@@ -12,6 +12,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
 import androidx.compose.ui.Modifier
 import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import dev.luksandroid.session.LuksSession
 import dev.luksandroid.ui.navigation.LuksAppNavigation
 import dev.luksandroid.ui.theme.LuksTheme
@@ -35,6 +37,16 @@ class MainActivity : ComponentActivity() {
         // WindowInsetsController.hide() call can ever do anything, app-wide,
         // regardless of what that screen asks for.
         WindowCompat.setDecorFitsSystemWindows(window, false)
+
+        // TEMPORARY DIAGNOSTIC — unconditional, no button, no toggle: hides
+        // the bars the instant the app launches, on every screen. If this
+        // doesn't hide them either, the hide mechanism itself is broken in
+        // this environment, unrelated to any button/click. Remove once
+        // that's answered.
+        WindowCompat.getInsetsController(window, window.decorView).apply {
+            hide(WindowInsetsCompat.Type.systemBars())
+            systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        }
 
         Trace.i("start: luks_core ${LuksNative.nativeVersion()}")
 

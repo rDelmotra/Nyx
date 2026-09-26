@@ -521,6 +521,7 @@ private fun SpeedDialItem(
 fun BrowserScreen(
     onNavigateToDevices: () -> Unit = {},
     onLockRequested: () -> Unit = onNavigateToDevices,
+    onPlayMedia: ((fullPath: String, displayName: String) -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
@@ -1531,13 +1532,17 @@ fun BrowserScreen(
                             canWrite = canWriteVolume && !isSubvolumeReadOnly,
                             onOpen = {
                                 if (item.isDir) {
-                                loadDirectory(item.fullPath)
-                            } else if (isPlayableMedia(item.name)) {
-                                playingItem = item
-                            } else {
-                                pendingExportItem = item
-                                exporter.launch(item.name)
-                            }
+                                    loadDirectory(item.fullPath)
+                                } else if (isPlayableMedia(item.name)) {
+                                    if (onPlayMedia != null) {
+                                        onPlayMedia(item.fullPath, item.name)
+                                    } else {
+                                        playingItem = item
+                                    }
+                                } else {
+                                    pendingExportItem = item
+                                    exporter.launch(item.name)
+                                }
                         },
                         onExport = {
                             if (item.isDir) {
@@ -1993,6 +1998,7 @@ fun BrowserItemRow(
     modifier: Modifier = Modifier,
 ) {
     var menuExpanded by remember { mutableStateOf(false) }
+    val context = LocalContext.current
 
     Row(
         modifier = modifier
@@ -2135,6 +2141,27 @@ fun BrowserItemRow(
                         onExport()
                     },
                 )
+
+                if (!item.isDir && isPlayableMedia(item.name)) {
+                    DropdownMenuItem(
+                        text = { Text("Open in external app") },
+                        leadingIcon = {
+                            Icon(
+                                imageVector = Icons.Default.Share,
+                                contentDescription = null,
+                                modifier = Modifier.size(20.dp),
+                            )
+                        },
+                        onClick = {
+                            menuExpanded = false
+                            dev.luksandroid.streaming.LocalHttpStreamServer.launchExternalPlayer(
+                                context = context,
+                                fullPath = item.fullPath,
+                                displayName = item.name,
+                            )
+                        },
+                    )
+                }
 
                 if (!item.isDir) {
                     DropdownMenuItem(

@@ -11,6 +11,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
 import androidx.compose.ui.Modifier
+import androidx.core.view.WindowCompat
 import dev.luksandroid.session.LuksSession
 import dev.luksandroid.ui.navigation.LuksAppNavigation
 import dev.luksandroid.ui.theme.LuksTheme
@@ -28,6 +29,12 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Without this, the window always reserves space for the system bars
+        // and tells Android to keep them shown — so no screen's
+        // WindowInsetsController.hide() call can ever do anything, app-wide,
+        // regardless of what that screen asks for.
+        WindowCompat.setDecorFitsSystemWindows(window, false)
 
         Trace.i("start: luks_core ${LuksNative.nativeVersion()}")
 

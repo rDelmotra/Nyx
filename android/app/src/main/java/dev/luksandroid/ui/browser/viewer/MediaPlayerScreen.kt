@@ -1,5 +1,8 @@
 package dev.luksandroid.ui.browser.viewer
 
+import android.app.Activity
+import android.content.ContextWrapper
+import android.content.pm.ActivityInfo
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
@@ -15,10 +18,17 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.media3.common.MediaItem
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
@@ -37,6 +47,12 @@ fun isPlayableMedia(name: String): Boolean {
     return ext in VIDEO_EXTENSIONS || ext in AUDIO_EXTENSIONS
 }
 
+private tailrec fun android.content.Context.findActivity(): Activity? = when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findActivity()
+    else -> null
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MediaPlayerScreen(
@@ -45,6 +61,9 @@ fun MediaPlayerScreen(
     onClose: () -> Unit,
 ) {
     val context = LocalContext.current
+    val activity = remember(context) { context.findActivity() }
+    val view = LocalView.current
+    var isFullscreen by remember { mutableStateOf(false) }
 
     val player = remember(fullPath) {
         ExoPlayer.Builder(context).build().apply {
@@ -60,33 +79,72 @@ fun MediaPlayerScreen(
         onDispose { player.release() }
     }
 
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = { Text(displayName, maxLines = 1) },
-                navigationIcon = {
-                    IconButton(onClick = onClose) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Close")
-                    }
-                },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.background,
-                ),
-            )
-        },
-    ) { innerPadding ->
+    // Leaving fullscreen on/off is a side effect on the Activity/Window, not
+    // Compose state, so it lives in a DisposableEffect rather than being
+    // derived — and it must restore both on toggle-off and on leaving the
+    // screen entirely, or the whole app is stuck sideways with hidden bars.
+    DisposableEffect(isFullscreen) {
+        val window = activity?.window
+        val insetsController = window?.let { WindowCompat.getInsetsController(it, view) }
+        if (isFullscreen) {
+            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            insetsController?.hide(WindowInsetsCompat.Type.systemBars())
+            insetsController?.systemBarsBehavior =
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        }
+        onDispose {
+            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            insetsController?.show(WindowInsetsCompat.Type.systemBars())
+        }
+    }
+
+    if (isFullscreen) {
         Box(modifier = Modifier.fillMaxSize()) {
             AndroidView(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(innerPadding),
+                modifier = Modifier.fillMaxSize(),
                 factory = { ctx ->
                     PlayerView(ctx).apply {
                         this.player = player
                         useController = true
+                        setFullscreenButtonClickListener { isFullscreen = false }
+                        setFullscreenButtonState(true)
                     }
                 },
+                update = { it.setFullscreenButtonState(true) },
             )
+        }
+    } else {
+        Scaffold(
+            topBar = {
+                TopAppBar(
+                    title = { Text(displayName, maxLines = 1) },
+                    navigationIcon = {
+                        IconButton(onClick = onClose) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Close")
+                        }
+                    },
+                    colors = TopAppBarDefaults.topAppBarColors(
+                        containerColor = MaterialTheme.colorScheme.background,
+                    ),
+                )
+            },
+        ) { innerPadding ->
+            Box(modifier = Modifier.fillMaxSize()) {
+                AndroidView(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(innerPadding),
+                    factory = { ctx ->
+                        PlayerView(ctx).apply {
+                            this.player = player
+                            useController = true
+                            setFullscreenButtonClickListener { isFullscreen = true }
+                            setFullscreenButtonState(false)
+                        }
+                    },
+                    update = { it.setFullscreenButtonState(false) },
+                )
+            }
         }
     }
 }

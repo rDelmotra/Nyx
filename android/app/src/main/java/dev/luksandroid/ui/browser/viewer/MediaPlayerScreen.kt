@@ -3,6 +3,7 @@ package dev.luksandroid.ui.browser.viewer
 import android.app.Activity
 import android.content.ContextWrapper
 import android.content.pm.ActivityInfo
+import android.view.ViewTreeObserver
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
@@ -90,13 +91,39 @@ fun MediaPlayerScreen(
     DisposableEffect(isFullscreen) {
         val window = activity?.window
         val insetsController = window?.let { WindowCompat.getInsetsController(it, view) }
-        if (isFullscreen) {
-            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-            insetsController?.hide(WindowInsetsCompat.Type.systemBars())
+
+        fun hideBars() {
             insetsController?.systemBarsBehavior =
                 WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            insetsController?.hide(WindowInsetsCompat.Type.systemBars())
+        }
+
+        // hide() is not sticky across a window-focus change: a system dialog
+        // (e.g. the POST_NOTIFICATIONS prompt) or the notification shade
+        // taking focus silently restores the bars, and Android does not
+        // re-hide them on its own once focus returns — the caller has to.
+        // Scoped to a View-level ViewTreeObserver listener (rather than
+        // Activity.onWindowFocusChanged) so it only applies while this
+        // screen is actually in fullscreen, not app-wide.
+        val focusListener = ViewTreeObserver.OnWindowFocusChangeListener { hasFocus ->
+            if (hasFocus && isFullscreen) hideBars()
+        }
+
+        if (isFullscreen) {
+            // Plain LANDSCAPE, not SENSOR_LANDSCAPE: the sensor variant still
+            // needs a live accelerometer/rotation-vector reading to pick
+            // normal-vs-reverse landscape, and simply never resolves on an
+            // emulator (or a device) that doesn't feed it one — it can hang
+            // in the current orientation forever. Plain LANDSCAPE is an
+            // unconditional lock with no sensor dependency, so it rotates
+            // deterministically regardless of emulator sensor support or the
+            // device's auto-rotate setting.
+            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+            hideBars()
+            view.viewTreeObserver.addOnWindowFocusChangeListener(focusListener)
         }
         onDispose {
+            view.viewTreeObserver.removeOnWindowFocusChangeListener(focusListener)
             activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
             insetsController?.show(WindowInsetsCompat.Type.systemBars())
         }

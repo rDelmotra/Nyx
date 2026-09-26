@@ -116,6 +116,8 @@ import dev.luksandroid.transfer.TransferProgress
 import dev.luksandroid.transfer.TransferPrompt
 import dev.luksandroid.transfer.treeProgressLabel
 import dev.luksandroid.ui.UiErrorMessage
+import dev.luksandroid.ui.browser.viewer.MediaPlayerScreen
+import dev.luksandroid.ui.browser.viewer.isPlayableMedia
 import dev.luksandroid.ui.components.BreadcrumbBar
 import dev.luksandroid.ui.components.CapacityBar
 import dev.luksandroid.ui.components.DeleteConfirmDialog
@@ -596,6 +598,7 @@ fun BrowserScreen(
 
     var activeChecksum by remember { mutableStateOf<ChecksumResult?>(null) }
     var pendingExportItem by remember { mutableStateOf<BrowserItem?>(null) }
+    var playingItem by remember { mutableStateOf<BrowserItem?>(null) }
 
     // Which TransferManager transfer (if any) this screen most recently started.
     // The transfer itself lives and runs in TransferManager regardless of this
@@ -1529,6 +1532,8 @@ fun BrowserScreen(
                             onOpen = {
                                 if (item.isDir) {
                                 loadDirectory(item.fullPath)
+                            } else if (isPlayableMedia(item.name)) {
+                                playingItem = item
                             } else {
                                 pendingExportItem = item
                                 exporter.launch(item.name)
@@ -1592,6 +1597,14 @@ fun BrowserScreen(
     }
 }
 }
+
+    playingItem?.let { item ->
+        MediaPlayerScreen(
+            fullPath = item.fullPath,
+            displayName = item.name,
+            onClose = { playingItem = null },
+        )
+    }
 
     // Dialogs
     if (showPlainWriteConfirmDialog) {

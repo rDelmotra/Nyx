@@ -14,8 +14,12 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.unit.dp
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
@@ -112,6 +116,18 @@ fun MediaPlayerScreen(
                 },
                 update = { it.setFullscreenButtonState(true) },
             )
+            // Not relying solely on PlayerView's own fullscreen icon here — it
+            // sits inside the auto-hiding transport controls, easy to miss or
+            // to have tapped-through by a controller-visibility timing quirk.
+            // This is a second, always-present way out of fullscreen.
+            TextButton(
+                onClick = { isFullscreen = false },
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(12.dp),
+            ) {
+                Text("Exit fullscreen", color = Color.White)
+            }
         }
     } else {
         Scaffold(
@@ -121,6 +137,11 @@ fun MediaPlayerScreen(
                     navigationIcon = {
                         IconButton(onClick = onClose) {
                             Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Close")
+                        }
+                    },
+                    actions = {
+                        TextButton(onClick = { isFullscreen = true }) {
+                            Text("Fullscreen")
                         }
                     },
                     colors = TopAppBarDefaults.topAppBarColors(

@@ -605,6 +605,62 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
     }
 }
 
+/**
+ * Stable-enough identity for a LUKS partition, used to key
+ * [dev.luksandroid.security.BiometricPassphraseVault]'s per-partition storage.
+ *
+ * NOT a LUKS UUID — that lives inside the encrypted header and isn't readable
+ * before unlock without new native code. Built instead from what's already
+ * known pre-unlock: USB vendor/product ID, USB serial, whole-device size, and
+ * the partition's own offset/size. `Locale.ROOT` matters because `%d`/`%x`
+ * render non-ASCII digits under some locales (e.g. Arabic), which would
+ * silently change the key if the phone's language changes.
+ *
+ * Collision means a different drive that happens to share vendor, product,
+ * serial, device size, and partition layout with a previously-enrolled one —
+ * for a single personal-use drive this is not expected to occur. If it did,
+ * the stored blob simply fails to decrypt (SecurePassphraseBuffer aborts with
+ * a wrong-passphrase failure) and the vault entry is forgotten; nothing about
+ * the wrong drive is exposed.
+ */
+internal fun biometricPartitionKey(
+    vendorId: Int,
+    productId: Int,
+    serial: String?,
+    deviceSizeBytes: Long,
+    offsetBytes: Long,
+    partitionSizeBytes: Long,
+): String {
+    val raw = String.format(
+        java.util.Locale.ROOT,
+        "%04x|%04x|%s|%d|%d|%d",
+        vendorId,
+        productId,
+        serial.orEmpty(),
+        deviceSizeBytes,
+        offsetBytes,
+        partitionSizeBytes,
+    )
+    val digest = java.security.MessageDigest.getInstance("SHA-256").digest(raw.toByteArray(Charsets.UTF_8))
+    val hex = digest.take(16).joinToString("") { "%02x".format(it) }
+    return "v1_$hex"
+}
+
+/** Null if [partition] isn't a LUKS container or the USB device descriptor isn't available. */
+fun LuksDevice.biometricKeyFor(partition: PartitionInfo): String? {
+    val usb = usbDevice ?: return null
+    if (!partition.isLuks) return null
+    val serial = runCatching { usb.serialNumber }.getOrNull()
+    return biometricPartitionKey(
+        vendorId = usb.vendorId,
+        productId = usb.productId,
+        serial = serial,
+        deviceSizeBytes = info.sizeBytes,
+        offsetBytes = partition.offsetBytes,
+        partitionSizeBytes = partition.sizeBytes,
+    )
+}
+
 internal fun parseDeviceInfo(json: String): DeviceInfo {
     val o = JSONObject(json)
     val arr = o.getJSONArray("partitions")

@@ -12,6 +12,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -21,12 +22,14 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.ErrorOutline
+import androidx.compose.material.icons.filled.Fingerprint
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Lock
@@ -42,8 +45,10 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.FilledTonalIconButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -66,17 +71,22 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import dev.luksandroid.LuksDevice
 import dev.luksandroid.LuksException
 import dev.luksandroid.PartitionInfo
 import dev.luksandroid.Trace
 import dev.luksandroid.UsbMassStorage
+import dev.luksandroid.biometricKeyFor
 import dev.luksandroid.formatSize
+import dev.luksandroid.security.BiometricPassphraseVault
 import dev.luksandroid.security.PassphraseScrubber
 import dev.luksandroid.security.SecurePassphraseBuffer
 import dev.luksandroid.session.LuksSession
@@ -108,10 +118,31 @@ fun DevicesScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val sessionState by LuksSession.state.collectAsState()
+    val activity = remember(context) { context.findFragmentActivity() }
 
     var targets by remember { mutableStateOf<List<UsbMassStorage.Target>>(emptyList()) }
     var deviceStates by remember { mutableStateOf<Map<String, DeviceItemState>>(emptyMap()) }
     var isScanning by remember { mutableStateOf(false) }
+
+    // Bumped whenever enrollment state might have changed underneath us: after
+    // enrolling/forgetting, and on ON_RESUME so a fingerprint added or removed
+    // in system Settings while this screen was backgrounded is picked up.
+    var vaultVersion by remember { mutableIntStateOf(0) }
+    val biometricAvailable = remember(activity, vaultVersion) {
+        activity != null && BiometricPassphraseVault.isAvailable(context)
+    }
+    var biometricBusy by remember { mutableStateOf(false) }
+    var dialogNotice by remember { mutableStateOf<String?>(null) }
+    var forgetTarget by remember { mutableStateOf<Pair<String, PartitionInfo>?>(null) }
+
+    DisposableEffect(activity) {
+        if (activity == null) return@DisposableEffect onDispose {}
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) vaultVersion++
+        }
+        activity.lifecycle.addObserver(observer)
+        onDispose { activity.lifecycle.removeObserver(observer) }
+    }
 
     fun keyOf(target: UsbMassStorage.Target) =
         "${target.device.deviceId}:${target.device.vendorId}:${target.device.productId}:${target.usbInterface.id}"
@@ -231,6 +262,40 @@ fun DevicesScreen(
 
     // Dialog state for passphrase entry
     var promptDialogTarget by remember { mutableStateOf<Pair<LuksDevice, PartitionInfo>?>(null) }
+
+    fun startManualUnlock(device: LuksDevice, partition: PartitionInfo, notice: String? = null) {
+        dialogNotice = notice
+        promptDialogTarget = device to partition
+    }
+
+    fun startBiometricUnlock(device: LuksDevice, partition: PartitionInfo) {
+        val act = activity ?: return
+        val bioKey = device.biometricKeyFor(partition) ?: return
+        if (biometricBusy) return
+        val label = partition.name.ifBlank { "Partition #${partition.index}" }
+        biometricBusy = true
+        scope.launch {
+            val outcome = try {
+                obtainPassphraseWithBiometric(act, context, bioKey, label)
+            } finally {
+                biometricBusy = false
+            }
+            when (outcome) {
+                is BiometricUnlockOutcome.UseManual -> {
+                    vaultVersion++
+                    startManualUnlock(device, partition, outcome.notice)
+                }
+                is BiometricUnlockOutcome.Passphrase -> outcome.buffer.use { buf ->
+                    val result = LuksSession.unlock(context, device, partition, buf)
+                    if (result is SessionState.Failed && result.message.contains("wrong passphrase", ignoreCase = true)) {
+                        BiometricPassphraseVault.forget(context, bioKey)
+                        vaultVersion++
+                        dialogNotice = BIOMETRIC_NOTICE_STALE
+                    }
+                }
+            }
+        }
+    }
 
     Column(
         modifier = modifier
@@ -354,6 +419,9 @@ fun DevicesScreen(
                     hasPermission = hasPerm,
                     itemState = itemState,
                     sessionState = sessionState,
+                    biometricAvailable = biometricAvailable,
+                    biometricBusy = biometricBusy,
+                    vaultVersion = vaultVersion,
                     onRequestPermission = {
                         scope.launch {
                             val granted = UsbMassStorage.requestPermission(context, target.device)
@@ -372,12 +440,18 @@ fun DevicesScreen(
                         }
                     },
                     onUnlockPartition = { device, partition ->
-                        promptDialogTarget = device to partition
+                        startManualUnlock(device, partition)
+                    },
+                    onBiometricUnlockPartition = { device, partition ->
+                        startBiometricUnlock(device, partition)
                     },
                     onMountPartition = { device, partition ->
                         scope.launch {
                             LuksSession.openPlain(context, device, partition)
                         }
+                    },
+                    onForgetBiometric = { bioKey, partition ->
+                        forgetTarget = bioKey to partition
                     },
                 )
             }
@@ -386,17 +460,61 @@ fun DevicesScreen(
 
     // Passphrase Entry Dialog
     promptDialogTarget?.let { (device, partition) ->
+        val bioKey = remember(device, partition) { device.biometricKeyFor(partition) }
+        val offerEnroll = remember(bioKey, biometricAvailable, vaultVersion) {
+            bioKey != null && biometricAvailable && !BiometricPassphraseVault.isEnrolled(context, bioKey)
+        }
         PassphraseEntryDialog(
             partition = partition,
-            onDismiss = { promptDialogTarget = null },
-            onSubmit = { buffer ->
+            offerBiometricEnroll = offerEnroll,
+            notice = dialogNotice,
+            onDismiss = {
                 promptDialogTarget = null
+                dialogNotice = null
+            },
+            onSubmit = { buffer, enroll ->
+                promptDialogTarget = null
+                dialogNotice = null
+                val enrollKey = if (enroll) bioKey else null
+                val act = activity
                 scope.launch {
                     buffer.use { buf ->
-                        LuksSession.unlock(context, device, partition, buf)
+                        var pendingKey: String? = null
+                        if (enrollKey != null && act != null) {
+                            biometricBusy = true
+                            try {
+                                if (enrollBiometric(act, context, enrollKey, partition.name.ifBlank { "Partition #${partition.index}" }, buf)) {
+                                    pendingKey = enrollKey
+                                }
+                            } finally {
+                                biometricBusy = false
+                            }
+                        }
+                        var unlocked = false
+                        try {
+                            unlocked = LuksSession.unlock(context, device, partition, buf) is SessionState.Unlocked
+                        } finally {
+                            pendingKey?.let { k ->
+                                if (!unlocked) BiometricPassphraseVault.forget(context, k)
+                                vaultVersion++
+                            }
+                        }
                     }
                 }
             },
+        )
+    }
+
+    // Forget-biometric confirmation
+    forgetTarget?.let { (bioKey, partition) ->
+        ForgetBiometricDialog(
+            label = partition.name.ifBlank { "Partition #${partition.index}" },
+            onConfirm = {
+                BiometricPassphraseVault.forget(context, bioKey)
+                vaultVersion++
+                forgetTarget = null
+            },
+            onDismiss = { forgetTarget = null },
         )
     }
 }
@@ -469,12 +587,18 @@ private fun TargetDeviceCard(
     hasPermission: Boolean,
     itemState: DeviceItemState,
     sessionState: SessionState,
+    biometricAvailable: Boolean,
+    biometricBusy: Boolean,
+    vaultVersion: Int,
     onRequestPermission: () -> Unit,
     onOpen: () -> Unit,
     onUnlockPartition: (LuksDevice, PartitionInfo) -> Unit,
+    onBiometricUnlockPartition: (LuksDevice, PartitionInfo) -> Unit,
     onMountPartition: (LuksDevice, PartitionInfo) -> Unit = { _, _ -> },
+    onForgetBiometric: (String, PartitionInfo) -> Unit = { _, _ -> },
     modifier: Modifier = Modifier,
 ) {
+    val context = LocalContext.current
     Card(
         modifier = modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(
@@ -621,12 +745,21 @@ private fun TargetDeviceCard(
 
                             // Render partitions
                             info.partitions.forEach { partition ->
+                                val bioKey = remember(dev, partition) { dev.biometricKeyFor(partition) }
+                                val enrolled = remember(bioKey, vaultVersion) {
+                                    bioKey != null && BiometricPassphraseVault.isEnrolled(context, bioKey)
+                                }
                                 PartitionItemCard(
                                     device = dev,
                                     partition = partition,
                                     sessionState = sessionState,
+                                    biometricEnrolled = enrolled,
+                                    showBiometricUnlock = enrolled && biometricAvailable,
+                                    biometricBusy = biometricBusy,
                                     onUnlock = { onUnlockPartition(dev, partition) },
+                                    onBiometricUnlock = { onBiometricUnlockPartition(dev, partition) },
                                     onMount = { onMountPartition(dev, partition) },
+                                    onForgetBiometric = { bioKey?.let { onForgetBiometric(it, partition) } },
                                 )
                             }
                         }
@@ -660,8 +793,13 @@ private fun PartitionItemCard(
     device: LuksDevice,
     partition: PartitionInfo,
     sessionState: SessionState,
+    biometricEnrolled: Boolean,
+    showBiometricUnlock: Boolean,
+    biometricBusy: Boolean,
     onUnlock: () -> Unit,
+    onBiometricUnlock: () -> Unit = {},
     onMount: () -> Unit = {},
+    onForgetBiometric: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val isSessionUnlocked = sessionState is SessionState.Unlocked &&
@@ -777,6 +915,29 @@ private fun PartitionItemCard(
                         ),
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+
+                    if (biometricEnrolled) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Default.Fingerprint,
+                                contentDescription = null,
+                                modifier = Modifier.size(12.dp),
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = "Fingerprint unlock on",
+                                style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            TextButton(
+                                onClick = onForgetBiometric,
+                                contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
+                            ) {
+                                Text("Turn off", style = MaterialTheme.typography.labelSmall)
+                            }
+                        }
+                    }
                 }
             }
 
@@ -797,17 +958,33 @@ private fun PartitionItemCard(
                         )
                     }
                 } else if (sessionState is SessionState.Locked) {
-                    FilledTonalButton(
-                        onClick = onUnlock,
-                        shape = RoundedCornerShape(8.dp),
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.LockOpen,
-                            contentDescription = null,
-                            modifier = Modifier.size(16.dp),
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text("Unlock")
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        if (showBiometricUnlock) {
+                            FilledTonalIconButton(
+                                onClick = onBiometricUnlock,
+                                enabled = !biometricBusy,
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Fingerprint,
+                                    contentDescription = "Unlock with fingerprint",
+                                    modifier = Modifier.size(20.dp),
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(6.dp))
+                        }
+                        FilledTonalButton(
+                            onClick = onUnlock,
+                            enabled = !biometricBusy,
+                            shape = RoundedCornerShape(8.dp),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.LockOpen,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp),
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Unlock")
+                        }
                     }
                 }
             } else if (partition.isPlain) {
@@ -1143,16 +1320,19 @@ private fun UnlockedStateCard(
 @Composable
 private fun PassphraseEntryDialog(
     partition: PartitionInfo,
+    offerBiometricEnroll: Boolean,
+    notice: String?,
     onDismiss: () -> Unit,
-    onSubmit: (SecurePassphraseBuffer) -> Unit,
+    onSubmit: (SecurePassphraseBuffer, enrollBiometric: Boolean) -> Unit,
 ) {
     var activeEditable by remember { mutableStateOf<Editable?>(null) }
     var hasContent by remember { mutableStateOf(false) }
+    var enrollChecked by remember { mutableStateOf(false) }
 
     fun submit() {
         val editable = activeEditable ?: return
         val buffer = PassphraseScrubber.extractAndScrub(editable)
-        onSubmit(buffer)
+        onSubmit(buffer, offerBiometricEnroll && enrollChecked)
     }
 
     AlertDialog(
@@ -1174,6 +1354,14 @@ private fun PassphraseEntryDialog(
         },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                if (notice != null) {
+                    Text(
+                        text = notice,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = WarningAmber,
+                    )
+                }
+
                 Text(
                     text = "Enter LUKS passphrase to derive decryption key:",
                     style = MaterialTheme.typography.bodyMedium,
@@ -1190,6 +1378,34 @@ private fun PassphraseEntryDialog(
                     style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
                     color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
                 )
+
+                if (offerBiometricEnroll) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .toggleable(
+                                value = enrollChecked,
+                                role = Role.Checkbox,
+                                onValueChange = { enrollChecked = it },
+                            ),
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Checkbox(checked = enrollChecked, onCheckedChange = null)
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = "Enable fingerprint unlock for this drive",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurface,
+                            )
+                        }
+                        Text(
+                            text = "Saved on this phone, encrypted with a key that needs your fingerprint.",
+                            style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                            modifier = Modifier.padding(start = 36.dp),
+                        )
+                    }
+                }
             }
         },
         confirmButton = {
@@ -1199,6 +1415,39 @@ private fun PassphraseEntryDialog(
                 shape = RoundedCornerShape(8.dp),
             ) {
                 Text("Unlock")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
+        },
+        shape = RoundedCornerShape(16.dp),
+    )
+}
+
+@Composable
+private fun ForgetBiometricDialog(
+    label: String,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Turn off fingerprint unlock?") },
+        text = {
+            Text("The saved passphrase for $label will be deleted from this phone. You'll need to type it next time.")
+        },
+        confirmButton = {
+            Button(
+                onClick = onConfirm,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.error,
+                    contentColor = MaterialTheme.colorScheme.onError,
+                ),
+                shape = RoundedCornerShape(8.dp),
+            ) {
+                Text("Turn off")
             }
         },
         dismissButton = {

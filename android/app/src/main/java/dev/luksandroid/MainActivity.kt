@@ -5,13 +5,13 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.view.WindowManager
-import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
 import androidx.compose.ui.Modifier
 import androidx.core.view.WindowCompat
+import androidx.fragment.app.FragmentActivity
 import dev.luksandroid.session.LuksSession
 import dev.luksandroid.ui.navigation.LuksAppNavigation
 import dev.luksandroid.ui.theme.LuksTheme
@@ -21,8 +21,11 @@ import dev.luksandroid.ui.theme.LuksTheme
  *
  * Hosts the Material 3 Compose UI navigation with [FLAG_SECURE] enforced
  * across all screens to block screenshot capture and recents thumbnails.
+ *
+ * FragmentActivity (not plain ComponentActivity) because androidx
+ * BiometricPrompt only accepts a FragmentActivity or Fragment host.
  */
-class MainActivity : ComponentActivity() {
+class MainActivity : FragmentActivity() {
 
     private val requestNotifications =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* advisory */ }

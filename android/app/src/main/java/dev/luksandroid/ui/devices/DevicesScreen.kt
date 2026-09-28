@@ -276,7 +276,7 @@ fun DevicesScreen(
         biometricBusy = true
         scope.launch {
             val outcome = try {
-                obtainPassphraseWithBiometric(act, context, bioKey, label)
+                obtainPassphraseWithBiometric(act, bioKey, label)
             } finally {
                 biometricBusy = false
             }
@@ -487,7 +487,7 @@ fun DevicesScreen(
                         if (enrollKey != null && act != null) {
                             biometricBusy = true
                             try {
-                                if (enrollBiometric(act, context, enrollKey, partition.name.ifBlank { "Partition #${partition.index}" }, buf)) {
+                                if (enrollBiometric(act, enrollKey, partition.name.ifBlank { "Partition #${partition.index}" }, buf)) {
                                     pendingKey = enrollKey
                                 }
                             } finally {

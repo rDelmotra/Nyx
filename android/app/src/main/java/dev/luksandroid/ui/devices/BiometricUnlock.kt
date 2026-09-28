@@ -9,6 +9,7 @@ import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.withResumed
 import dev.luksandroid.Trace
 import dev.luksandroid.security.BiometricPassphraseVault
 import dev.luksandroid.security.SecurePassphraseBuffer
@@ -40,6 +41,8 @@ private sealed interface PromptResult {
 /**
  * Bridges androidx's callback-based [BiometricPrompt] into a suspend call.
  *
+ * In 1.1.0, `authenticate()` after `onSaveInstanceState` only logs and returns,
+ * so [withResumed] ensures it is only invoked while the activity is actively resumed.
  * The ON_STOP observer guarantees this always resolves if the activity is
  * backgrounded mid-prompt (app switch, screen lock) — without it, a
  * cancelled coroutine scope would leave the CompletableDeferred pending
@@ -81,9 +84,11 @@ private suspend fun FragmentActivity.runBiometricPrompt(
             result.complete(PromptResult.Error(BiometricPrompt.ERROR_CANCELED))
         }
     }
-    lifecycle.addObserver(onStop)
     return try {
-        prompt.authenticate(info, BiometricPrompt.CryptoObject(cipher))
+        lifecycle.withResumed {
+            lifecycle.addObserver(onStop)
+            prompt.authenticate(info, BiometricPrompt.CryptoObject(cipher))
+        }
         result.await()
     } finally {
         lifecycle.removeObserver(onStop)
@@ -99,20 +104,19 @@ internal sealed interface BiometricUnlockOutcome {
 /** Fingerprint-gated equivalent of typing the passphrase for [partitionKey]. */
 internal suspend fun obtainPassphraseWithBiometric(
     activity: FragmentActivity,
-    context: Context,
     partitionKey: String,
     label: String,
 ): BiometricUnlockOutcome {
-    if (!BiometricPassphraseVault.isAvailable(context)) {
-        return BiometricUnlockOutcome.UseManual(null)
+    if (!BiometricPassphraseVault.isAvailable(activity)) {
+        return BiometricUnlockOutcome.UseManual(BIOMETRIC_NOTICE_UNAVAILABLE)
     }
 
     val cipher = try {
         withContext(Dispatchers.Default) {
-            BiometricPassphraseVault.decryptCipherFor(context, partitionKey)
+            BiometricPassphraseVault.decryptCipherFor(activity, partitionKey)
         }
     } catch (e: KeyPermanentlyInvalidatedException) {
-        BiometricPassphraseVault.forget(context, partitionKey)
+        BiometricPassphraseVault.forget(activity, partitionKey)
         return BiometricUnlockOutcome.UseManual(BIOMETRIC_NOTICE_RESET)
     } catch (e: Exception) {
         Trace.e("BiometricUnlock: decryptCipherFor failed: ${Trace.throwableSummary(e)}")
@@ -128,9 +132,9 @@ internal suspend fun obtainPassphraseWithBiometric(
             else -> BiometricUnlockOutcome.UseManual(null)
         }
         is PromptResult.Success -> try {
-            BiometricUnlockOutcome.Passphrase(BiometricPassphraseVault.decrypt(context, partitionKey, result.cipher))
+            BiometricUnlockOutcome.Passphrase(BiometricPassphraseVault.decrypt(activity, partitionKey, result.cipher))
         } catch (e: AEADBadTagException) {
-            BiometricPassphraseVault.forget(context, partitionKey)
+            BiometricPassphraseVault.forget(activity, partitionKey)
             BiometricUnlockOutcome.UseManual(BIOMETRIC_NOTICE_RESET)
         } catch (e: Exception) {
             Trace.e("BiometricUnlock: decrypt failed: ${Trace.throwableSummary(e)}")
@@ -145,12 +149,11 @@ internal suspend fun obtainPassphraseWithBiometric(
  */
 internal suspend fun enrollBiometric(
     activity: FragmentActivity,
-    context: Context,
     partitionKey: String,
     label: String,
     passphrase: SecurePassphraseBuffer,
 ): Boolean {
-    if (!BiometricPassphraseVault.isAvailable(context) || BiometricPassphraseVault.isEnrolled(context, partitionKey)) {
+    if (!BiometricPassphraseVault.isAvailable(activity) || BiometricPassphraseVault.isEnrolled(activity, partitionKey)) {
         return false
     }
 
@@ -158,7 +161,7 @@ internal suspend fun enrollBiometric(
         withContext(Dispatchers.Default) {
             // Drops any stale key left over from a previously skipped enrollment
             // so encryptCipherFor always starts from a fresh Keystore key.
-            BiometricPassphraseVault.forget(context, partitionKey)
+            BiometricPassphraseVault.forget(activity, partitionKey)
             BiometricPassphraseVault.encryptCipherFor(partitionKey)
         }
     } catch (e: Exception) {
@@ -169,15 +172,15 @@ internal suspend fun enrollBiometric(
     val result = activity.runBiometricPrompt("Enable fingerprint unlock", label, "Skip", cipher)
     val successCipher = (result as? PromptResult.Success)?.cipher
     if (successCipher == null) {
-        BiometricPassphraseVault.forget(context, partitionKey)
+        BiometricPassphraseVault.forget(activity, partitionKey)
         return false
     }
     return try {
-        BiometricPassphraseVault.store(context, partitionKey, successCipher, passphrase)
+        BiometricPassphraseVault.store(activity, partitionKey, successCipher, passphrase)
         true
     } catch (e: Exception) {
         Trace.e("BiometricUnlock: store failed: ${Trace.throwableSummary(e)}")
-        BiometricPassphraseVault.forget(context, partitionKey)
+        BiometricPassphraseVault.forget(activity, partitionKey)
         false
     }
 }

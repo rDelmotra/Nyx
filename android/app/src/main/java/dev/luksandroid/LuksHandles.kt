@@ -633,7 +633,7 @@ internal fun biometricPartitionKey(
 ): String {
     val raw = String.format(
         java.util.Locale.ROOT,
-        "%04x|%04x|%s|%d|%d|%d",
+        "v1|%04x|%04x|%s|%d|%d|%d",
         vendorId,
         productId,
         serial.orEmpty(),

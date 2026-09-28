@@ -38,17 +38,17 @@ Traditional solutions require rooting the Android device, installing custom kern
 
 ## Quickstart
 
-**[⬇ Download the latest release](https://github.com/rDelmotra/luks-android/releases/latest)** — grab `app-release.apk` (v0.3.0) directly, no build required. Requires Android 10+ (API 29) on an arm64-v8a device.
+**[⬇ Download the latest release](https://github.com/rDelmotra/luks-android/releases/latest)** — grab `app-release.apk` (v0.4.0) directly, no build required. Requires Android 10+ (API 29) on an arm64-v8a device.
 
 > [!NOTE]
-> The `v0.3.0` release introduces **in-app video/audio playback** via AndroidX Media3 ExoPlayer with an in-memory 1 MiB block cache (burst-and-sleep, zero SSD thermal stress), **external streaming** over an RFC 7233 loopback HTTP server (`http://127.0.0.1`) for VLC / MX Player, alongside full ext4 and Btrfs write support.
+> The `v0.4.0` release introduces **hardware-backed biometric unlock** (fingerprint / face authentication via Android Keystore backed AES-GCM passphrase vault), alongside **in-app media playback** with zero-wear block caching, loopback HTTP streaming, and full ext4/Btrfs write support.
 
 > [!WARNING]
 > **Write at your own risk.** Writing directly to raw block storage from unprivileged userspace over mobile USB OTG carries inherent physical risk. While this engine is verified against Linux kernel oracles and enforces fail-closed write fencing, real-world hardware disruptions (unstable OTG adapters, loose USB-C cables, surprise disconnections, or drive controllers rejecting cache flush) can interrupt in-flight transactions. **Always maintain verified backups of critical data before performing write operations.**
 
 | Target | Artifact | Size | Description |
 | :--- | :--- | :--- | :--- |
-| **Android Release (Recommended)** | [`app-release.apk`](https://github.com/rDelmotra/luks-android/releases/latest) | `~5.4 MB` | Prebuilt, signed v2/v3, ready to install |
+| **Android Release (Recommended)** | [`app-release.apk`](https://github.com/rDelmotra/luks-android/releases/latest) | `~6.2 MB` | Prebuilt, signed v2/v3, ready to install |
 | **Android Debug** *(build from source)* | `app-debug.apk` | `~32 MB` | For development and live diagnostics |
 | **Native Core (Rust crate)** | `luks_core` / `luks_jni` | `< 2 MB` | Use the engine standalone via Rust or JNI |
 
@@ -71,7 +71,7 @@ adb install -r android/app/build/outputs/apk/release/app-release.apk
 
 1. **Connect the drive.** Plug a USB-OTG drive or external enclosure into the Android device.
 2. **Grant USB permission.** Accept the standard Android USB Host dialog to allow userspace communication via `/dev/bus/usb`.
-3. **Unlock the volume.** Enter the passphrase to decrypt the LUKS2 keyslot (Argon2id or PBKDF2).
+3. **Unlock the volume.** Enter the passphrase or use biometric unlock (fingerprint) to decrypt the LUKS2 keyslot.
 4. **Browse and transfer.** Explore folders, view file metadata, stream media, or export files directly to internal storage.
 
 ---
@@ -79,6 +79,7 @@ adb install -r android/app/build/outputs/apk/release/app-release.apk
 ## Features
 
 - **Rootless operation.** Runs entirely in unprivileged userspace using Android's USB Host APIs. No root access, unlocked bootloaders, or custom ROMs required.
+- **Hardware-backed biometric unlock.** Unlock encrypted LUKS2 containers using fingerprint or face authentication (`BiometricPrompt`). Passphrases are vaulted inside the hardware-isolated `AndroidKeyStore` using AES-256-GCM with biometric authentication-per-use gating and auto-invalidation if enrollment changes.
 - **In-app media player & streaming.** High-performance video and audio playback directly from decrypted LUKS2 containers and plain drives. Features a 1 MiB (4 × 256 KiB) LRU block cache that eliminates SSD flash wear and an embedded RFC 7233 range server for external players (VLC, MX Player) with zero disk extraction.
 - **LUKS2 container cryptography.** Full support for Argon2id and PBKDF2 key derivation functions with AES-256-XTS ciphers, hardware-accelerated via ARMv8 crypto extensions (`pmull`, `aes`).
 - **Memory security and key zeroization.** Master keys, subkeys, and expanded cipher schedules implement `Zeroize` and `ZeroizeOnDrop`, purging sensitive material from memory immediately upon exit.
@@ -89,7 +90,7 @@ adb install -r android/app/build/outputs/apk/release/app-release.apk
 - **ext4 filesystem engine.** Extent tree traversals, directory hash-tree indexing, block group bitmap allocations, and file creation/deletion validated against reference Linux `e2fsck`.
 - **SCSI Bulk-Only Transport (BOT).** Custom userspace USBFS engine driving 128 KiB chunked SCSI transfers with a non-blocking URB arena and generational drain recovery.
 - **Fail-closed safety model.** Release builds enforce compile-time write gating (`dangerous-write-support`). Any transport stall, cable disconnect, or corruption fences the session instantly.
-- **Lightweight footprint.** Complete Android application is ~5.4 MB, with ProGuard/R8 code and resource shrinking.
+- **Lightweight footprint.** Complete Android application is ~6.2 MB, with ProGuard/R8 code and resource shrinking.
 - **In-memory forensic ring buffer.** A 256-slot non-allocating circular ring buffer records hardware events, SCSI CDBs, sense codes, and filesystem operations with zero plaintext leakage.
 
 Full system architecture, hardware benchmarks, and the per-feature read/write support matrix are in [doc/architecture.md](doc/architecture.md).

@@ -47,7 +47,7 @@ Verifies that release builds contain zero write symbols or entry points:
 bash tools/verify-no-write-code.sh
 ```
 
-In Android builds, Gradle enforces this at build time via the `checkNoWriteCodeInRelease` task. If write-enabled native libraries (`libluks_jni.so`) are present when assembling a release APK, Gradle will fail closed. To deliberately produce a write-enabled release build (as in `v0.3.0`):
+In Android builds, Gradle enforces this at build time via the `checkNoWriteCodeInRelease` task. If write-enabled native libraries (`libluks_jni.so`) are present when assembling a release APK, Gradle will fail closed. To deliberately produce a write-enabled release build (as in `v0.4.0`):
 ```bash
 cd android && ./gradlew assembleRelease -PallowWriteInRelease=true
 ```
@@ -56,7 +56,7 @@ cd android && ./gradlew assembleRelease -PallowWriteInRelease=true
 ```bash
 cd android && ./gradlew testDebugUnitTest
 ```
-Currently 232 unit tests passing, covering session lifecycle, device state, plain volume write consent, breadcrumbs, media block caching, RFC 7233 local streaming, and error handling.
+Currently 244 unit tests passing, covering session lifecycle, device state, plain volume write consent, breadcrumbs, media block caching, RFC 7233 local streaming, biometric partition key derivation, and error handling.
 
 ---
 

@@ -55,6 +55,7 @@ Measured on physical ARM64 hardware (Android 14+):
 | **Btrfs Compression** | Supported | Planned | ZSTD, LZO, and ZLIB decompression supported; write compression deferred |
 | **Btrfs Multi-device (RAID)** | Refused | Refused | Fail-closed refusal to protect multi-device arrays on mobile |
 | **SAF DocumentsProvider** | Supported | Planned | Exposes storage to Android system file pickers (Read-only) |
+| **Media Player & Streaming** | Supported | N/A | AndroidX Media3 ExoPlayer with 1 MiB LRU block cache and RFC 7233 local HTTP server |
 
 > [!NOTE]
-> This matrix describes the capabilities implemented on `main` and shipped in the `v0.2.0` release. Release builds include compile-time write safety assertions (`checkNoWriteCodeInRelease`) that require `-PallowWriteInRelease=true` when native write support is compiled in.
+> This matrix describes the capabilities implemented on `main` and shipped in the `v0.3.0` release. Release builds include compile-time write safety assertions (`checkNoWriteCodeInRelease`) that require `-PallowWriteInRelease=true` when native write support is compiled in.

@@ -20,6 +20,17 @@ lifecycle = "2.9.4"
 activityCompose = "1.11.0"
 composeBom = "2025.12.01"
 media3 = "1.11.0"
+# 1.1.0 is the newest stable release. Everything past it (1.2.0-alphaNN,
+# 1.4.0-alphaNN) is still alpha per Google's own metadata — there is no
+# 1.2.0/1.3.0 stable to skip to.
+biometric = "1.1.0"
+# BiometricPrompt requires a FragmentActivity. biometric:1.1.0 pulls in
+# fragment:1.2.5 transitively (confirmed via `dependencies`), which is old
+# enough to conflict with androidx.activity's registerForActivityResult
+# request-code range. Pinned forward explicitly rather than relying on the
+# transitive version. 1.9.1 is newer but stayed off the same compileSdk-37
+# ceiling documented above for the rest of this androidx line — untested here.
+fragment = "1.8.9"
 junit = "4.13.2"
 androidxTestExtJunit = "1.2.1"
 androidxTestRunner = "1.6.2"
@@ -38,6 +49,8 @@ androidx-compose-material3 = { group = "androidx.compose.material3", name = "mat
 androidx-compose-material-icons-extended = { group = "androidx.compose.material", name = "material-icons-extended" }
 androidx-media3-exoplayer = { group = "androidx.media3", name = "media3-exoplayer", version.ref = "media3" }
 androidx-media3-ui = { group = "androidx.media3", name = "media3-ui", version.ref = "media3" }
+androidx-biometric = { group = "androidx.biometric", name = "biometric", version.ref = "biometric" }
+androidx-fragment = { group = "androidx.fragment", name = "fragment", version.ref = "fragment" }
 junit = { group = "junit", name = "junit", version.ref = "junit" }
 androidx-test-ext-junit = { group = "androidx.test.ext", name = "junit", version.ref = "androidxTestExtJunit" }
 androidx-test-runner = { group = "androidx.test", name = "runner", version.ref = "androidxTestRunner" }

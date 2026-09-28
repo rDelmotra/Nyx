@@ -563,7 +563,11 @@ open class TransferController {
                     val chunk = volume.readChunk(path, done, toRead)
                     if (chunk.isEmpty()) break
 
-                    out.write(chunk)
+                    try {
+                        out.write(chunk)
+                    } finally {
+                        java.util.Arrays.fill(chunk, 0.toByte())
+                    }
                     done += chunk.size
 
                     val now = System.currentTimeMillis()
@@ -835,6 +839,9 @@ open class TransferController {
                 Trace.i("TransferManager", "Import completed: $transferId in ${totalSec}s (inode $ino)")
                 Trace.i(formatThroughput("import-single", done, stats.snapshot()))
             } finally {
+                for (i in 0 until buffer.capacity()) {
+                    buffer.put(i, 0.toByte())
+                }
                 writer.close()
             }
         } catch (e: CancellationException) {

@@ -567,12 +567,22 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
             write(buf, length)
         }
 
+        private fun scrubScratch() {
+            scratch?.let { buf ->
+                for (i in 0 until buf.capacity()) {
+                    buf.put(i, 0.toByte())
+                }
+            }
+            scratch = null
+        }
+
         open fun finish(parentPath: String, name: String): Long {
             check(writerHandle != 0L) { "writer is closed" }
             check(handle != 0L) { "volume is closed" }
             val wh = writerHandle
             writerHandle = 0
             activeWriters -= this
+            scrubScratch()
             val result = LuksNative.nativeFinishFile(handle, wh, parentPath, name)
             invalidateStatFsCache()
             return result
@@ -583,6 +593,7 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
         }
 
         open override fun close() {
+            scrubScratch()
             if (writerHandle != 0L && handle != 0L) {
                 try {
                     LuksNative.nativeCloseWriter(handle, writerHandle)

@@ -269,18 +269,22 @@ object TreeImporter {
         try {
             source.open(entry.sourceId).use { input ->
                 val buffer = ByteArray(CHUNK_SIZE)
-                while (true) {
-                    // The read and the write are timed separately because the
-                    // loop runs them in series: the drive is idle for the whole
-                    // read and the phone for the whole write. Whether that costs
-                    // anything worth fixing is exactly what these two numbers
-                    // answer -- see TransferStats.
-                    val read = stats.read { input.read(buffer) }
-                    if (read < 0) break
-                    if (read == 0) continue
-                    stats.write { volume.writeChunk(writer, buffer, 0, read) }
-                    total += read
-                    onChunk(total)
+                try {
+                    while (true) {
+                        // The read and the write are timed separately because the
+                        // loop runs them in series: the drive is idle for the whole
+                        // read and the phone for the whole write. Whether that costs
+                        // anything worth fixing is exactly what these two numbers
+                        // answer -- see TransferStats.
+                        val read = stats.read { input.read(buffer) }
+                        if (read < 0) break
+                        if (read == 0) continue
+                        stats.write { volume.writeChunk(writer, buffer, 0, read) }
+                        total += read
+                        onChunk(total)
+                    }
+                } finally {
+                    java.util.Arrays.fill(buffer, 0.toByte())
                 }
             }
         } catch (t: Throwable) {

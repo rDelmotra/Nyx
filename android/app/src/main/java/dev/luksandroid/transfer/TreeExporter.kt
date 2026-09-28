@@ -280,15 +280,19 @@ object TreeExporter {
         try {
             source.open(entry.sourceId).use { input ->
                 val buffer = ByteArray(CHUNK_SIZE)
-                while (true) {
-                    // Here "read" is the drive and "write" is the phone -- the
-                    // mirror of TreeImporter's, and serialised the same way.
-                    val read = stats.read { input.read(buffer) }
-                    if (read < 0) break
-                    if (read == 0) continue
-                    stats.write { output.write(buffer, 0, read) }
-                    total += read
-                    onChunk(total)
+                try {
+                    while (true) {
+                        // Here "read" is the drive and "write" is the phone -- the
+                        // mirror of TreeImporter's, and serialised the same way.
+                        val read = stats.read { input.read(buffer) }
+                        if (read < 0) break
+                        if (read == 0) continue
+                        stats.write { output.write(buffer, 0, read) }
+                        total += read
+                        onChunk(total)
+                    }
+                } finally {
+                    java.util.Arrays.fill(buffer, 0.toByte())
                 }
             }
         } finally {

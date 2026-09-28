@@ -667,5 +667,30 @@ class LuksSessionTest {
         assertTrue("Expected volume to be closed upon cancellation", volumeClosed.get())
         assertFalse("State should not be Failed after cancellation", session.state.value is SessionState.Failed)
     }
+
+    @Test
+    fun testFileWriterScratchBufferScrubbedOnClose() {
+        val volume = object : dev.luksandroid.LuksVolume(0L) {
+            override val info = dev.luksandroid.VolumeInfo("label", "uuid", 4096, 1024L, "ext4", emptyList())
+        }
+        val writer = volume.run {
+            object : dev.luksandroid.LuksVolume.FileWriter(100L) {
+                override fun write(data: java.nio.ByteBuffer, len: Int) {}
+            }
+        }
+        writer.write(byteArrayOf(1, 2, 3, 4, 5))
+
+        val field = dev.luksandroid.LuksVolume.FileWriter::class.java.getDeclaredField("scratch").apply {
+            isAccessible = true
+        }
+        val buf = field.get(writer) as java.nio.ByteBuffer
+        org.junit.Assert.assertNotNull(buf)
+        assertTrue((0 until buf.capacity()).any { buf.get(it) != 0.toByte() })
+
+        writer.close()
+
+        org.junit.Assert.assertNull(field.get(writer))
+        assertTrue((0 until buf.capacity()).all { buf.get(it) == 0.toByte() })
+    }
 }
 

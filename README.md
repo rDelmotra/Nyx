@@ -41,7 +41,7 @@ Traditional solutions require rooting the Android device, installing custom kern
 **[⬇ Download the latest release](https://github.com/rDelmotra/luks-android/releases/latest)** — grab `app-release.apk` (v0.4.0) directly, no build required. Requires Android 10+ (API 29) on an arm64-v8a device.
 
 > [!NOTE]
-> The `v0.4.0` release introduces **hardware-backed biometric unlock** (fingerprint / face authentication via Android Keystore backed AES-GCM passphrase vault), alongside **in-app media playback** with zero-wear block caching, loopback HTTP streaming, and full ext4/Btrfs write support.
+> The `v0.4.0` release introduces **hardware-backed biometric unlock** (fingerprint / face authentication via Android Keystore backed AES-GCM passphrase vault), alongside **in-app media playback** with zero-wear in-memory block caching, air-gapped zero-network security, and full ext4/Btrfs write support.
 
 > [!WARNING]
 > **Write at your own risk.** Writing directly to raw block storage from unprivileged userspace over mobile USB OTG carries inherent physical risk. While this engine is verified against Linux kernel oracles and enforces fail-closed write fencing, real-world hardware disruptions (unstable OTG adapters, loose USB-C cables, surprise disconnections, or drive controllers rejecting cache flush) can interrupt in-flight transactions. **Always maintain verified backups of critical data before performing write operations.**
@@ -80,7 +80,7 @@ adb install -r android/app/build/outputs/apk/release/app-release.apk
 
 - **Rootless operation.** Runs entirely in unprivileged userspace using Android's USB Host APIs. No root access, unlocked bootloaders, or custom ROMs required.
 - **Hardware-backed biometric unlock.** Unlock encrypted LUKS2 containers using fingerprint or face authentication (`BiometricPrompt`). Passphrases are vaulted inside the hardware-isolated `AndroidKeyStore` using AES-256-GCM with biometric authentication-per-use gating and auto-invalidation if enrollment changes.
-- **In-app media player & streaming.** High-performance video and audio playback directly from decrypted LUKS2 containers and plain drives. Features a 1 MiB (4 × 256 KiB) LRU block cache that eliminates SSD flash wear and an embedded RFC 7233 range server for external players (VLC, MX Player) with zero disk extraction.
+- **In-app media player.** High-performance video and audio playback directly from decrypted LUKS2 containers and plain drives. Features a 1 MiB (4 × 256 KiB) in-memory LRU block cache that eliminates SSD flash wear with zero disk extraction and zero network permissions required.
 - **LUKS2 container cryptography.** Full support for Argon2id and PBKDF2 key derivation functions with AES-256-XTS ciphers, hardware-accelerated via ARMv8 crypto extensions (`pmull`, `aes`).
 - **Memory security and key zeroization.** Master keys, subkeys, and expanded cipher schedules implement `Zeroize` and `ZeroizeOnDrop`, purging sensitive material from memory immediately upon exit.
 - **Btrfs filesystem engine.** Complete B-tree Copy-on-Write (CoW) mutation engine, live Castagnoli CRC32c checksum calculations, dynamic multi-gigabyte chunk allocation, and Free-Space Tree (FST) CoW management.

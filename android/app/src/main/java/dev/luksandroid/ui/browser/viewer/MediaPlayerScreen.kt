@@ -256,10 +256,6 @@ fun MediaPlayerScreen(
                         }
                     },
                     actions = {
-                        // External-player handoff (LocalHttpStreamServer) is
-                        // implemented but not wired to any UI entry point yet —
-                        // it opens a new local attack surface (loopback HTTP,
-                        // token-gated) and hasn't been decided on.
                         if (!isAudioOnly) {
                             TextButton(onClick = { isFullscreen = true }) {
                                 Text("Fullscreen")

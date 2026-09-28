@@ -2142,26 +2142,6 @@ fun BrowserItemRow(
                     },
                 )
 
-                if (!item.isDir && isPlayableMedia(item.name)) {
-                    DropdownMenuItem(
-                        text = { Text("Open in external app") },
-                        leadingIcon = {
-                            Icon(
-                                imageVector = Icons.Default.Share,
-                                contentDescription = null,
-                                modifier = Modifier.size(20.dp),
-                            )
-                        },
-                        onClick = {
-                            menuExpanded = false
-                            dev.luksandroid.streaming.LocalHttpStreamServer.launchExternalPlayer(
-                                context = context,
-                                fullPath = item.fullPath,
-                                displayName = item.name,
-                            )
-                        },
-                    )
-                }
 
                 if (!item.isDir) {
                     DropdownMenuItem(

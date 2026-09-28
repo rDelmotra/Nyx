@@ -55,7 +55,7 @@ Measured on physical ARM64 hardware (Android 14+):
 | **Btrfs Compression** | Supported | Planned | ZSTD, LZO, and ZLIB decompression supported; write compression deferred |
 | **Btrfs Multi-device (RAID)** | Refused | Refused | Fail-closed refusal to protect multi-device arrays on mobile |
 | **SAF DocumentsProvider** | Supported | Planned | Exposes storage to Android system file pickers (Read-only) |
-| **Media Player & Streaming** | Supported | N/A | AndroidX Media3 ExoPlayer with 1 MiB LRU block cache and RFC 7233 local HTTP server |
+| **In-App Media Player** | Supported | N/A | AndroidX Media3 ExoPlayer with 1 MiB in-memory LRU block cache (air-gapped, zero-network) |
 | **Biometric Unlock** | Supported | N/A | Hardware-backed Android Keystore AES-GCM vault with BiometricPrompt auth-per-use |
 
 > [!NOTE]

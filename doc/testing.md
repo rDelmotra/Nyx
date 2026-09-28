@@ -56,7 +56,7 @@ cd android && ./gradlew assembleRelease -PallowWriteInRelease=true
 ```bash
 cd android && ./gradlew testDebugUnitTest
 ```
-Currently 244 unit tests passing, covering session lifecycle, device state, plain volume write consent, breadcrumbs, media block caching, RFC 7233 local streaming, biometric partition key derivation, and error handling.
+Currently 240 unit tests passing, covering session lifecycle, device state, plain volume write consent, breadcrumbs, media block caching, biometric partition key derivation, and error handling.
 
 ---
 

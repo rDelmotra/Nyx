@@ -503,7 +503,6 @@ open class SessionController(
         activeUsbDevice = null
 
         TransferManager.resetTransferLocks()
-        runCatching { dev.luksandroid.streaming.LocalHttpStreamServer.stop() }
 
         // 1. Volume must close FIRST
         try {

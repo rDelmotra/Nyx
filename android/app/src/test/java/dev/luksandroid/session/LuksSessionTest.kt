@@ -515,4 +515,157 @@ class LuksSessionTest {
         expectNoLock(android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW)
         expectNoLock(android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_MODERATE)
     }
+
+    @Test
+    fun testUnlockCancellationClosesVolumeAndRethrowsCancellation() = runBlocking {
+        val partition = PartitionInfo(
+            index = 1,
+            name = "cryptdata",
+            offsetBytes = 1048576L,
+            sizeBytes = 1073741824L,
+            isLuks = true,
+            luksVersion = 2,
+        )
+
+        val volumeClosed = java.util.concurrent.atomic.AtomicBoolean(false)
+        val fakeVolume = object : dev.luksandroid.LuksVolume(0L) {
+            override val info = dev.luksandroid.VolumeInfo(
+                label = "crypt",
+                uuid = "dummy-uuid",
+                blockSize = 4096,
+                sizeBytes = 1073741824L,
+                fsType = "ext4",
+                subvolumes = emptyList(),
+                encrypted = true,
+            )
+            override fun listDir(path: String) = emptyList<Entry>()
+            override fun close() {
+                volumeClosed.set(true)
+            }
+        }
+
+        val unlockStarted = CompletableDeferred<Unit>()
+        val canCompleteUnlock = CompletableDeferred<Unit>()
+
+        val fakeDevice = object : dev.luksandroid.LuksDevice(0L) {
+            override val info = dev.luksandroid.DeviceInfo(
+                vendor = "USB",
+                product = "Drive",
+                blockSize = 512,
+                sizeBytes = 2147483648L,
+                tableKind = "GPT",
+                partitions = listOf(partition),
+                writeProbe = null,
+            )
+
+            override fun unlock(partitionOffset: Long, password: dev.luksandroid.security.SecurePassphraseBuffer): dev.luksandroid.LuksVolume {
+                unlockStarted.complete(Unit)
+                runBlocking { canCompleteUnlock.await() }
+                return fakeVolume
+            }
+        }
+
+        val context = object : android.content.ContextWrapper(null) {
+            override fun startForegroundService(service: android.content.Intent?): android.content.ComponentName? = null
+            override fun stopService(name: android.content.Intent?): Boolean = true
+        }
+
+        val direct = java.nio.ByteBuffer.allocateDirect(16)
+        direct.put("test".toByteArray())
+        val buffer = dev.luksandroid.security.SecurePassphraseBuffer.of(direct, 4)
+
+        var cancellationThrown = false
+        val job = testScope.launch {
+            try {
+                session.unlock(context, fakeDevice, partition, buffer)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                cancellationThrown = true
+                throw e
+            }
+        }
+
+        unlockStarted.await()
+        job.cancel()
+        canCompleteUnlock.complete(Unit)
+        job.join()
+
+        buffer.close()
+
+        assertTrue("Expected CancellationException to be thrown, but was swallowed", cancellationThrown)
+        assertTrue("Expected volume to be closed upon cancellation", volumeClosed.get())
+        assertFalse("State should not be Failed after cancellation", session.state.value is SessionState.Failed)
+    }
+
+    @Test
+    fun testOpenPlainCancellationClosesVolumeAndRethrowsCancellation() = runBlocking {
+        val partition = PartitionInfo(
+            index = 1,
+            name = "plaindata",
+            offsetBytes = 1048576L,
+            sizeBytes = 1073741824L,
+            isLuks = false,
+            luksVersion = null,
+            fsType = "ext4",
+        )
+
+        val volumeClosed = java.util.concurrent.atomic.AtomicBoolean(false)
+        val fakeVolume = object : dev.luksandroid.LuksVolume(0L) {
+            override val info = dev.luksandroid.VolumeInfo(
+                label = "plain",
+                uuid = "dummy-uuid",
+                blockSize = 4096,
+                sizeBytes = 1073741824L,
+                fsType = "ext4",
+                subvolumes = emptyList(),
+                encrypted = false,
+            )
+            override fun listDir(path: String) = emptyList<Entry>()
+            override fun close() {
+                volumeClosed.set(true)
+            }
+        }
+
+        val openStarted = CompletableDeferred<Unit>()
+        val canCompleteOpen = CompletableDeferred<Unit>()
+
+        val fakeDevice = object : dev.luksandroid.LuksDevice(0L) {
+            override val info = dev.luksandroid.DeviceInfo(
+                vendor = "USB",
+                product = "Drive",
+                blockSize = 512,
+                sizeBytes = 2147483648L,
+                tableKind = "GPT",
+                partitions = listOf(partition),
+                writeProbe = null,
+            )
+
+            override fun openPlain(partitionOffset: Long): dev.luksandroid.LuksVolume {
+                openStarted.complete(Unit)
+                runBlocking { canCompleteOpen.await() }
+                return fakeVolume
+            }
+        }
+
+        val context = object : android.content.ContextWrapper(null) {}
+
+        var cancellationThrown = false
+        val job = testScope.launch {
+            try {
+                session.openPlain(context, fakeDevice, partition)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                cancellationThrown = true
+                throw e
+            }
+        }
+
+        openStarted.await()
+        job.cancel()
+        canCompleteOpen.complete(Unit)
+        job.join()
+
+        assertTrue("Expected CancellationException to be thrown, but was swallowed", cancellationThrown)
+        assertTrue("Expected volume to be closed upon cancellation", volumeClosed.get())
+        assertFalse("State should not be Failed after cancellation", session.state.value is SessionState.Failed)
+    }
 }
+

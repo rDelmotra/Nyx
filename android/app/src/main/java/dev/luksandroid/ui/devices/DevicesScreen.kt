@@ -285,12 +285,16 @@ fun DevicesScreen(
                     vaultVersion++
                     startManualUnlock(device, partition, outcome.notice)
                 }
-                is BiometricUnlockOutcome.Passphrase -> outcome.buffer.use { buf ->
-                    val result = LuksSession.unlock(context, device, partition, buf)
-                    if (result is SessionState.Failed && result.message.contains("wrong passphrase", ignoreCase = true)) {
-                        BiometricPassphraseVault.forget(context, bioKey)
-                        vaultVersion++
-                        dialogNotice = BIOMETRIC_NOTICE_STALE
+                is BiometricUnlockOutcome.Passphrase -> {
+                    LuksSession.scope.launch {
+                        outcome.buffer.use { buf ->
+                            val result = LuksSession.unlock(context, device, partition, buf)
+                            if (result is SessionState.Failed && result.message.contains("wrong passphrase", ignoreCase = true)) {
+                                BiometricPassphraseVault.forget(context, bioKey)
+                                vaultVersion++
+                                dialogNotice = BIOMETRIC_NOTICE_STALE
+                            }
+                        }
                     }
                 }
             }
@@ -446,7 +450,7 @@ fun DevicesScreen(
                         startBiometricUnlock(device, partition)
                     },
                     onMountPartition = { device, partition ->
-                        scope.launch {
+                        LuksSession.scope.launch {
                             LuksSession.openPlain(context, device, partition)
                         }
                     },
@@ -477,7 +481,7 @@ fun DevicesScreen(
                 dialogNotice = null
                 val enrollKey = if (enroll) bioKey else null
                 val act = activity
-                scope.launch {
+                LuksSession.scope.launch {
                     buffer.use { buf ->
                         var pendingKey: String? = null
                         if (enrollKey != null && act != null) {

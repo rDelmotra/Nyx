@@ -10,6 +10,7 @@ import dev.luksandroid.PartitionInfo
 import dev.luksandroid.Trace
 import dev.luksandroid.UnlockService
 import dev.luksandroid.security.SecurePassphraseBuffer
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -47,7 +48,7 @@ sealed interface SessionState {
  * Process-scoped, thread-safe, reference-counted owner of the unlocked LUKS volume.
  */
 open class SessionController(
-    private val scope: CoroutineScope = CoroutineScope(Dispatchers.Default + SupervisorJob()),
+    val scope: CoroutineScope = CoroutineScope(Dispatchers.Default + SupervisorJob()),
     private val timeProvider: () -> Long = { System.currentTimeMillis() },
 ) {
     private val _state = MutableStateFlow<SessionState>(SessionState.Locked)
@@ -202,10 +203,13 @@ open class SessionController(
         _state.value = SessionState.Unlocking(partition)
         this.activeUsbDevice = device.usbDevice
         val started = timeProvider()
+        var producedVolume: LuksVolume? = null
         try {
             val vol = UnlockService.holding(context) {
                 withContext(Dispatchers.IO) {
-                    device.unlock(partition.offsetBytes, password)
+                    val v = device.unlock(partition.offsetBytes, password)
+                    producedVolume = v
+                    v
                 }
             }
             val kdfMs = timeProvider() - started
@@ -228,6 +232,15 @@ open class SessionController(
             _state.value = unlocked
             restartIdleTimer()
             unlocked
+        } catch (e: CancellationException) {
+            this.activeUsbDevice = null
+            if (this.volume !== producedVolume) {
+                runCatching { producedVolume?.close() }
+            }
+            if (_state.value is SessionState.Unlocking) {
+                _state.value = SessionState.Locked
+            }
+            throw e
         } catch (e: LuksException) {
             this.activeUsbDevice = null
             Trace.err(e.code, "unlock")
@@ -272,9 +285,12 @@ open class SessionController(
         _state.value = SessionState.Unlocking(partition)
         this.activeUsbDevice = device.usbDevice
         val started = timeProvider()
+        var producedVolume: LuksVolume? = null
         try {
             val vol = withContext(Dispatchers.IO) {
-                device.openPlain(partition.offsetBytes)
+                val v = device.openPlain(partition.offsetBytes)
+                producedVolume = v
+                v
             }
             val mountMs = timeProvider() - started
             val info = vol.info
@@ -296,6 +312,15 @@ open class SessionController(
             _state.value = unlocked
             restartIdleTimer()
             unlocked
+        } catch (e: CancellationException) {
+            this.activeUsbDevice = null
+            if (this.volume !== producedVolume) {
+                runCatching { producedVolume?.close() }
+            }
+            if (_state.value is SessionState.Unlocking) {
+                _state.value = SessionState.Locked
+            }
+            throw e
         } catch (e: LuksException) {
             this.activeUsbDevice = null
             Trace.err(e.code, "open_plain")

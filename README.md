@@ -29,10 +29,14 @@ A rootless, userspace storage and cryptographic stack for Android: LUKS2 decrypt
 
 Traditional solutions require rooting the Android device, installing custom kernels, or cross-compiling kernel modules (`dm-crypt`, `btrfs.ko`). LUKS-Android moves the entire stack into an unprivileged userspace process. A high-performance Rust core handles cryptographic decryption and B-tree operations, while a modern Jetpack Compose UI provides intuitive directory browsing, file transfers, and diagnostics.
 
-<div align="center">
-<!-- Demonstration screenshot / recording placeholder -->
-<!-- <img src="./readmeAssets/app-demo.png" alt="LUKS-Android application interface" width="720" /> -->
-</div>
+<p align="center">
+  <img src="./readmeAssets/browser-export.gif" alt="In-Browser Quick Export" width="340" />
+  &nbsp;
+  <img src="./readmeAssets/transfer-queue.gif" alt="Background Transfer Queue" width="340" />
+</p>
+<p align="center">
+  <em>Live 95–100+ MiB/s export in action: real-time in-browser progress (left) and dedicated background transfer queue (right).</em>
+</p>
 
 ---
 

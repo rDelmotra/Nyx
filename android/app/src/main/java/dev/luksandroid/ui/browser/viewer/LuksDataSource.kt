@@ -9,6 +9,9 @@ import androidx.media3.datasource.DataSourceException
 import androidx.media3.datasource.DataSpec
 import dev.luksandroid.session.LuksSession
 import dev.luksandroid.session.SessionController
+import dev.luksandroid.session.SessionState
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import java.io.EOFException
 
@@ -33,11 +36,35 @@ class LuksDataSource(
     private var readPosition: Long = 0L
     private var bytesRemaining: Long = 0L
     private var opened: Boolean = false
+    private var sessionJob: Job? = null
 
     // LRU Block Cache: Block Index (position / blockSize) -> ByteArray
     private val blockCache = object : LinkedHashMap<Long, ByteArray>(maxBlocks, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Long, ByteArray>?): Boolean {
-            return size > maxBlocks
+            if (size > maxBlocks) {
+                eldest?.value?.let { java.util.Arrays.fill(it, 0.toByte()) }
+                return true
+            }
+            return false
+        }
+    }
+
+    init {
+        sessionJob = session.scope.launch {
+            session.state.collect { state ->
+                if (state is SessionState.Locked) {
+                    clearAndZeroBlockCache()
+                }
+            }
+        }
+    }
+
+    private fun clearAndZeroBlockCache() {
+        synchronized(blockCache) {
+            for (block in blockCache.values) {
+                java.util.Arrays.fill(block, 0.toByte())
+            }
+            blockCache.clear()
         }
     }
 
@@ -59,7 +86,7 @@ class LuksDataSource(
 
         // Invalidate cache only if switching to a different file
         if (cleanPath != path) {
-            blockCache.clear()
+            clearAndZeroBlockCache()
             path = cleanPath
         }
 
@@ -126,7 +153,9 @@ class LuksDataSource(
     }
 
     private fun getOrLoadBlock(blockIndex: Long): ByteArray {
-        blockCache[blockIndex]?.let { return it }
+        synchronized(blockCache) {
+            blockCache[blockIndex]?.let { return it }
+        }
 
         val startOffset = blockIndex * blockSize
         val fetchSize = minOf(blockSize.toLong(), totalFileSize - startOffset).toInt()
@@ -142,7 +171,9 @@ class LuksDataSource(
             )
         }
 
-        blockCache[blockIndex] = data
+        synchronized(blockCache) {
+            blockCache[blockIndex] = data
+        }
         return data
     }
 
@@ -156,12 +187,35 @@ class LuksDataSource(
         }
     }
 
+    fun release() {
+        sessionJob?.cancel()
+        sessionJob = null
+        clearAndZeroBlockCache()
+    }
+
+    protected fun finalize() {
+        release()
+    }
+
     class Factory(
         private val session: SessionController = LuksSession,
         private val blockSize: Int = DEFAULT_BLOCK_SIZE,
         private val maxBlocks: Int = DEFAULT_MAX_BLOCKS,
     ) : DataSource.Factory {
-        override fun createDataSource(): DataSource = LuksDataSource(session, blockSize, maxBlocks)
+        private val instances = mutableListOf<LuksDataSource>()
+
+        override fun createDataSource(): DataSource {
+            val ds = LuksDataSource(session, blockSize, maxBlocks)
+            synchronized(instances) { instances.add(ds) }
+            return ds
+        }
+
+        fun release() {
+            synchronized(instances) {
+                instances.forEach { it.release() }
+                instances.clear()
+            }
+        }
     }
 
     companion object {

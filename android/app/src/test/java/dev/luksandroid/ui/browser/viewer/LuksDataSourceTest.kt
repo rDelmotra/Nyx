@@ -60,12 +60,16 @@ class LuksDataSourceTest {
             )
         }
 
+        val returnedChunks = mutableListOf<ByteArray>()
+
         override fun readChunk(path: String, offset: Long, len: Int): ByteArray {
             chunkReadCount++
             val data = fileDataMap[path] ?: return ByteArray(0)
             if (offset >= data.size) return ByteArray(0)
             val end = minOf(data.size.toLong(), offset + len).toInt()
-            return data.copyOfRange(offset.toInt(), end)
+            val chunk = data.copyOfRange(offset.toInt(), end)
+            returnedChunks.add(chunk)
+            return chunk
         }
     }
 
@@ -270,5 +274,78 @@ class LuksDataSourceTest {
         // Multiple close calls must be idempotent (no duplicate transferEnd)
         dataSource.close()
         assertEquals(1, endCount)
+    }
+
+    @Test
+    fun `cached blocks are zeroized on release`() {
+        val testData = ByteArray(1024) { (it + 1).toByte() }
+        testVolume.fileDataMap["/secret.bin"] = testData
+
+        val dataSource = LuksDataSource(session = session, blockSize = 512, maxBlocks = 2)
+        dataSource.open(DataSpec(LuksDataSource.uriFor("/secret.bin")))
+
+        val buf = ByteArray(512)
+        dataSource.read(buf, 0, 512)
+        assertEquals(1, testVolume.returnedChunks.size)
+        val cachedChunk = testVolume.returnedChunks[0]
+        // Chunk should not be zeroed yet
+        assertTrue(cachedChunk.any { it != 0.toByte() })
+
+        dataSource.release()
+
+        // After release, the cached block ByteArray must have been wiped with zeroes
+        assertTrue(cachedChunk.all { it == 0.toByte() })
+    }
+
+    @Test
+    fun `cached blocks are zeroized on session lock`() {
+        val testData = ByteArray(1024) { (it + 1).toByte() }
+        testVolume.fileDataMap["/secret2.bin"] = testData
+
+        val dataSource = LuksDataSource(session = session, blockSize = 512, maxBlocks = 2)
+        dataSource.open(DataSpec(LuksDataSource.uriFor("/secret2.bin")))
+
+        val buf = ByteArray(512)
+        dataSource.read(buf, 0, 512)
+        assertEquals(1, testVolume.returnedChunks.size)
+        val cachedChunk = testVolume.returnedChunks[0]
+        assertTrue(cachedChunk.any { it != 0.toByte() })
+
+        runBlocking { session.lock() }
+
+        // After session lock, the cached block ByteArray must have been wiped with zeroes
+        assertTrue(cachedChunk.all { it == 0.toByte() })
+    }
+
+    @Test
+    fun `cached blocks are zeroized on LRU eviction and file switch`() {
+        val testData1 = ByteArray(1024) { (it + 1).toByte() }
+        val testData2 = ByteArray(1024) { (it + 50).toByte() }
+        testVolume.fileDataMap["/file1.bin"] = testData1
+        testVolume.fileDataMap["/file2.bin"] = testData2
+
+        // Cache capacity = 1 block (512 bytes)
+        val dataSource = LuksDataSource(session = session, blockSize = 512, maxBlocks = 1)
+        dataSource.open(DataSpec(LuksDataSource.uriFor("/file1.bin")))
+
+        val buf = ByteArray(512)
+        // Read block 0 of file1
+        dataSource.read(buf, 0, 512)
+        assertEquals(1, testVolume.returnedChunks.size)
+        val block0 = testVolume.returnedChunks[0]
+        assertTrue(block0.any { it != 0.toByte() })
+
+        // Read block 1 of file1 -> triggers LRU eviction of block 0
+        dataSource.read(buf, 0, 512)
+        assertEquals(2, testVolume.returnedChunks.size)
+        val block1 = testVolume.returnedChunks[1]
+        assertTrue(block0.all { it == 0.toByte() }) // evicted block 0 wiped
+        assertTrue(block1.any { it != 0.toByte() })
+
+        // Switch to file2 -> triggers clearAndZeroBlockCache
+        dataSource.open(DataSpec(LuksDataSource.uriFor("/file2.bin")))
+        assertTrue(block1.all { it == 0.toByte() }) // block 1 wiped on file switch
+
+        dataSource.release()
     }
 }

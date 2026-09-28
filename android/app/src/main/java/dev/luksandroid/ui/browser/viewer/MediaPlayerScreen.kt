@@ -161,6 +161,7 @@ fun MediaPlayerScreen(
         }
     }
 
+    val dataSourceFactory = remember(fullPath) { LuksDataSource.Factory() }
     val player = remember(fullPath) {
         // 30-60s buffer window: fewer, larger native reads than the default,
         // at the cost of more RAM held per open file.
@@ -189,7 +190,7 @@ fun MediaPlayerScreen(
                     .setUri(LuksDataSource.uriFor(fullPath))
                 inferMimeType(fullPath)?.let { mediaItemBuilder.setMimeType(it) }
 
-                val mediaSource = ProgressiveMediaSource.Factory(LuksDataSource.Factory())
+                val mediaSource = ProgressiveMediaSource.Factory(dataSourceFactory)
                     .createMediaSource(mediaItemBuilder.build())
                 setMediaSource(mediaSource)
 
@@ -212,7 +213,10 @@ fun MediaPlayerScreen(
     }
 
     DisposableEffect(player) {
-        onDispose { player.release() }
+        onDispose {
+            player.release()
+            dataSourceFactory.release()
+        }
     }
 
     // Fullscreen system bars and orientation management (Video Only)

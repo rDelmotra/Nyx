@@ -1,9 +1,12 @@
 package dev.luksandroid.ui.browser
 
 import android.content.ClipData
+import android.content.ClipDescription
 import android.content.ClipboardManager
 import android.content.Context
 import android.net.Uri
+import android.os.Build
+import android.os.PersistableBundle
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -2211,7 +2214,6 @@ fun ChecksumResultDialog(
     result: ChecksumResult,
     onDismissRequest: () -> Unit,
 ) {
-    val clipboardManager = LocalClipboardManager.current
     val context = LocalContext.current
     val mbPerSec = result.bytesPerSec.toDouble() / (1L shl 20)
 
@@ -2268,7 +2270,17 @@ fun ChecksumResultDialog(
         confirmButton = {
             Button(
                 onClick = {
-                    clipboardManager.setText(AnnotatedString(result.sha256))
+                    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                    if (cm != null) {
+                        val clip = ClipData.newPlainText("SHA-256 Checksum", result.sha256).apply {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                description.extras = (description.extras ?: PersistableBundle()).apply {
+                                    putBoolean(ClipDescription.EXTRA_IS_SENSITIVE, true)
+                                }
+                            }
+                        }
+                        cm.setPrimaryClip(clip)
+                    }
                     Toast.makeText(context, "Checksum copied to clipboard", Toast.LENGTH_SHORT).show()
                 },
             ) {

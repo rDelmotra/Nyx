@@ -142,6 +142,7 @@ object Trace {
      * path cannot be passed here even by mistake.
      */
     fun err(code: Int, operation: String, detail: ErrDetail = ErrDetail.None) {
+        if (!BuildConfig.DEBUG) return
         val formatted = "[${currentThreadTag()}] ${formatErr(code, operation, detail)}"
         runCatching { Log.e(TAG_ERR, formatted) }
         appendToFile("E", TAG_ERR, formatted)

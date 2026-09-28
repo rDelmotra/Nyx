@@ -17,6 +17,7 @@ import javax.crypto.AEADBadTagException
 import javax.crypto.Cipher
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
 
 internal tailrec fun Context.findFragmentActivity(): FragmentActivity? = when (this) {
@@ -47,17 +48,20 @@ private sealed interface PromptResult {
  * backgrounded mid-prompt (app switch, screen lock) — without it, a
  * cancelled coroutine scope would leave the CompletableDeferred pending
  * forever and the caller hung.
+ *
+ * All BiometricPrompt, Lifecycle observer, and resume operations must execute on
+ * [Dispatchers.Main.immediate] to avoid "Method removeObserver must be called on the main thread".
  */
 private suspend fun FragmentActivity.runBiometricPrompt(
     title: String,
     subtitle: String?,
     negativeText: String,
     cipher: Cipher,
-): PromptResult {
+): PromptResult = withContext(Dispatchers.Main.immediate) {
     val result = CompletableDeferred<PromptResult>()
     val prompt = BiometricPrompt(
-        this,
-        ContextCompat.getMainExecutor(this),
+        this@runBiometricPrompt,
+        ContextCompat.getMainExecutor(this@runBiometricPrompt),
         object : BiometricPrompt.AuthenticationCallback() {
             override fun onAuthenticationSucceeded(authResult: BiometricPrompt.AuthenticationResult) {
                 val c = authResult.cryptoObject?.cipher
@@ -84,15 +88,20 @@ private suspend fun FragmentActivity.runBiometricPrompt(
             result.complete(PromptResult.Error(BiometricPrompt.ERROR_CANCELED))
         }
     }
-    return try {
+    try {
         lifecycle.withResumed {
             lifecycle.addObserver(onStop)
             prompt.authenticate(info, BiometricPrompt.CryptoObject(cipher))
         }
         result.await()
+    } catch (e: Exception) {
+        Trace.e("BiometricUnlock: runBiometricPrompt error: ${Trace.throwableSummary(e)}")
+        PromptResult.Error(BiometricPrompt.ERROR_CANCELED)
     } finally {
-        lifecycle.removeObserver(onStop)
-        if (!result.isCompleted) prompt.cancelAuthentication()
+        withContext(NonCancellable) {
+            lifecycle.removeObserver(onStop)
+            if (!result.isCompleted) prompt.cancelAuthentication()
+        }
     }
 }
 

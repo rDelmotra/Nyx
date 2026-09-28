@@ -291,8 +291,10 @@ fun DevicesScreen(
                             val result = LuksSession.unlock(context, device, partition, buf)
                             if (result is SessionState.Failed && result.message.contains("wrong passphrase", ignoreCase = true)) {
                                 BiometricPassphraseVault.forget(context, bioKey)
-                                vaultVersion++
-                                dialogNotice = BIOMETRIC_NOTICE_STALE
+                                withContext(Dispatchers.Main) {
+                                    vaultVersion++
+                                    dialogNotice = BIOMETRIC_NOTICE_STALE
+                                }
                             }
                         }
                     }
@@ -485,13 +487,13 @@ fun DevicesScreen(
                     buffer.use { buf ->
                         var pendingKey: String? = null
                         if (enrollKey != null && act != null) {
-                            biometricBusy = true
+                            withContext(Dispatchers.Main) { biometricBusy = true }
                             try {
                                 if (enrollBiometric(act, enrollKey, partition.name.ifBlank { "Partition #${partition.index}" }, buf)) {
                                     pendingKey = enrollKey
                                 }
                             } finally {
-                                biometricBusy = false
+                                withContext(Dispatchers.Main) { biometricBusy = false }
                             }
                         }
                         var unlocked = false
@@ -500,7 +502,7 @@ fun DevicesScreen(
                         } finally {
                             pendingKey?.let { k ->
                                 if (!unlocked) BiometricPassphraseVault.forget(context, k)
-                                vaultVersion++
+                                withContext(Dispatchers.Main) { vaultVersion++ }
                             }
                         }
                     }

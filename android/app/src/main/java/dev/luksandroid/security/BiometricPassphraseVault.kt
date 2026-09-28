@@ -4,11 +4,13 @@ import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyPermanentlyInvalidatedException
 import android.security.keystore.KeyProperties
+import android.security.keystore.StrongBoxUnavailableException
 import android.util.Base64
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_STRONG
 import java.nio.ByteBuffer
 import java.security.KeyStore
+import java.security.ProviderException
 import java.util.Arrays
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
@@ -117,22 +119,37 @@ object BiometricPassphraseVault {
         val ks = KeyStore.getInstance(KEYSTORE).apply { load(null) }
         (ks.getKey(alias(partitionKey), null) as? SecretKey)?.let { return it }
 
-        val builder = KeyGenParameterSpec.Builder(
-            alias(partitionKey),
-            KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
-        )
-            .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
-            .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
-            .setUserAuthenticationRequired(true)
-            .setInvalidatedByBiometricEnrollment(true)
-            // Leaving the validity duration/type unset (rather than calling
-            // setUserAuthenticationParameters explicitly) already defaults to
-            // "every use" + AUTH_BIOMETRIC_STRONG per AOSP's own
-            // KeyGenParameterSpec.Builder field defaults — confirmed against
-            // frameworks/base source, not assumed. Same as Aegis's key setup.
+        fun createSpec(strongBox: Boolean): KeyGenParameterSpec {
+            val builder = KeyGenParameterSpec.Builder(
+                alias(partitionKey),
+                KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
+            )
+                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                .setUserAuthenticationRequired(true)
+                .setInvalidatedByBiometricEnrollment(true)
+                // Leaving the validity duration/type unset (rather than calling
+                // setUserAuthenticationParameters explicitly) already defaults to
+                // "every use" + AUTH_BIOMETRIC_STRONG per AOSP's own
+                // KeyGenParameterSpec.Builder field defaults — confirmed against
+                // frameworks/base source, not assumed. Same as Aegis's key setup.
+
+            if (strongBox) {
+                builder.setIsStrongBoxBacked(true)
+            }
+            return builder.build()
+        }
 
         val keyGen = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, KEYSTORE)
-        keyGen.init(builder.build())
-        return keyGen.generateKey()
+        return try {
+            keyGen.init(createSpec(strongBox = true))
+            keyGen.generateKey()
+        } catch (_: StrongBoxUnavailableException) {
+            keyGen.init(createSpec(strongBox = false))
+            keyGen.generateKey()
+        } catch (_: ProviderException) {
+            keyGen.init(createSpec(strongBox = false))
+            keyGen.generateKey()
+        }
     }
 }

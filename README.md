@@ -5,7 +5,7 @@ A rootless, userspace storage and cryptographic stack for Android: LUKS2 decrypt
 <!-- Demonstration banner / social preview placeholder -->
 <!-- <img src="./readmeAssets/social-preview.png" alt="LUKS-Android Userspace Storage Stack" width="860" /> -->
 
-[![Latest release](https://img.shields.io/github/v/release/rDelmotra/luks-android?style=flat-square&label=release&color=0969da&labelColor=0d1117)](https://github.com/rDelmotra/luks-android/releases/latest)
+[![Latest release](https://img.shields.io/github/v/release/rDelmotra/LUBA?style=flat-square&label=release&color=0969da&labelColor=0d1117)](https://github.com/rDelmotra/LUBA/releases/latest)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue?style=flat-square&labelColor=0d1117)](LICENSE-APACHE)
 
 - [What is LUKS-Android?](#what-is-luks-android)
@@ -38,7 +38,7 @@ Traditional solutions require rooting the Android device, installing custom kern
 
 ## Quickstart
 
-**[⬇ Download the latest release](https://github.com/rDelmotra/luks-android/releases/latest)** — grab `app-release.apk` (v0.4.0) directly, no build required. Requires Android 10+ (API 29) on an arm64-v8a device.
+**[⬇ Download the latest release](https://github.com/rDelmotra/LUBA/releases/latest)** — grab `app-release.apk` (v0.4.0) directly, no build required. Requires Android 10+ (API 29) on an arm64-v8a device.
 
 > [!NOTE]
 > The `v0.4.0` release introduces **hardware-backed biometric unlock** (fingerprint / face authentication via Android Keystore backed AES-GCM passphrase vault), alongside **in-app media playback** with zero-wear in-memory block caching, air-gapped zero-network security, and full ext4/Btrfs write support.
@@ -48,7 +48,7 @@ Traditional solutions require rooting the Android device, installing custom kern
 
 | Target | Artifact | Size | Description |
 | :--- | :--- | :--- | :--- |
-| **Android Release (Recommended)** | [`app-release.apk`](https://github.com/rDelmotra/luks-android/releases/latest) | `~6.2 MB` | Prebuilt, signed v2/v3, ready to install |
+| **Android Release (Recommended)** | [`app-release.apk`](https://github.com/rDelmotra/LUBA/releases/latest) | `~6.2 MB` | Prebuilt, signed v2/v3, ready to install |
 | **Android Debug** *(build from source)* | `app-debug.apk` | `~32 MB` | For development and live diagnostics |
 | **Native Core (Rust crate)** | `luks_core` / `luks_jni` | `< 2 MB` | Use the engine standalone via Rust or JNI |
 
@@ -63,7 +63,7 @@ adb install -r android/app/build/outputs/apk/release/app-release.apk
 ```
 
 > [!TIP]
-> No ADB? Open the [release APK link](https://github.com/rDelmotra/luks-android/releases/latest) directly on the Android device and tap the downloaded file to install — Android will prompt to allow "Install unknown apps" for the browser or file manager you used.
+> No ADB? Open the [release APK link](https://github.com/rDelmotra/LUBA/releases/latest) directly on the Android device and tap the downloaded file to install — Android will prompt to allow "Install unknown apps" for the browser or file manager you used.
 
 ---
 
@@ -72,7 +72,7 @@ adb install -r android/app/build/outputs/apk/release/app-release.apk
 1. **Connect the drive.** Plug a USB-OTG drive or external enclosure into the Android device.
 2. **Grant USB permission.** Accept the standard Android USB Host dialog to allow userspace communication via `/dev/bus/usb`.
 3. **Unlock the volume.** Enter the passphrase or use biometric unlock (fingerprint) to decrypt the LUKS2 keyslot.
-4. **Browse and transfer.** Explore folders, view file metadata, stream media, or export files directly to internal storage.
+4. **Browse and transfer.** Explore folders, view file metadata, play audio and video directly in-app, or export files to internal storage.
 
 ---
 

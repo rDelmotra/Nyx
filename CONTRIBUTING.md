@@ -4,7 +4,7 @@ This project is solo-maintained and pre-1.0. Read this before opening a PR — i
 
 ## Reporting bugs
 
-Open an [issue](https://github.com/rDelmotra/luks-android/issues) with:
+Open an [issue](https://github.com/rDelmotra/LUBA/issues) with:
 - Device model, Android version, and the USB bridge/drive chipset if it's hardware-related.
 - Kernel version if you're grading output against a Linux oracle (`cryptsetup`, `e2fsck`, `btrfs check`).
 - ADB diagnostic output where relevant — see [doc/testing.md](doc/testing.md) for how to pull the forensic ring buffer.

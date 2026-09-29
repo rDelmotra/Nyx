@@ -110,6 +110,7 @@ import dev.luksandroid.formatTimestamp
 import dev.luksandroid.session.DirectoryTransferRequest
 import dev.luksandroid.session.LuksSession
 import dev.luksandroid.session.SessionState
+import dev.luksandroid.ui.theme.DestructiveRed
 import dev.luksandroid.ui.theme.StateLocked
 import dev.luksandroid.session.TransferManager
 import dev.luksandroid.session.TransferState
@@ -1859,7 +1860,10 @@ fun BrowserScreen(
                         onClick = { run(CollisionMode.KEEP_BOTH) },
                         enabled = choice.allowKeepBoth,
                     ) { Text("Keep both") }
-                    TextButton(onClick = { run(CollisionMode.REPLACE) }) { Text("Replace") }
+                    TextButton(
+                        onClick = { run(CollisionMode.REPLACE) },
+                        colors = ButtonDefaults.textButtonColors(contentColor = DestructiveRed),
+                    ) { Text("Replace") }
                 }
             },
             dismissButton = {

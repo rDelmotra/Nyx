@@ -92,7 +92,8 @@ import dev.luksandroid.security.SecurePassphraseBuffer
 import dev.luksandroid.session.LuksSession
 import dev.luksandroid.session.SessionState
 import dev.luksandroid.ui.SecurePassphraseField
-import dev.luksandroid.ui.theme.SuccessGreen
+import dev.luksandroid.ui.theme.StateLocked
+import dev.luksandroid.ui.theme.StateUnlocked
 import dev.luksandroid.ui.theme.WarningAmber
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -560,14 +561,14 @@ private fun EmptyDevicesCard(
             }
 
             Text(
-                text = "Plug in a USB storage drive",
-                style = MaterialTheme.typography.titleLarge,
+                text = "Plug in a drive",
+                style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.SemiBold),
                 textAlign = TextAlign.Center,
                 color = MaterialTheme.colorScheme.onSurface,
             )
 
             Text(
-                text = "Connect a LUKS-encrypted USB drive via an OTG adapter or USB-C cable.",
+                text = "Nothing leaves this phone. Connect via USB-C or OTG adapter.",
                 style = MaterialTheme.typography.bodyMedium,
                 textAlign = TextAlign.Center,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -837,10 +838,10 @@ private fun PartitionItemCard(
                     },
                     contentDescription = null,
                     tint = when {
-                        isSessionUnlocked -> SuccessGreen
-                        partition.isLuks -> MaterialTheme.colorScheme.primary
+                        isSessionUnlocked -> StateUnlocked
+                        partition.isLuks -> StateLocked
                         partition.isPlain -> MaterialTheme.colorScheme.secondary
-                        partition.unsupportedReason != null -> MaterialTheme.colorScheme.error
+                        partition.unsupportedReason != null -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
                         else -> MaterialTheme.colorScheme.onSurfaceVariant
                     },
                     modifier = Modifier.size(20.dp),
@@ -951,16 +952,16 @@ private fun PartitionItemCard(
                 if (isSessionUnlocked) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(
-                            imageVector = Icons.Default.CheckCircle,
+                            imageVector = Icons.Default.LockOpen,
                             contentDescription = "Unlocked",
-                            tint = SuccessGreen,
+                            tint = StateUnlocked,
                             modifier = Modifier.size(16.dp),
                         )
                         Spacer(modifier = Modifier.width(4.dp))
                         Text(
                             text = "Unlocked",
                             style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
-                            color = SuccessGreen,
+                            color = StateUnlocked,
                         )
                     }
                 } else if (sessionState is SessionState.Locked) {
@@ -999,14 +1000,14 @@ private fun PartitionItemCard(
                         Icon(
                             imageVector = Icons.Default.CheckCircle,
                             contentDescription = "Mounted",
-                            tint = SuccessGreen,
+                            tint = StateUnlocked,
                             modifier = Modifier.size(16.dp),
                         )
                         Spacer(modifier = Modifier.width(4.dp))
                         Text(
                             text = "Mounted",
                             style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
-                            color = SuccessGreen,
+                            color = StateUnlocked,
                         )
                     }
                 } else if (sessionState is SessionState.Locked) {
@@ -1072,18 +1073,29 @@ private fun UnlockingStateCard(
                         color = MaterialTheme.colorScheme.onPrimaryContainer,
                     )
                     Text(
-                        text = "Deriving master key · Elapsed: ${elapsedSec}s",
-                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-                        color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.8f),
+                        text = "Deriving key — slow on purpose, so guessing is slow too.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.85f),
                     )
                 }
             }
 
-            Text(
-                text = "Argon2 / PBKDF2 key derivation and memory allocation in progress.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.8f),
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = "Argon2id · Memory-hard KDF",
+                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                    color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.7f),
+                )
+                Text(
+                    text = "${elapsedSec}s elapsed",
+                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold),
+                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                )
+            }
         }
     }
 }
@@ -1272,7 +1284,7 @@ private fun UnlockedStateCard(
                 Icon(
                     imageVector = if (info.encrypted) Icons.Default.LockOpen else Icons.Default.Storage,
                     contentDescription = null,
-                    tint = SuccessGreen,
+                    tint = StateUnlocked,
                     modifier = Modifier.size(24.dp),
                 )
                 Column(modifier = Modifier.weight(1f)) {
@@ -1380,7 +1392,7 @@ private fun PassphraseEntryDialog(
                 )
 
                 Text(
-                    text = "Screen capture blocked & memory scrubbed on submit.",
+                    text = "Screen capture blocked · Off-heap memory wiped on lock",
                     style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
                     color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
                 )
@@ -1405,7 +1417,7 @@ private fun PassphraseEntryDialog(
                             )
                         }
                         Text(
-                            text = "Saved on this phone, encrypted with a key that needs your fingerprint.",
+                            text = "Your passphrase will be encrypted with a key in this phone's secure hardware. Turning this off deletes it.",
                             style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
                             color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
                             modifier = Modifier.padding(start = 36.dp),

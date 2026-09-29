@@ -45,8 +45,14 @@ import androidx.compose.ui.unit.sp
 import dev.luksandroid.formatSize
 import dev.luksandroid.session.LuksSession
 import dev.luksandroid.session.SessionState
-import dev.luksandroid.ui.theme.SuccessGreen
-import dev.luksandroid.ui.theme.WarningAmber
+import androidx.compose.foundation.border
+import androidx.compose.material.icons.filled.LockOpen
+import dev.luksandroid.ui.theme.DarkOutline
+import dev.luksandroid.ui.theme.DestructiveRed
+import dev.luksandroid.ui.theme.StateLocked
+import dev.luksandroid.ui.theme.StateUnlocked
+import dev.luksandroid.ui.theme.TextMuted
+import dev.luksandroid.ui.theme.TextPrimary
 import kotlinx.coroutines.launch
 
 @Composable
@@ -74,8 +80,13 @@ fun SessionStatusHeader(
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 4.dp),
-                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f),
+                        .padding(horizontal = 16.dp, vertical = 4.dp)
+                        .border(
+                            width = 1.dp,
+                            color = StateUnlocked.copy(alpha = 0.35f),
+                            shape = RoundedCornerShape(10.dp),
+                        ),
+                    color = MaterialTheme.colorScheme.surfaceVariant,
                     shape = RoundedCornerShape(10.dp),
                 ) {
                     Row(
@@ -91,9 +102,9 @@ fun SessionStatusHeader(
                             modifier = Modifier.weight(1f, fill = false),
                         ) {
                             Icon(
-                                imageVector = Icons.Default.Storage,
-                                contentDescription = "Drive",
-                                tint = SuccessGreen,
+                                imageVector = Icons.Default.LockOpen,
+                                contentDescription = "Unlocked",
+                                tint = StateUnlocked,
                                 modifier = Modifier.size(18.dp),
                             )
                             Spacer(modifier = Modifier.width(6.dp))
@@ -102,14 +113,14 @@ fun SessionStatusHeader(
                                 style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
-                                color = MaterialTheme.colorScheme.onSurface,
+                                color = TextPrimary,
                             )
                             Spacer(modifier = Modifier.width(6.dp))
                             // Filesystem pill badge
                             Box(
                                 modifier = Modifier
                                     .clip(RoundedCornerShape(4.dp))
-                                    .background(MaterialTheme.colorScheme.primaryContainer)
+                                    .background(StateUnlocked.copy(alpha = 0.15f))
                                     .padding(horizontal = 5.dp, vertical = 1.dp),
                             ) {
                                 Text(
@@ -118,7 +129,7 @@ fun SessionStatusHeader(
                                         fontWeight = FontWeight.Bold,
                                         fontSize = 10.sp,
                                     ),
-                                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                    color = StateUnlocked,
                                 )
                             }
                             Spacer(modifier = Modifier.width(8.dp))
@@ -128,44 +139,44 @@ fun SessionStatusHeader(
                                 modifier = Modifier
                                     .clip(RoundedCornerShape(4.dp))
                                     .background(
-                                        if (isTimerPaused) WarningAmber.copy(alpha = 0.15f)
-                                        else MaterialTheme.colorScheme.surfaceVariant
+                                        if (isTimerPaused) DestructiveRed.copy(alpha = 0.15f)
+                                        else StateUnlocked.copy(alpha = 0.10f)
                                     )
                                     .padding(horizontal = 6.dp, vertical = 2.dp),
                             ) {
                                 Icon(
                                     imageVector = if (isTimerPaused) Icons.Default.Sync else Icons.Default.HourglassEmpty,
                                     contentDescription = null,
-                                    tint = if (isTimerPaused) WarningAmber else MaterialTheme.colorScheme.onSurfaceVariant,
+                                    tint = if (isTimerPaused) DestructiveRed else StateUnlocked,
                                     modifier = Modifier.size(12.dp),
                                 )
                                 Spacer(modifier = Modifier.width(3.dp))
                                 Text(
                                     text = if (isTimerPaused) {
-                                        "$activeLeases active"
+                                        "Writing — don't unplug"
                                     } else {
-                                        formatIdleTime(remainingIdleMs)
+                                        "Auto-locks in ${formatIdleTime(remainingIdleMs)}"
                                     },
                                     style = MaterialTheme.typography.labelSmall.copy(
                                         fontFamily = FontFamily.Monospace,
                                         fontSize = 11.sp,
                                         fontWeight = FontWeight.Medium,
                                     ),
-                                    color = if (isTimerPaused) WarningAmber else MaterialTheme.colorScheme.onSurfaceVariant,
+                                    color = if (isTimerPaused) DestructiveRed else StateUnlocked,
                                 )
                             }
                         }
 
                         Spacer(modifier = Modifier.width(8.dp))
 
-                        // 1-tap Lock button
+                        // 1-tap Lock button (no confirmation needed - locking is immediate)
                         FilledTonalButton(
                             onClick = {
                                 scope.launch { LuksSession.lock() }
                             },
                             colors = ButtonDefaults.filledTonalButtonColors(
-                                containerColor = MaterialTheme.colorScheme.errorContainer,
-                                contentColor = MaterialTheme.colorScheme.onErrorContainer,
+                                containerColor = if (isTimerPaused) DestructiveRed.copy(alpha = 0.2f) else StateUnlocked.copy(alpha = 0.15f),
+                                contentColor = if (isTimerPaused) DestructiveRed else StateUnlocked,
                             ),
                             contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
                             modifier = Modifier.height(32.dp),
@@ -177,7 +188,10 @@ fun SessionStatusHeader(
                                 modifier = Modifier.size(14.dp),
                             )
                             Spacer(modifier = Modifier.width(4.dp))
-                            Text("Lock", style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold))
+                            Text(
+                                text = if (isTimerPaused) "Lock after write" else "Lock",
+                                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                            )
                         }
                     }
                 }
@@ -187,8 +201,9 @@ fun SessionStatusHeader(
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 4.dp),
-                    color = MaterialTheme.colorScheme.errorContainer,
+                        .padding(horizontal = 16.dp, vertical = 4.dp)
+                        .border(1.dp, DarkOutline, RoundedCornerShape(8.dp)),
+                    color = MaterialTheme.colorScheme.surfaceVariant,
                     shape = RoundedCornerShape(8.dp),
                 ) {
                     Row(
@@ -196,16 +211,16 @@ fun SessionStatusHeader(
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Icon(
-                            imageVector = Icons.Default.Warning,
+                            imageVector = Icons.Default.Lock,
                             contentDescription = "Detached",
-                            tint = MaterialTheme.colorScheme.onErrorContainer,
+                            tint = StateLocked,
                             modifier = Modifier.size(18.dp),
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = "Drive detached: ${state.message}",
+                            text = "Drive disconnected. Session closed safely. Memory wiped.",
                             style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onErrorContainer,
+                            color = TextPrimary,
                         )
                     }
                 }
@@ -215,8 +230,9 @@ fun SessionStatusHeader(
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 4.dp),
-                    color = MaterialTheme.colorScheme.errorContainer,
+                        .padding(horizontal = 16.dp, vertical = 4.dp)
+                        .border(1.dp, DestructiveRed.copy(alpha = 0.3f), RoundedCornerShape(8.dp)),
+                    color = MaterialTheme.colorScheme.surfaceVariant,
                     shape = RoundedCornerShape(8.dp),
                 ) {
                     Row(
@@ -226,14 +242,14 @@ fun SessionStatusHeader(
                         Icon(
                             imageVector = Icons.Default.Warning,
                             contentDescription = "Failed",
-                            tint = MaterialTheme.colorScheme.onErrorContainer,
+                            tint = DestructiveRed,
                             modifier = Modifier.size(18.dp),
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
                             text = "Session error: ${state.message}",
                             style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onErrorContainer,
+                            color = TextPrimary,
                         )
                     }
                 }

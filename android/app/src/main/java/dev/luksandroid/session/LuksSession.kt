@@ -229,6 +229,9 @@ open class SessionController(
             this.activeUsbDevice = device.usbDevice
 
             val unlocked = SessionState.Unlocked(vol, partition, entries)
+            // A calm settling beat (280ms) ensuring the success state is visually registered
+            // before the canvas transitions into the browser
+            delay(280)
             _state.value = unlocked
             restartIdleTimer()
             unlocked

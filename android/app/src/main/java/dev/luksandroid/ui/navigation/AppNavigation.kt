@@ -4,6 +4,7 @@ import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -87,18 +88,28 @@ fun LuksAppNavigation(
             .navigationBarsPadding()
             .imePadding(),
     ) {
-        // Unified Single-Door Canvas: Steady in-place crossfade without vertical layout shifts
+        // Unified Single-Door Canvas: Grounded in-place transition with material settle
         AnimatedContent(
             targetState = isUnlocked,
             transitionSpec = {
                 if (targetState) {
-                    (fadeIn(animationSpec = tween(260)) + scaleIn(
-                        initialScale = 0.99f,
-                        animationSpec = tween(260),
-                    )).togetherWith(fadeOut(animationSpec = tween(180)))
+                    (fadeIn(animationSpec = tween(340, easing = FastOutSlowInEasing)) +
+                     slideInVertically(
+                         animationSpec = tween(340, easing = FastOutSlowInEasing),
+                         initialOffsetY = { 28 },
+                     ) +
+                     scaleIn(
+                         initialScale = 0.96f,
+                         animationSpec = tween(340, easing = FastOutSlowInEasing),
+                     )).togetherWith(
+                         fadeOut(animationSpec = tween(180))
+                     )
                 } else {
-                    fadeIn(animationSpec = tween(180))
-                        .togetherWith(fadeOut(animationSpec = tween(180)) + scaleOut(targetScale = 0.99f, animationSpec = tween(180)))
+                    fadeIn(animationSpec = tween(220))
+                        .togetherWith(
+                            fadeOut(animationSpec = tween(180)) +
+                            scaleOut(targetScale = 0.96f, animationSpec = tween(180))
+                        )
                 }
             },
             label = "VaultStateTransition",

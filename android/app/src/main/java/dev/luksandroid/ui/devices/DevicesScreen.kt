@@ -101,6 +101,7 @@ import dev.luksandroid.session.LuksSession
 import dev.luksandroid.session.SessionState
 import dev.luksandroid.ui.LuksHaptics
 import dev.luksandroid.ui.SecurePassphraseField
+import dev.luksandroid.ui.components.DiskVisualMap
 import dev.luksandroid.ui.theme.DarkOutline
 import dev.luksandroid.ui.theme.DestructiveRed
 import dev.luksandroid.ui.theme.StateLocked
@@ -856,12 +857,22 @@ private fun TargetDeviceCard(
                         val dev = itemState.device
                         val info = dev.info
 
-                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                             Text(
                                 text = "${info.vendor} ${info.product} · ${formatSize(info.sizeBytes)} · ${info.tableKind}",
                                 style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium),
                                 color = MaterialTheme.colorScheme.onSurface,
                             )
+
+                            if (info.partitions.isNotEmpty()) {
+                                DiskVisualMap(
+                                    deviceInfo = info,
+                                    selectedPartition = promptDialogTarget?.takeIf { it.first == dev }?.second,
+                                    onSelectPartition = { partition ->
+                                        onUnlockPartition(dev, partition)
+                                    },
+                                )
+                            }
 
                             if (info.partitions.isEmpty()) {
                                 Text(
@@ -955,6 +966,16 @@ private fun PartitionItemCard(
         modifier = modifier.fillMaxWidth(),
         shape = RoundedCornerShape(12.dp),
         color = MaterialTheme.colorScheme.surface,
+        border = if (partition.isLuks) {
+            BorderStroke(
+                width = if (isPromptingUnlock) 1.5.dp else 1.dp,
+                color = if (isSessionUnlocked) StateUnlocked.copy(alpha = 0.5f)
+                        else if (isPromptingUnlock) StateLocked
+                        else StateLocked.copy(alpha = 0.35f),
+            )
+        } else {
+            BorderStroke(1.dp, DarkOutline)
+        },
     ) {
         Column(
             modifier = Modifier
@@ -1063,13 +1084,13 @@ private fun PartitionItemCard(
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
 
-                        if (biometricEnrolled && !isPromptingUnlock) {
+                        if (biometricEnrolled) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Icon(
                                     imageVector = Icons.Default.Fingerprint,
                                     contentDescription = null,
                                     modifier = Modifier.size(12.dp),
-                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    tint = StateUnlocked,
                                 )
                                 Spacer(modifier = Modifier.width(4.dp))
                                 Text(
@@ -1077,9 +1098,10 @@ private fun PartitionItemCard(
                                     style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
+                                Spacer(modifier = Modifier.width(4.dp))
                                 TextButton(
                                     onClick = onForgetBiometric,
-                                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
+                                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
                                 ) {
                                     Text("Turn off", style = MaterialTheme.typography.labelSmall)
                                 }
@@ -1110,33 +1132,18 @@ private fun PartitionItemCard(
                             enter = fadeIn(),
                             exit = fadeOut(),
                         ) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                if (showBiometricUnlock) {
-                                    FilledTonalIconButton(
-                                        onClick = onBiometricUnlock,
-                                        enabled = !biometricBusy,
-                                    ) {
-                                        Icon(
-                                            imageVector = Icons.Default.Fingerprint,
-                                            contentDescription = "Unlock with fingerprint",
-                                            modifier = Modifier.size(20.dp),
-                                        )
-                                    }
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                }
-                                FilledTonalButton(
-                                    onClick = onUnlock,
-                                    enabled = !biometricBusy,
-                                    shape = RoundedCornerShape(8.dp),
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.LockOpen,
-                                        contentDescription = null,
-                                        modifier = Modifier.size(16.dp),
-                                    )
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text("Unlock")
-                                }
+                            FilledTonalButton(
+                                onClick = if (showBiometricUnlock) onBiometricUnlock else onUnlock,
+                                enabled = !biometricBusy,
+                                shape = RoundedCornerShape(8.dp),
+                            ) {
+                                Icon(
+                                    imageVector = if (showBiometricUnlock) Icons.Default.Fingerprint else Icons.Default.LockOpen,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(16.dp),
+                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Unlock")
                             }
                         }
                     }
@@ -1182,10 +1189,12 @@ private fun PartitionItemCard(
                 InPlaceUnlockSection(
                     partition = partition,
                     showBiometricUnlock = showBiometricUnlock,
+                    biometricEnrolled = biometricEnrolled,
                     biometricBusy = biometricBusy,
                     offerBiometricEnroll = offerBiometricEnroll,
                     dialogNotice = dialogNotice,
                     onBiometricUnlock = onBiometricUnlock,
+                    onForgetBiometric = onForgetBiometric,
                     onSubmitPassphrase = onSubmitPassphrase,
                     onDismiss = onDismissUnlock,
                 )
@@ -1198,10 +1207,12 @@ private fun PartitionItemCard(
 private fun InPlaceUnlockSection(
     partition: PartitionInfo,
     showBiometricUnlock: Boolean,
+    biometricEnrolled: Boolean = false,
     biometricBusy: Boolean,
     offerBiometricEnroll: Boolean,
     dialogNotice: String?,
     onBiometricUnlock: () -> Unit,
+    onForgetBiometric: () -> Unit = {},
     onSubmitPassphrase: (SecurePassphraseBuffer, Boolean) -> Unit,
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier,
@@ -1233,31 +1244,49 @@ private fun InPlaceUnlockSection(
         }
 
         if (showBiometricUnlock) {
-            Button(
+            FilledTonalButton(
                 onClick = onBiometricUnlock,
                 enabled = !biometricBusy,
                 shape = RoundedCornerShape(10.dp),
                 modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.filledTonalButtonColors(
+                    containerColor = StateUnlocked.copy(alpha = 0.15f),
+                    contentColor = StateUnlocked,
+                ),
             ) {
                 Icon(
                     imageVector = Icons.Default.Fingerprint,
                     contentDescription = null,
-                    modifier = Modifier.size(20.dp),
+                    modifier = Modifier.size(18.dp),
                 )
                 Spacer(modifier = Modifier.width(8.dp))
-                Text("Unlock with Fingerprint")
+                Text(
+                    text = "Touch sensor to unlock with Fingerprint",
+                    style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold),
+                )
             }
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.Center,
+                horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text(
-                    text = "or enter passphrase",
-                    style = MaterialTheme.typography.bodySmall,
+                    text = "or enter passphrase below",
+                    style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                if (biometricEnrolled) {
+                    TextButton(
+                        onClick = onForgetBiometric,
+                        contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
+                    ) {
+                        Text(
+                            text = "Remove fingerprint",
+                            style = MaterialTheme.typography.labelSmall.copy(color = DestructiveRed),
+                        )
+                    }
+                }
             }
         }
 

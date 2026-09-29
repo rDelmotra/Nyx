@@ -128,6 +128,7 @@ import dev.luksandroid.ui.components.CapacityBar
 import dev.luksandroid.ui.components.DeleteConfirmDialog
 import dev.luksandroid.ui.components.NewFolderDialog
 import dev.luksandroid.ui.components.RenameDialog
+import dev.luksandroid.ui.components.SessionStatusHeader
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
@@ -1053,6 +1054,9 @@ fun BrowserScreen(
 
     Scaffold(
         modifier = modifier.fillMaxSize(),
+        topBar = {
+            SessionStatusHeader()
+        },
         snackbarHost = { SnackbarHost(snackbarHostState) },
         floatingActionButton = {
             if (!isWriteDisabled) {

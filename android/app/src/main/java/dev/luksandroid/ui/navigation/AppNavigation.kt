@@ -55,7 +55,6 @@ import dev.luksandroid.session.TransferState
 import dev.luksandroid.ui.transfers.formatSpeed
 import dev.luksandroid.ui.browser.BrowserScreen
 import dev.luksandroid.ui.browser.viewer.MediaPlayerScreen
-import dev.luksandroid.ui.components.SessionStatusHeader
 import dev.luksandroid.ui.devices.DevicesScreen
 import dev.luksandroid.ui.diagnostics.DiagnosticsScreen
 import dev.luksandroid.ui.theme.StateUnlocked
@@ -88,53 +87,38 @@ fun LuksAppNavigation(
             .navigationBarsPadding()
             .imePadding(),
     ) {
-        Column(modifier = Modifier.fillMaxSize()) {
-            // Door Open Guardian: Amber status bar with lease warnings, idle countdown, and 1-tap lock
-            if (activeMedia == null && isUnlocked) {
-                SessionStatusHeader()
-            }
-
-            // Unified Single-Door Canvas
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth(),
-            ) {
-                AnimatedContent(
-                    targetState = isUnlocked,
-                    transitionSpec = {
-                        if (targetState) {
-                            (fadeIn(animationSpec = tween(300)) + scaleIn(
-                                initialScale = 0.98f,
-                                animationSpec = spring(
-                                    dampingRatio = Spring.DampingRatioNoBouncy,
-                                    stiffness = Spring.StiffnessLow,
-                                )
-                            )).togetherWith(fadeOut(animationSpec = tween(200)))
-                        } else {
-                            fadeIn(animationSpec = tween(200))
-                                .togetherWith(fadeOut(animationSpec = tween(200)) + scaleOut(targetScale = 0.98f, animationSpec = tween(200)))
-                        }
-                    },
-                    label = "VaultStateTransition",
-                ) { unlocked ->
-                    if (unlocked) {
-                        BrowserScreen(
-                            onNavigateToDevices = {
-                                // Locked - LuksSession will transition state
-                            },
-                            onPlayMedia = { fullPath, displayName ->
-                                activeMedia = ActiveMedia(fullPath, displayName)
-                            },
-                        )
-                    } else {
-                        DevicesScreen(
-                            onOpenDiagnostics = if (BuildConfig.DEBUG) {
-                                { showDiagnosticsSheet = true }
-                            } else null,
-                        )
-                    }
+        // Unified Single-Door Canvas: Steady in-place crossfade without vertical layout shifts
+        AnimatedContent(
+            targetState = isUnlocked,
+            transitionSpec = {
+                if (targetState) {
+                    (fadeIn(animationSpec = tween(260)) + scaleIn(
+                        initialScale = 0.99f,
+                        animationSpec = tween(260),
+                    )).togetherWith(fadeOut(animationSpec = tween(180)))
+                } else {
+                    fadeIn(animationSpec = tween(180))
+                        .togetherWith(fadeOut(animationSpec = tween(180)) + scaleOut(targetScale = 0.99f, animationSpec = tween(180)))
                 }
+            },
+            label = "VaultStateTransition",
+            modifier = Modifier.fillMaxSize(),
+        ) { unlocked ->
+            if (unlocked) {
+                BrowserScreen(
+                    onNavigateToDevices = {
+                        // Locked - LuksSession will transition state
+                    },
+                    onPlayMedia = { fullPath, displayName ->
+                        activeMedia = ActiveMedia(fullPath, displayName)
+                    },
+                )
+            } else {
+                DevicesScreen(
+                    onOpenDiagnostics = if (BuildConfig.DEBUG) {
+                        { showDiagnosticsSheet = true }
+                    } else null,
+                )
             }
         }
 

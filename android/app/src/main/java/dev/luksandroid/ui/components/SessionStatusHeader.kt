@@ -33,6 +33,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -47,6 +48,8 @@ import dev.luksandroid.session.LuksSession
 import dev.luksandroid.session.SessionState
 import androidx.compose.foundation.border
 import androidx.compose.material.icons.filled.LockOpen
+import androidx.compose.ui.platform.LocalContext
+import dev.luksandroid.ui.LuksHaptics
 import dev.luksandroid.ui.theme.DarkOutline
 import dev.luksandroid.ui.theme.DestructiveRed
 import dev.luksandroid.ui.theme.StateLocked
@@ -59,10 +62,20 @@ import kotlinx.coroutines.launch
 fun SessionStatusHeader(
     modifier: Modifier = Modifier,
 ) {
+    val context = LocalContext.current
     val sessionState by LuksSession.state.collectAsState()
     val activeLeases by LuksSession.activeLeasesFlow.collectAsState()
     val remainingIdleMs by LuksSession.remainingIdleMs.collectAsState()
     val scope = rememberCoroutineScope()
+
+    LaunchedEffect(sessionState) {
+        when (sessionState) {
+            is SessionState.Unlocked -> LuksHaptics.unlock(context)
+            is SessionState.Detached -> LuksHaptics.deadboltLock(context)
+            is SessionState.Failed -> LuksHaptics.error(context)
+            else -> {}
+        }
+    }
 
     AnimatedVisibility(
         visible = sessionState !is SessionState.Locked,
@@ -172,6 +185,7 @@ fun SessionStatusHeader(
                         // 1-tap Lock button (no confirmation needed - locking is immediate)
                         FilledTonalButton(
                             onClick = {
+                                LuksHaptics.deadboltLock(context)
                                 scope.launch { LuksSession.lock() }
                             },
                             colors = ButtonDefaults.filledTonalButtonColors(

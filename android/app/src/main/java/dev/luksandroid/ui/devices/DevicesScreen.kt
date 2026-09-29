@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -91,7 +92,10 @@ import dev.luksandroid.security.PassphraseScrubber
 import dev.luksandroid.security.SecurePassphraseBuffer
 import dev.luksandroid.session.LuksSession
 import dev.luksandroid.session.SessionState
+import dev.luksandroid.ui.LuksHaptics
 import dev.luksandroid.ui.SecurePassphraseField
+import dev.luksandroid.ui.theme.DarkOutline
+import dev.luksandroid.ui.theme.DestructiveRed
 import dev.luksandroid.ui.theme.StateLocked
 import dev.luksandroid.ui.theme.StateUnlocked
 import dev.luksandroid.ui.theme.WarningAmber
@@ -1109,9 +1113,10 @@ private fun DetachedStateCard(
     Card(
         modifier = modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.errorContainer,
+            containerColor = MaterialTheme.colorScheme.surfaceVariant,
         ),
         shape = RoundedCornerShape(12.dp),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
     ) {
         Row(
             modifier = Modifier
@@ -1127,33 +1132,29 @@ private fun DetachedStateCard(
                 Icon(
                     imageVector = Icons.Default.UsbOff,
                     contentDescription = null,
-                    tint = MaterialTheme.colorScheme.onErrorContainer,
+                    tint = StateLocked,
                     modifier = Modifier.size(28.dp),
                 )
                 Spacer(modifier = Modifier.width(12.dp))
                 Column {
                     Text(
-                        text = "Drive Detached",
+                        text = "Drive Disconnected",
                         style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                        color = MaterialTheme.colorScheme.onErrorContainer,
+                        color = MaterialTheme.colorScheme.onSurface,
                     )
                     Text(
-                        text = message,
+                        text = "Session closed safely. Master key cleared from memory.",
                         style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onErrorContainer.copy(alpha = 0.9f),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
             }
 
             Button(
                 onClick = onDismiss,
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = MaterialTheme.colorScheme.error,
-                    contentColor = MaterialTheme.colorScheme.onError,
-                ),
                 shape = RoundedCornerShape(8.dp),
             ) {
-                Text("Dismiss / Scan")
+                Text("Scan Drives")
             }
         }
     }
@@ -1171,9 +1172,10 @@ private fun FailedStateCard(
     Card(
         modifier = modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.errorContainer,
+            containerColor = MaterialTheme.colorScheme.surfaceVariant,
         ),
         shape = RoundedCornerShape(12.dp),
+        border = BorderStroke(1.dp, if (isWrongPassphrase) StateUnlocked.copy(alpha = 0.5f) else DestructiveRed.copy(alpha = 0.5f)),
     ) {
         Column(
             modifier = Modifier
@@ -1183,47 +1185,47 @@ private fun FailedStateCard(
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(
-                    imageVector = Icons.Default.ErrorOutline,
+                    imageVector = if (isWrongPassphrase) Icons.Default.Lock else Icons.Default.ErrorOutline,
                     contentDescription = null,
-                    tint = MaterialTheme.colorScheme.onErrorContainer,
+                    tint = if (isWrongPassphrase) StateUnlocked else DestructiveRed,
                     modifier = Modifier.size(24.dp),
                 )
                 Spacer(modifier = Modifier.width(8.dp))
                 Text(
                     text = if (isWrongPassphrase) "Incorrect Passphrase" else "Unlock Failed",
                     style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                    color = MaterialTheme.colorScheme.onErrorContainer,
+                    color = MaterialTheme.colorScheme.onSurface,
                 )
             }
 
             Text(
-                text = message,
+                text = if (isWrongPassphrase) {
+                    "Passphrase did not unlock this partition. Off-heap memory wiped; the drive remains untouched."
+                } else {
+                    message
+                },
                 style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onErrorContainer.copy(alpha = 0.9f),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
 
             Row(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Button(
-                    onClick = onReset,
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.error,
-                        contentColor = MaterialTheme.colorScheme.onError,
-                    ),
-                    shape = RoundedCornerShape(8.dp),
-                ) {
-                    Text("Reset")
-                }
-
                 if (onTryAgain != null) {
-                    FilledTonalButton(
+                    Button(
                         onClick = onTryAgain,
                         shape = RoundedCornerShape(8.dp),
                     ) {
                         Text("Try Again")
                     }
+                }
+
+                OutlinedButton(
+                    onClick = onReset,
+                    shape = RoundedCornerShape(8.dp),
+                ) {
+                    Text("Dismiss")
                 }
             }
         }
@@ -1237,6 +1239,7 @@ private fun UnlockedStateCard(
     onLock: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val context = LocalContext.current
     val info = state.volume.info
 
     Card(
@@ -1319,7 +1322,10 @@ private fun UnlockedStateCard(
                 }
 
                 OutlinedButton(
-                    onClick = onLock,
+                    onClick = {
+                        LuksHaptics.deadboltLock(context)
+                        onLock()
+                    },
                     shape = RoundedCornerShape(8.dp),
                 ) {
                     Icon(

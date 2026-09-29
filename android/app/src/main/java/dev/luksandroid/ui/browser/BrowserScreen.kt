@@ -110,6 +110,7 @@ import dev.luksandroid.formatTimestamp
 import dev.luksandroid.session.DirectoryTransferRequest
 import dev.luksandroid.session.LuksSession
 import dev.luksandroid.session.SessionState
+import dev.luksandroid.ui.theme.StateLocked
 import dev.luksandroid.session.TransferManager
 import dev.luksandroid.session.TransferState
 import dev.luksandroid.session.TransferType
@@ -545,13 +546,19 @@ fun BrowserScreen(
                     imageVector = Icons.Default.Lock,
                     contentDescription = null,
                     modifier = Modifier.size(48.dp),
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    tint = StateLocked,
                 )
                 Text(
-                    text = "Drive is not unlocked",
+                    text = "Drive is locked",
                     style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                Text(
+                    text = "No key in memory. Unlock a partition to browse files.",
+                    style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                Spacer(modifier = Modifier.height(4.dp))
                 Button(onClick = onNavigateToDevices) {
                     Text("Go to Devices")
                 }
@@ -720,11 +727,11 @@ fun BrowserScreen(
             TransferState.COMPLETED -> {
                 when (terminal.type) {
                     TransferType.IMPORT -> {
-                        snackbarHostState.showSnackbar("Imported \"${terminal.name}\" successfully")
+                        snackbarHostState.showSnackbar("Copied \"${terminal.name}\" to drive")
                         loadDirectory(currentPath)
                     }
                     TransferType.EXPORT -> {
-                        snackbarHostState.showSnackbar("Exported \"${terminal.name}\" successfully")
+                        snackbarHostState.showSnackbar("Saved \"${terminal.name}\" to phone")
                     }
                     TransferType.HASH -> {} // ChecksumResultDialog is driven by startHash's onResult callback.
                 }
@@ -739,9 +746,9 @@ fun BrowserScreen(
                     }
                 }
                 val label = when (terminal.type) {
-                    TransferType.IMPORT -> "Import"
-                    TransferType.EXPORT -> "Export"
-                    TransferType.HASH -> "Checksum calculation"
+                    TransferType.IMPORT -> "Copy to drive"
+                    TransferType.EXPORT -> "Save to phone"
+                    TransferType.HASH -> "Integrity check"
                 }
                 snackbarHostState.showSnackbar("$label failed: ${terminal.error ?: "unknown error"}")
             }
@@ -1080,7 +1087,7 @@ fun BrowserScreen(
                                 )
 
                                 SpeedDialItem(
-                                    label = "Import folder",
+                                    label = "Copy folder to drive",
                                     icon = BrowserIcons.Folder,
                                     onClick = {
                                         isSpeedDialOpen = false
@@ -1091,7 +1098,7 @@ fun BrowserScreen(
                                 )
 
                                 SpeedDialItem(
-                                    label = "Import files",
+                                    label = "Copy files to drive",
                                     icon = BrowserIcons.Upload,
                                     onClick = {
                                         isSpeedDialOpen = false
@@ -1395,9 +1402,9 @@ fun BrowserScreen(
                             "$pctStr$speedStr"
                         }
                         val operation = when (transfer.type) {
-                            TransferType.IMPORT -> "Importing"
-                            TransferType.EXPORT -> "Exporting"
-                            TransferType.HASH -> "Hashing"
+                            TransferType.IMPORT -> "Writing to drive:"
+                            TransferType.EXPORT -> "Saving to phone:"
+                            TransferType.HASH -> "Checking integrity:"
                         }
 
                         Row(
@@ -2130,7 +2137,7 @@ fun BrowserItemRow(
                 // recursive copy (Pass 4). The caller routes by type -- a file
                 // through CreateDocument, a folder through OpenDocumentTree.
                 DropdownMenuItem(
-                    text = { Text(if (item.isDir) "Export folder to phone" else "Export to phone") },
+                    text = { Text(if (item.isDir) "Save folder to phone" else "Save to phone") },
                     leadingIcon = {
                         Icon(
                             imageVector = BrowserIcons.Download,

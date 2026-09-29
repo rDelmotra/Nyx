@@ -15,8 +15,10 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import dev.luksandroid.ui.LuksHaptics
 
 @Composable
 fun DeleteConfirmDialog(
@@ -77,8 +79,12 @@ fun DeleteConfirmDialog(
             }
         },
         confirmButton = {
+            val context = LocalContext.current
             Button(
-                onClick = onConfirm,
+                onClick = {
+                    LuksHaptics.deadboltLock(context)
+                    onConfirm()
+                },
                 enabled = !isDeleting,
                 colors = ButtonDefaults.buttonColors(
                     containerColor = MaterialTheme.colorScheme.error,

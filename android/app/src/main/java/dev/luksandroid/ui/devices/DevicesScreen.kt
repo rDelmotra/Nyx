@@ -541,6 +541,7 @@ private fun EmptyDevicesCard(
             containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
         ),
         shape = RoundedCornerShape(16.dp),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
     ) {
         Column(
             modifier = Modifier
@@ -616,6 +617,7 @@ private fun TargetDeviceCard(
             containerColor = MaterialTheme.colorScheme.surfaceVariant,
         ),
         shape = RoundedCornerShape(14.dp),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
     ) {
         Column(
             modifier = Modifier
@@ -898,16 +900,16 @@ private fun PartitionItemCard(
                             Box(
                                 modifier = Modifier
                                     .clip(RoundedCornerShape(4.dp))
-                                    .background(MaterialTheme.colorScheme.errorContainer)
+                                    .background(MaterialTheme.colorScheme.surfaceVariant)
                                     .padding(horizontal = 6.dp, vertical = 1.dp),
                             ) {
                                 Text(
                                     text = "${partition.fsType?.uppercase() ?: "UNKNOWN"} (Unsupported)",
                                     style = MaterialTheme.typography.labelSmall.copy(
-                                        fontWeight = FontWeight.Bold,
+                                        fontWeight = FontWeight.Medium,
                                         fontSize = 10.sp,
                                     ),
-                                    color = MaterialTheme.colorScheme.onErrorContainer,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
                             }
                         }

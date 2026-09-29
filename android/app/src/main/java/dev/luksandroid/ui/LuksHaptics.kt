@@ -40,6 +40,41 @@ object LuksHaptics {
         } catch (_: Throwable) {}
     }
 
+    /**
+     * Tactile sensory feedback simulating tapping in on transition to the browser vault.
+     * Uses a light priming contact tick followed by a crisp arrival click.
+     */
+    fun tapIn(context: Context) {
+        try {
+            val vibrator = getVibrator(context) ?: return
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+                vibrator.areAllPrimitivesSupported(
+                    VibrationEffect.Composition.PRIMITIVE_TICK,
+                    VibrationEffect.Composition.PRIMITIVE_CLICK
+                )
+            ) {
+                val composition = VibrationEffect.startComposition()
+                    .addPrimitive(VibrationEffect.Composition.PRIMITIVE_TICK, 0.75f)
+                    .addPrimitive(VibrationEffect.Composition.PRIMITIVE_CLICK, 1.0f, 45)
+                    .compose()
+                vibrator.vibrate(composition)
+            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                vibrator.vibrate(
+                    VibrationEffect.createWaveform(
+                        longArrayOf(0, 12, 45, 25),
+                        intArrayOf(0, 110, 0, 240),
+                        -1
+                    )
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                vibrator.vibrate(longArrayOf(0, 15, 45, 25), -1)
+            }
+        } catch (_: Throwable) {
+            unlock(context)
+        }
+    }
+
     fun tick(context: Context) {
         try {
             val vibrator = getVibrator(context) ?: return

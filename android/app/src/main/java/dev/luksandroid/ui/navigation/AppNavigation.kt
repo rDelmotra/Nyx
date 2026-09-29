@@ -37,6 +37,7 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -45,6 +46,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import dev.luksandroid.BuildConfig
@@ -53,6 +55,7 @@ import dev.luksandroid.session.SessionState
 import dev.luksandroid.session.TransferItem
 import dev.luksandroid.session.TransferManager
 import dev.luksandroid.session.TransferState
+import dev.luksandroid.ui.LuksHaptics
 import dev.luksandroid.ui.transfers.formatSpeed
 import dev.luksandroid.ui.browser.BrowserScreen
 import dev.luksandroid.ui.browser.viewer.MediaPlayerScreen
@@ -69,11 +72,18 @@ data class ActiveMedia(val fullPath: String, val displayName: String)
 fun LuksAppNavigation(
     modifier: Modifier = Modifier,
 ) {
+    val context = LocalContext.current
     val sessionState by LuksSession.state.collectAsState()
     val isUnlocked = sessionState is SessionState.Unlocked
     var activeMedia by remember { mutableStateOf<ActiveMedia?>(null) }
     var showTransfersSheet by remember { mutableStateOf(false) }
     var showDiagnosticsSheet by remember { mutableStateOf(false) }
+
+    LaunchedEffect(isUnlocked) {
+        if (isUnlocked) {
+            LuksHaptics.tapIn(context)
+        }
+    }
 
     val transfers by TransferManager.transfers.collectAsState()
     val activeTransfers = remember(transfers) {

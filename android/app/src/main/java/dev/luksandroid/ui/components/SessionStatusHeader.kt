@@ -72,7 +72,6 @@ fun SessionStatusHeader(
 
     LaunchedEffect(sessionState) {
         when (sessionState) {
-            is SessionState.Unlocked -> LuksHaptics.unlock(context)
             is SessionState.Detached -> LuksHaptics.deadboltLock(context)
             is SessionState.Failed -> LuksHaptics.error(context)
             else -> {}

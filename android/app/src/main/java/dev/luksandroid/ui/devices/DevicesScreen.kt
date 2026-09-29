@@ -8,7 +8,12 @@ import android.hardware.usb.UsbManager
 import android.os.Build
 import android.text.Editable
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -370,123 +375,75 @@ fun DevicesScreen(
         }
     }
 
-    Column(
-        modifier = modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp),
-    ) {
-        // Quiet Room Header
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
+    val onRetryPartition: (LuksDevice, PartitionInfo) -> Unit = { dev, part ->
+        scope.launch {
+            LuksSession.reset()
+            if (part.isPlain) {
+                LuksSession.openPlain(context, dev, part)
+            } else {
+                promptDialogTarget = dev to part
+            }
+        }
+    }
+    val onResetSession: () -> Unit = {
+        scope.launch {
+            LuksSession.reset()
+            scanDevices()
+        }
+    }
+
+    if (targets.isEmpty() && sessionState !is SessionState.Unlocked) {
+        Column(
+            modifier = modifier
+                .fillMaxSize()
+                .padding(16.dp),
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(
-                    imageVector = Icons.Default.Lock,
-                    contentDescription = null,
-                    tint = StateLocked,
-                    modifier = Modifier.size(20.dp),
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = "LUKS Android",
-                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold),
-                    color = MaterialTheme.colorScheme.onBackground,
-                )
+            QuietRoomHeader(
+                isScanning = isScanning,
+                onScan = { scanDevices() },
+                onOpenDiagnostics = onOpenDiagnostics,
+            )
+
+            GlobalSessionNotices(
+                sessionState = sessionState,
+                deviceStates = deviceStates,
+                onRetryPartition = onRetryPartition,
+                onReset = onResetSession,
+                modifier = Modifier.padding(top = 16.dp),
+            )
+
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth(),
+                contentAlignment = Alignment.Center,
+            ) {
+                EmptyDevicesView(onScan = { scanDevices() }, isScanning = isScanning)
             }
 
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                if (isScanning) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(16.dp),
-                        strokeWidth = 2.dp,
-                        color = StateLocked,
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                } else {
-                    IconButton(onClick = { scanDevices() }) {
-                        Icon(
-                            imageVector = Icons.Default.Refresh,
-                            contentDescription = "Check connection",
-                            modifier = Modifier.size(18.dp),
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                }
-                if (onOpenDiagnostics != null) {
-                    IconButton(onClick = onOpenDiagnostics) {
-                        Icon(
-                            imageVector = Icons.Default.BugReport,
-                            contentDescription = "Diagnostics",
-                            modifier = Modifier.size(18.dp),
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                }
-            }
+            QuietSecurityFooter()
         }
+    } else {
+        Column(
+            modifier = modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
+            QuietRoomHeader(
+                isScanning = isScanning,
+                onScan = { scanDevices() },
+                onOpenDiagnostics = onOpenDiagnostics,
+            )
 
-        // Global Session State notices (Unlocking / Detached / Failed)
-        when (val s = sessionState) {
-            is SessionState.Unlocking -> {
-                UnlockingStateCard(partition = s.partition)
-            }
-            is SessionState.Detached -> {
-                DetachedStateCard(
-                    message = s.message,
-                    onDismiss = {
-                        scope.launch {
-                            LuksSession.reset()
-                            scanDevices()
-                        }
-                    }
-                )
-            }
-            is SessionState.Failed -> {
-                FailedStateCard(
-                    message = s.message,
-                    onReset = {
-                        scope.launch {
-                            LuksSession.reset()
-                        }
-                    },
-                    onTryAgain = if (s.partition != null) {
-                        {
-                            val targetDev = deviceStates.values
-                                .filterIsInstance<DeviceItemState.Opened>()
-                                .map { it.device }
-                                .firstOrNull { it.openablePartitions.any { op -> op.offsetBytes == s.partition.offsetBytes } }
-                            if (targetDev != null) {
-                                scope.launch {
-                                    LuksSession.reset()
-                                    if (s.partition.isPlain) {
-                                        LuksSession.openPlain(context, targetDev, s.partition)
-                                    } else {
-                                        promptDialogTarget = targetDev to s.partition
-                                    }
-                                }
-                            } else {
-                                scope.launch { LuksSession.reset() }
-                            }
-                        }
-                    } else null
-                )
-            }
-            is SessionState.Unlocked -> {
-                // Handled smoothly by LuksAppNavigation
-            }
-            is SessionState.Locked -> {
-                // Normal locked flow
-            }
-        }
+            GlobalSessionNotices(
+                sessionState = sessionState,
+                deviceStates = deviceStates,
+                onRetryPartition = onRetryPartition,
+                onReset = onResetSession,
+            )
 
-        // Render targets
-        if (targets.isEmpty() && sessionState !is SessionState.Unlocked) {
-            EmptyDevicesView(onScan = { scanDevices() }, isScanning = isScanning)
-        } else {
             targets.forEach { target ->
                 val key = keyOf(target)
                 val itemState = deviceStates[key] ?: DeviceItemState.Idle
@@ -560,6 +517,107 @@ fun DevicesScreen(
 }
 
 @Composable
+private fun QuietRoomHeader(
+    isScanning: Boolean,
+    onScan: () -> Unit,
+    onOpenDiagnostics: (() -> Unit)?,
+    modifier: Modifier = Modifier,
+) {
+    Row(
+        modifier = modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(
+                imageVector = Icons.Default.Lock,
+                contentDescription = null,
+                tint = StateLocked,
+                modifier = Modifier.size(20.dp),
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Text(
+                text = "LUKS Android",
+                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold),
+                color = MaterialTheme.colorScheme.onBackground,
+            )
+        }
+
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            if (isScanning) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(16.dp),
+                    strokeWidth = 2.dp,
+                    color = StateLocked,
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+            } else {
+                IconButton(onClick = onScan) {
+                    Icon(
+                        imageVector = Icons.Default.Refresh,
+                        contentDescription = "Check connection",
+                        modifier = Modifier.size(18.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            if (onOpenDiagnostics != null) {
+                IconButton(onClick = onOpenDiagnostics) {
+                    Icon(
+                        imageVector = Icons.Default.BugReport,
+                        contentDescription = "Diagnostics",
+                        modifier = Modifier.size(18.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun GlobalSessionNotices(
+    sessionState: SessionState,
+    deviceStates: Map<String, DeviceItemState>,
+    onRetryPartition: (LuksDevice, PartitionInfo) -> Unit,
+    onReset: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    when (val s = sessionState) {
+        is SessionState.Unlocking -> {
+            UnlockingStateCard(partition = s.partition, modifier = modifier)
+        }
+        is SessionState.Detached -> {
+            DetachedStateCard(
+                message = s.message,
+                onDismiss = onReset,
+                modifier = modifier,
+            )
+        }
+        is SessionState.Failed -> {
+            val part = s.partition
+            val targetDev = if (part != null) {
+                deviceStates.values
+                    .filterIsInstance<DeviceItemState.Opened>()
+                    .map { it.device }
+                    .firstOrNull { it.openablePartitions.any { op -> op.offsetBytes == part.offsetBytes } }
+            } else null
+
+            FailedStateCard(
+                message = s.message,
+                onReset = onReset,
+                onTryAgain = if (part != null && targetDev != null) {
+                    { onRetryPartition(targetDev, part) }
+                } else null,
+                modifier = modifier,
+            )
+        }
+        is SessionState.Unlocked -> {}
+        is SessionState.Locked -> {}
+    }
+}
+
+@Composable
 private fun EmptyDevicesView(
     onScan: () -> Unit,
     isScanning: Boolean,
@@ -568,7 +626,7 @@ private fun EmptyDevicesView(
     Box(
         modifier = modifier
             .fillMaxWidth()
-            .padding(vertical = 48.dp, horizontal = 24.dp),
+            .padding(horizontal = 24.dp),
         contentAlignment = Alignment.Center,
     ) {
         Column(
@@ -577,9 +635,10 @@ private fun EmptyDevicesView(
         ) {
             Box(
                 modifier = Modifier
-                    .size(72.dp)
+                    .size(76.dp)
                     .clip(CircleShape)
-                    .background(MaterialTheme.colorScheme.surfaceVariant),
+                    .background(MaterialTheme.colorScheme.surfaceVariant)
+                    .border(1.dp, StateLocked.copy(alpha = 0.25f), CircleShape),
                 contentAlignment = Alignment.Center,
             ) {
                 Icon(
@@ -604,7 +663,7 @@ private fun EmptyDevicesView(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
 
-            Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(4.dp))
 
             if (isScanning) {
                 CircularProgressIndicator(
@@ -625,6 +684,33 @@ private fun EmptyDevicesView(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun QuietSecurityFooter(modifier: Modifier = Modifier) {
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(vertical = 8.dp),
+        horizontalArrangement = Arrangement.Center,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            imageVector = Icons.Default.Security,
+            contentDescription = null,
+            modifier = Modifier.size(13.dp),
+            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
+        )
+        Spacer(modifier = Modifier.width(6.dp))
+        Text(
+            text = "Isolated RAM · Zero network · Off-heap key wiping",
+            style = MaterialTheme.typography.labelSmall.copy(
+                fontSize = 11.sp,
+                letterSpacing = 0.3.sp,
+            ),
+            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+        )
     }
 }
 
@@ -690,7 +776,7 @@ private fun TargetDeviceCard(
                         color = MaterialTheme.colorScheme.onSurface,
                     )
                     Text(
-                        text = "Encrypted Block Device · Interface ${target.usbInterface.id}",
+                        text = "USB Storage · Interface ${target.usbInterface.id}",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -1019,33 +1105,39 @@ private fun PartitionItemCard(
                                 color = StateUnlocked,
                             )
                         }
-                    } else if (sessionState is SessionState.Locked && !isPromptingUnlock) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            if (showBiometricUnlock) {
-                                FilledTonalIconButton(
-                                    onClick = onBiometricUnlock,
+                    } else if (sessionState is SessionState.Locked) {
+                        AnimatedVisibility(
+                            visible = !isPromptingUnlock,
+                            enter = fadeIn(),
+                            exit = fadeOut(),
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                if (showBiometricUnlock) {
+                                    FilledTonalIconButton(
+                                        onClick = onBiometricUnlock,
+                                        enabled = !biometricBusy,
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Fingerprint,
+                                            contentDescription = "Unlock with fingerprint",
+                                            modifier = Modifier.size(20.dp),
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                }
+                                FilledTonalButton(
+                                    onClick = onUnlock,
                                     enabled = !biometricBusy,
+                                    shape = RoundedCornerShape(8.dp),
                                 ) {
                                     Icon(
-                                        imageVector = Icons.Default.Fingerprint,
-                                        contentDescription = "Unlock with fingerprint",
-                                        modifier = Modifier.size(20.dp),
+                                        imageVector = Icons.Default.LockOpen,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(16.dp),
                                     )
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("Unlock")
                                 }
-                                Spacer(modifier = Modifier.width(6.dp))
-                            }
-                            FilledTonalButton(
-                                onClick = onUnlock,
-                                enabled = !biometricBusy,
-                                shape = RoundedCornerShape(8.dp),
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.LockOpen,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(16.dp),
-                                )
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("Unlock")
                             }
                         }
                     }
@@ -1083,7 +1175,11 @@ private fun PartitionItemCard(
             }
 
             // In-place Unlock Area
-            if (isPromptingUnlock && partition.isLuks && sessionState is SessionState.Locked) {
+            AnimatedVisibility(
+                visible = isPromptingUnlock && partition.isLuks && sessionState is SessionState.Locked,
+                enter = expandVertically(expandFrom = Alignment.Top) + fadeIn(),
+                exit = shrinkVertically(shrinkTowards = Alignment.Top) + fadeOut(),
+            ) {
                 InPlaceUnlockSection(
                     partition = partition,
                     showBiometricUnlock = showBiometricUnlock,
@@ -1293,8 +1389,13 @@ private fun UnlockingStateCard(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically,
             ) {
+                val kdfLabel = when (partition.luksVersion) {
+                    1 -> "PBKDF2 · Iterated KDF"
+                    2 -> "Argon2id · Memory-hard KDF"
+                    else -> "Cryptographic KDF"
+                }
                 Text(
-                    text = "Argon2id · Memory-hard KDF",
+                    text = kdfLabel,
                     style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
                     color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.7f),
                 )

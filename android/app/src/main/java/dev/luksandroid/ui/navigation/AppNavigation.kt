@@ -2,8 +2,11 @@ package dev.luksandroid.ui.navigation
 
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
@@ -96,7 +99,13 @@ fun LuksAppNavigation(
                 AnimatedContent(
                     targetState = isUnlocked,
                     transitionSpec = {
-                        fadeIn() togetherWith fadeOut()
+                        if (targetState) {
+                            (fadeIn(animationSpec = tween(300)) + scaleIn(initialScale = 0.98f, animationSpec = tween(300)))
+                                .togetherWith(fadeOut(animationSpec = tween(200)))
+                        } else {
+                            fadeIn(animationSpec = tween(200))
+                                .togetherWith(fadeOut(animationSpec = tween(200)) + scaleOut(targetScale = 0.98f, animationSpec = tween(200)))
+                        }
                     },
                     label = "VaultStateTransition",
                 ) { unlocked ->

@@ -637,8 +637,7 @@ private fun EmptyDevicesView(
                 modifier = Modifier
                     .size(76.dp)
                     .clip(CircleShape)
-                    .background(MaterialTheme.colorScheme.surfaceVariant)
-                    .border(1.dp, StateLocked.copy(alpha = 0.25f), CircleShape),
+                    .background(MaterialTheme.colorScheme.surfaceVariant),
                 contentAlignment = Alignment.Center,
             ) {
                 Icon(
@@ -793,7 +792,7 @@ private fun TargetDeviceCard(
                     horizontalArrangement = Arrangement.SpaceBetween,
                 ) {
                     Text(
-                        text = "USB permission required to read drive",
+                        text = "Tap to allow access to this drive",
                         style = MaterialTheme.typography.bodySmall,
                         color = WarningAmber,
                         modifier = Modifier.weight(1f),

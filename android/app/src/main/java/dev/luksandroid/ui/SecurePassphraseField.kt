@@ -6,6 +6,7 @@ import android.text.InputType
 import android.text.TextWatcher
 import android.text.method.PasswordTransformationMethod
 import android.view.ActionMode
+import android.view.HapticFeedbackConstants
 import android.view.Menu
 import android.view.MenuItem
 import android.view.View
@@ -31,6 +32,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.PathFillType
 import androidx.compose.ui.graphics.SolidColor
@@ -92,6 +94,7 @@ fun SecurePassphraseField(
     onHasContentChange: (Boolean) -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val view = LocalView.current
     val textColor = MaterialTheme.colorScheme.onSurface.toArgb()
     val hintColor = MaterialTheme.colorScheme.onSurfaceVariant.toArgb()
 
@@ -184,8 +187,10 @@ fun SecurePassphraseField(
                     .pointerInput(Unit) {
                         awaitEachGesture {
                             awaitFirstDown(requireUnconsumed = false)
+                            view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
                             isRevealed = true
                             waitForUpOrCancellation()
+                            view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
                             isRevealed = false
                         }
                     },

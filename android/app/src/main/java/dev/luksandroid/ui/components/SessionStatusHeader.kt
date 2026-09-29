@@ -93,12 +93,7 @@ fun SessionStatusHeader(
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 4.dp)
-                        .border(
-                            width = 1.dp,
-                            color = StateUnlocked.copy(alpha = 0.35f),
-                            shape = RoundedCornerShape(10.dp),
-                        ),
+                        .padding(horizontal = 16.dp, vertical = 4.dp),
                     color = MaterialTheme.colorScheme.surfaceVariant,
                     shape = RoundedCornerShape(10.dp),
                 ) {
@@ -163,20 +158,37 @@ fun SessionStatusHeader(
                                     tint = if (isTimerPaused) DestructiveRed else StateUnlocked,
                                     modifier = Modifier.size(12.dp),
                                 )
-                                Spacer(modifier = Modifier.width(3.dp))
-                                Text(
-                                    text = if (isTimerPaused) {
-                                        "Writing — don't unplug"
-                                    } else {
-                                        "Auto-locks in ${formatIdleTime(remainingIdleMs)}"
-                                    },
-                                    style = MaterialTheme.typography.labelSmall.copy(
-                                        fontFamily = FontFamily.Monospace,
-                                        fontSize = 11.sp,
-                                        fontWeight = FontWeight.Medium,
-                                    ),
-                                    color = if (isTimerPaused) DestructiveRed else StateUnlocked,
-                                )
+                                Spacer(modifier = Modifier.width(4.dp))
+                                if (isTimerPaused) {
+                                    Text(
+                                        text = "Saving changes… keep connected",
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.Medium,
+                                        ),
+                                        color = DestructiveRed,
+                                    )
+                                } else {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(
+                                            text = "Auto-locks in ",
+                                            style = MaterialTheme.typography.labelSmall.copy(
+                                                fontSize = 11.sp,
+                                                fontWeight = FontWeight.Normal,
+                                            ),
+                                            color = StateUnlocked,
+                                        )
+                                        Text(
+                                            text = formatIdleTime(remainingIdleMs),
+                                            style = MaterialTheme.typography.labelSmall.copy(
+                                                fontFamily = FontFamily.Monospace,
+                                                fontSize = 11.sp,
+                                                fontWeight = FontWeight.SemiBold,
+                                            ),
+                                            color = StateUnlocked,
+                                        )
+                                    }
+                                }
                             }
                         }
 
@@ -232,7 +244,7 @@ fun SessionStatusHeader(
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = "Drive disconnected. Session closed safely. Memory wiped.",
+                            text = "Session secured. Keys wiped from memory.",
                             style = MaterialTheme.typography.bodySmall,
                             color = TextPrimary,
                         )
@@ -261,7 +273,7 @@ fun SessionStatusHeader(
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = "Session error: ${state.message}",
+                            text = "Could not unlock: ${state.message}",
                             style = MaterialTheme.typography.bodySmall,
                             color = TextPrimary,
                         )

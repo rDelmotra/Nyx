@@ -2,6 +2,8 @@ package dev.luksandroid.ui.navigation
 
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -102,8 +104,13 @@ fun LuksAppNavigation(
                     targetState = isUnlocked,
                     transitionSpec = {
                         if (targetState) {
-                            (fadeIn(animationSpec = tween(300)) + scaleIn(initialScale = 0.98f, animationSpec = tween(300)))
-                                .togetherWith(fadeOut(animationSpec = tween(200)))
+                            (fadeIn(animationSpec = tween(300)) + scaleIn(
+                                initialScale = 0.98f,
+                                animationSpec = spring(
+                                    dampingRatio = Spring.DampingRatioNoBouncy,
+                                    stiffness = Spring.StiffnessLow,
+                                )
+                            )).togetherWith(fadeOut(animationSpec = tween(200)))
                         } else {
                             fadeIn(animationSpec = tween(200))
                                 .togetherWith(fadeOut(animationSpec = tween(200)) + scaleOut(targetScale = 0.98f, animationSpec = tween(200)))

@@ -1760,7 +1760,7 @@ private fun BiometricRevokeIcon(
                         holdProgress.snapTo(0f)
                         holdProgress.animateTo(
                             targetValue = 1f,
-                            animationSpec = tween(durationMillis = 1120, easing = LinearEasing),
+                            animationSpec = tween(durationMillis = 650, easing = LinearEasing),
                         )
                         triggered = true
                         LuksHaptics.rampPeakAndDrop(context)

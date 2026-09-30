@@ -100,7 +100,7 @@ object LuksHaptics {
     }
 
     /**
-     * Starts an uphill crescendo haptic ramp lasting 1.12 seconds (1120ms).
+     * Starts an uphill crescendo haptic ramp lasting 650 milliseconds.
      * Builds from a gentle tactile hum up to maximum peak intensity with a power curve.
      */
     fun startUphillRamp(context: Context) {
@@ -108,14 +108,14 @@ object LuksHaptics {
             val vibrator = getVibrator(context) ?: return
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 if (vibrator.hasAmplitudeControl()) {
-                    val stepCount = 28
-                    val sliceMs = 40L
+                    val stepCount = 26
+                    val sliceMs = 25L
                     val timings = LongArray(stepCount + 1) { if (it == 0) 0L else sliceMs }
                     val amplitudes = IntArray(stepCount + 1) { i ->
                         if (i == 0) 0
                         else {
                             val t = (i - 1).toDouble() / (stepCount - 1).toDouble()
-                            // Baseline reduced to 15 (60% of previous 25) for a gentle touch response
+                            // Baseline at 15 for a gentle touch response
                             val base = 15.0
                             val peak = 255.0
                             val linear = base + (peak - base) * t
@@ -126,22 +126,22 @@ object LuksHaptics {
                     }
                     vibrator.vibrate(VibrationEffect.createWaveform(timings, amplitudes, -1))
                 } else {
-                    // Fallback pulse pattern precisely calibrated to sum to 1120ms
+                    // Fallback pulse pattern precisely calibrated to sum to 650ms
                     val timings = longArrayOf(
-                        0, 20, 110, 20, 95, 20, 80, 25, 65, 25, 55, 30, 45, 30, 35, 35, 25, 40, 20, 45, 15, 50, 10, 55, 10, 60, 5, 80, 0, 95
+                        0, 15, 80, 15, 70, 15, 60, 20, 50, 20, 40, 25, 30, 25, 25, 30, 20, 35, 15, 45, 10, 55
                     )
                     @Suppress("DEPRECATION")
                     vibrator.vibrate(timings, -1)
                 }
             } else {
                 @Suppress("DEPRECATION")
-                vibrator.vibrate(1120L)
+                vibrator.vibrate(650L)
             }
         } catch (_: Throwable) {}
     }
 
     /**
-     * Tactile release and drop affirming the uphill ramp reached its peak at 1.12s.
+     * Tactile release and drop affirming the uphill ramp reached its peak at 650ms.
      */
     fun rampPeakAndDrop(context: Context) {
         try {

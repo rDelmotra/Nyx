@@ -869,62 +869,99 @@ private fun TargetDeviceCard(
                         val dev = itemState.device
                         val info = dev.info
 
-                        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                            Text(
-                                text = "${info.vendor} ${info.product} · ${formatSize(info.sizeBytes)} · ${info.tableKind}",
-                                style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium),
-                                color = MaterialTheme.colorScheme.onSurface,
-                            )
-
-                            if (info.partitions.isNotEmpty()) {
-                                DiskVisualMap(
-                                    deviceInfo = info,
-                                    selectedPartition = promptDialogTarget?.takeIf { it.first == dev }?.second,
-                                    onSelectPartition = { partition ->
-                                        onUnlockPartition(dev, partition)
-                                    },
-                                )
-                            }
-
-                            if (info.partitions.isEmpty()) {
+                        Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                                 Text(
-                                    text = "No partition table found on drive.",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    text = "${info.vendor} ${info.product} · ${formatSize(info.sizeBytes)} · ${info.tableKind}",
+                                    style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium),
+                                    color = MaterialTheme.colorScheme.onSurface,
                                 )
+
+                                if (info.partitions.isNotEmpty()) {
+                                    DiskVisualMap(
+                                        deviceInfo = info,
+                                        selectedPartition = promptDialogTarget?.takeIf { it.first == dev }?.second,
+                                        onSelectPartition = { partition ->
+                                            onUnlockPartition(dev, partition)
+                                        },
+                                    )
+                                } else {
+                                    Text(
+                                        text = "No partition table found on drive.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
                             }
 
-                            // Render partitions
-                            info.partitions.forEach { partition ->
-                                val bioKey = remember(dev, partition) { dev.biometricKeyFor(partition) }
+                            // Show unlock challenge directly under map if a partition is selected
+                            val selectedPartition = promptDialogTarget?.takeIf { it.first == dev }?.second
+                            if (selectedPartition != null && sessionState is SessionState.Locked) {
+                                val bioKey = remember(dev, selectedPartition) { dev.biometricKeyFor(selectedPartition) }
                                 val enrolled = remember(bioKey, vaultVersion) {
                                     bioKey != null && BiometricPassphraseVault.isEnrolled(context, bioKey)
                                 }
-                                val isPrompting = promptDialogTarget?.first == dev &&
-                                    promptDialogTarget.second.offsetBytes == partition.offsetBytes
                                 val offerEnroll = remember(bioKey, biometricAvailable, vaultVersion) {
                                     bioKey != null && biometricAvailable && !BiometricPassphraseVault.isEnrolled(context, bioKey)
                                 }
 
-                                PartitionItemCard(
-                                    device = dev,
-                                    partition = partition,
-                                    sessionState = sessionState,
-                                    biometricEnrolled = enrolled,
-                                    showBiometricUnlock = enrolled && biometricAvailable,
-                                    biometricBusy = biometricBusy,
-                                    isPromptingUnlock = isPrompting,
-                                    offerBiometricEnroll = offerEnroll,
-                                    dialogNotice = if (isPrompting) dialogNotice else null,
-                                    onUnlock = { onUnlockPartition(dev, partition) },
-                                    onBiometricUnlock = { onBiometricUnlockPartition(dev, partition) },
-                                    onMount = { onMountPartition(dev, partition) },
-                                    onForgetBiometric = { bioKey?.let { onForgetBiometric(it, partition) } },
-                                    onSubmitPassphrase = { buffer, enroll ->
-                                        onSubmitUnlock(dev, partition, buffer, enroll)
-                                    },
-                                    onDismissUnlock = onDismissUnlock,
-                                )
+                                AnimatedVisibility(
+                                    visible = true,
+                                    enter = fadeIn() + expandVertically(expandFrom = Alignment.Top),
+                                    exit = fadeOut() + shrinkVertically(shrinkTowards = Alignment.Top),
+                                ) {
+                                    if (selectedPartition.isLuks) {
+                                        InPlaceUnlockSection(
+                                            partition = selectedPartition,
+                                            showBiometricUnlock = enrolled && biometricAvailable,
+                                            biometricEnrolled = enrolled,
+                                            biometricBusy = biometricBusy,
+                                            offerBiometricEnroll = offerEnroll,
+                                            dialogNotice = dialogNotice,
+                                            onBiometricUnlock = { onBiometricUnlockPartition(dev, selectedPartition) },
+                                            onForgetBiometric = { bioKey?.let { onForgetBiometric(it, selectedPartition) } },
+                                            onSubmitPassphrase = { buffer, enroll ->
+                                                onSubmitUnlock(dev, selectedPartition, buffer, enroll)
+                                            },
+                                            onDismiss = onDismissUnlock,
+                                        )
+                                    } else if (selectedPartition.isPlain) {
+                                        Column(
+                                            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                                        ) {
+                                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.25f))
+                                            FilledTonalButton(
+                                                onClick = { onMountPartition(dev, selectedPartition) },
+                                                shape = RoundedCornerShape(8.dp),
+                                                modifier = Modifier.fillMaxWidth()
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Default.Storage,
+                                                    contentDescription = null,
+                                                    modifier = Modifier.size(16.dp),
+                                                )
+                                                Spacer(modifier = Modifier.width(4.dp))
+                                                Text("Mount ${selectedPartition.fsType?.uppercase() ?: "Plain"}")
+                                            }
+                                            Row(
+                                                modifier = Modifier.fillMaxWidth(),
+                                                horizontalArrangement = Arrangement.End
+                                            ) {
+                                                TextButton(
+                                                    onClick = onDismissUnlock,
+                                                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
+                                                    modifier = Modifier.height(26.dp),
+                                                ) {
+                                                    Text(
+                                                        text = "Cancel",
+                                                        style = MaterialTheme.typography.labelSmall.copy(color = MaterialTheme.colorScheme.onSurfaceVariant),
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -953,257 +990,15 @@ private fun TargetDeviceCard(
 }
 
 @Composable
-private fun PartitionItemCard(
-    device: LuksDevice,
-    partition: PartitionInfo,
-    sessionState: SessionState,
-    biometricEnrolled: Boolean,
-    showBiometricUnlock: Boolean,
-    biometricBusy: Boolean,
-    isPromptingUnlock: Boolean,
-    offerBiometricEnroll: Boolean,
-    dialogNotice: String?,
-    onUnlock: () -> Unit,
-    onBiometricUnlock: () -> Unit = {},
-    onMount: () -> Unit = {},
-    onForgetBiometric: () -> Unit = {},
-    onSubmitPassphrase: (SecurePassphraseBuffer, Boolean) -> Unit = { _, _ -> },
-    onDismissUnlock: () -> Unit = {},
-    modifier: Modifier = Modifier,
-) {
-    val isSessionUnlocked = sessionState is SessionState.Unlocked &&
-            sessionState.partition.offsetBytes == partition.offsetBytes
-
-    Surface(
-        modifier = modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(12.dp),
-        color = MaterialTheme.colorScheme.surface,
-        border = if (partition.isLuks) {
-            BorderStroke(
-                width = if (isPromptingUnlock) 1.5.dp else 1.dp,
-                color = if (isSessionUnlocked) StateUnlocked.copy(alpha = 0.5f)
-                        else if (isPromptingUnlock) StateLocked
-                        else StateLocked.copy(alpha = 0.35f),
-            )
-        } else {
-            BorderStroke(1.dp, DarkOutline)
-        },
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(14.dp),
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween,
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.weight(1f),
-                ) {
-                    Icon(
-                        imageVector = if (partition.isLuks) {
-                            if (isSessionUnlocked) Icons.Default.LockOpen else Icons.Default.Lock
-                        } else {
-                            Icons.Default.Storage
-                        },
-                        contentDescription = null,
-                        tint = when {
-                            isSessionUnlocked -> StateUnlocked
-                            partition.isLuks -> StateLocked
-                            partition.isPlain -> MaterialTheme.colorScheme.secondary
-                            partition.unsupportedReason != null -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
-                            else -> MaterialTheme.colorScheme.onSurfaceVariant
-                        },
-                        modifier = Modifier.size(20.dp),
-                    )
-                    Spacer(modifier = Modifier.width(10.dp))
-
-                    Column {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(
-                                text = partition.name.ifBlank { "Partition #${partition.index}" },
-                                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium),
-                                color = MaterialTheme.colorScheme.onSurface,
-                            )
-                            if (partition.isLuks) {
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Box(
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(4.dp))
-                                        .background(MaterialTheme.colorScheme.primaryContainer)
-                                        .padding(horizontal = 6.dp, vertical = 1.dp),
-                                ) {
-                                    Text(
-                                        text = "LUKS${partition.luksVersion ?: ""}",
-                                        style = MaterialTheme.typography.labelSmall.copy(
-                                            fontWeight = FontWeight.Bold,
-                                            fontSize = 10.sp,
-                                        ),
-                                        color = MaterialTheme.colorScheme.onPrimaryContainer,
-                                    )
-                                }
-                            } else if (partition.isPlain) {
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Box(
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(4.dp))
-                                        .background(MaterialTheme.colorScheme.secondaryContainer)
-                                        .padding(horizontal = 6.dp, vertical = 1.dp),
-                                ) {
-                                    Text(
-                                        text = "${partition.fsType?.uppercase()}",
-                                        style = MaterialTheme.typography.labelSmall.copy(
-                                            fontWeight = FontWeight.Bold,
-                                            fontSize = 10.sp,
-                                        ),
-                                        color = MaterialTheme.colorScheme.onSecondaryContainer,
-                                    )
-                                }
-                            } else if (partition.unsupportedReason != null) {
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Box(
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(4.dp))
-                                        .background(MaterialTheme.colorScheme.surfaceVariant)
-                                        .padding(horizontal = 6.dp, vertical = 1.dp),
-                                ) {
-                                    Text(
-                                        text = "${partition.fsType?.uppercase() ?: "UNKNOWN"} (Unsupported)",
-                                        style = MaterialTheme.typography.labelSmall.copy(
-                                            fontWeight = FontWeight.Medium,
-                                            fontSize = 10.sp,
-                                        ),
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    )
-                                }
-                            }
-
-                            if (biometricEnrolled) {
-                                Spacer(modifier = Modifier.width(6.dp))
-                                BiometricRevokeIcon(
-                                    onTriggerTurnOff = onForgetBiometric,
-                                )
-                            }
-                        }
-
-                        Text(
-                            text = buildString {
-                                append("${formatSize(partition.sizeBytes)} · Offset 0x${partition.offsetBytes.toString(16)}")
-                                if (partition.unsupportedReason != null) {
-                                    append(" · ${partition.unsupportedReason}")
-                                }
-                            },
-                            style = MaterialTheme.typography.bodySmall.copy(
-                                fontFamily = FontFamily.Monospace,
-                                fontSize = 11.sp,
-                            ),
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                }
-
-                if (partition.isLuks) {
-                    if (isSessionUnlocked) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(
-                                imageVector = Icons.Default.LockOpen,
-                                contentDescription = "Unlocked",
-                                tint = StateUnlocked,
-                                modifier = Modifier.size(16.dp),
-                            )
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text(
-                                text = "Unlocked",
-                                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
-                                color = StateUnlocked,
-                            )
-                        }
-                    } else if (sessionState is SessionState.Locked) {
-                        AnimatedVisibility(
-                            visible = !isPromptingUnlock,
-                            enter = fadeIn(),
-                            exit = fadeOut(),
-                        ) {
-                            FilledTonalButton(
-                                onClick = if (showBiometricUnlock) onBiometricUnlock else onUnlock,
-                                enabled = !biometricBusy,
-                                shape = RoundedCornerShape(8.dp),
-                            ) {
-                                Icon(
-                                    imageVector = if (showBiometricUnlock) Icons.Default.Fingerprint else Icons.Default.LockOpen,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(16.dp),
-                                )
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("Unlock")
-                            }
-                        }
-                    }
-                } else if (partition.isPlain) {
-                    if (isSessionUnlocked) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(
-                                imageVector = Icons.Default.CheckCircle,
-                                contentDescription = "Mounted",
-                                tint = StateUnlocked,
-                                modifier = Modifier.size(16.dp),
-                            )
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text(
-                                text = "Mounted",
-                                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
-                                color = StateUnlocked,
-                            )
-                        }
-                    } else if (sessionState is SessionState.Locked) {
-                        FilledTonalButton(
-                            onClick = onMount,
-                            shape = RoundedCornerShape(8.dp),
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Storage,
-                                contentDescription = null,
-                                modifier = Modifier.size(16.dp),
-                            )
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("Mount")
-                        }
-                    }
-                }
-            }
-
-            // In-place Unlock Area
-            AnimatedVisibility(
-                visible = isPromptingUnlock && partition.isLuks && sessionState is SessionState.Locked,
-                enter = expandVertically(expandFrom = Alignment.Top) + fadeIn(),
-                exit = shrinkVertically(shrinkTowards = Alignment.Top) + fadeOut(),
-            ) {
-                InPlaceUnlockSection(
-                    partition = partition,
-                    showBiometricUnlock = showBiometricUnlock,
-                    biometricBusy = biometricBusy,
-                    offerBiometricEnroll = offerBiometricEnroll,
-                    dialogNotice = dialogNotice,
-                    onBiometricUnlock = onBiometricUnlock,
-                    onSubmitPassphrase = onSubmitPassphrase,
-                    onDismiss = onDismissUnlock,
-                )
-            }
-        }
-    }
-}
-
-@Composable
 private fun InPlaceUnlockSection(
     partition: PartitionInfo,
     showBiometricUnlock: Boolean,
+    biometricEnrolled: Boolean,
     biometricBusy: Boolean,
     offerBiometricEnroll: Boolean,
     dialogNotice: String?,
     onBiometricUnlock: () -> Unit,
+    onForgetBiometric: () -> Unit,
     onSubmitPassphrase: (SecurePassphraseBuffer, Boolean) -> Unit,
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier,
@@ -1222,9 +1017,24 @@ private fun InPlaceUnlockSection(
         modifier = modifier
             .fillMaxWidth()
             .padding(top = 8.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.25f))
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = "Unlock ${partition.name.ifBlank { "Partition #${partition.index}" }}",
+                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            if (biometricEnrolled) {
+                BiometricRevokeIcon(onTriggerTurnOff = onForgetBiometric)
+            }
+        }
 
         if (dialogNotice != null) {
             Text(

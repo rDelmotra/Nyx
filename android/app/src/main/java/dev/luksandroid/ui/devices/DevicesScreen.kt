@@ -8,18 +8,26 @@ import android.hardware.usb.UsbManager
 import android.os.Build
 import android.text.Editable
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -35,6 +43,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Fingerprint
 import androidx.compose.material.icons.filled.FolderOpen
@@ -78,6 +87,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontFamily
@@ -1068,6 +1080,13 @@ private fun PartitionItemCard(
                                     )
                                 }
                             }
+
+                            if (biometricEnrolled) {
+                                Spacer(modifier = Modifier.width(6.dp))
+                                BiometricRevokeIcon(
+                                    onTriggerTurnOff = onForgetBiometric,
+                                )
+                            }
                         }
 
                         Text(
@@ -1083,30 +1102,6 @@ private fun PartitionItemCard(
                             ),
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
-
-                        if (biometricEnrolled) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Icon(
-                                    imageVector = Icons.Default.Fingerprint,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(12.dp),
-                                    tint = StateUnlocked,
-                                )
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text(
-                                    text = "Fingerprint unlock on",
-                                    style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                                Spacer(modifier = Modifier.width(4.dp))
-                                TextButton(
-                                    onClick = onForgetBiometric,
-                                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
-                                ) {
-                                    Text("Turn off", style = MaterialTheme.typography.labelSmall)
-                                }
-                            }
-                        }
                     }
                 }
 
@@ -1493,6 +1488,15 @@ private fun FailedStateCard(
     modifier: Modifier = Modifier,
 ) {
     val isWrongPassphrase = message.contains("wrong passphrase", ignoreCase = true)
+    val autoDismissProgress = remember { Animatable(0f) }
+
+    LaunchedEffect(Unit) {
+        autoDismissProgress.animateTo(
+            targetValue = 1f,
+            animationSpec = tween(durationMillis = 4000, easing = LinearEasing),
+        )
+        onReset()
+    }
 
     Card(
         modifier = modifier.fillMaxWidth(),
@@ -1523,34 +1527,72 @@ private fun FailedStateCard(
                 )
             }
 
-            Text(
-                text = if (isWrongPassphrase) {
-                    "Passphrase did not unlock this partition. Off-heap memory wiped; the drive remains untouched."
-                } else {
-                    message
-                },
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            if (!isWrongPassphrase) {
+                Text(
+                    text = message,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
 
             Row(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 if (onTryAgain != null) {
                     Button(
                         onClick = onTryAgain,
                         shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.height(38.dp),
+                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 0.dp),
                     ) {
                         Text("Try Again")
                     }
                 }
 
-                OutlinedButton(
-                    onClick = onReset,
-                    shape = RoundedCornerShape(8.dp),
+                // Auto-dismiss bar: fills from 0% to 100% over 4s (tap to dismiss early)
+                val fillTrackColor = if (isWrongPassphrase) StateUnlocked.copy(alpha = 0.22f)
+                                     else DestructiveRed.copy(alpha = 0.20f)
+                Box(
+                    modifier = (if (onTryAgain != null) Modifier.weight(1f) else Modifier.fillMaxWidth())
+                        .height(38.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(MaterialTheme.colorScheme.surface)
+                        .border(
+                            BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)),
+                            RoundedCornerShape(8.dp),
+                        )
+                        .drawBehind {
+                            val fraction = autoDismissProgress.value.coerceIn(0f, 1f)
+                            if (fraction > 0f) {
+                                drawRect(
+                                    color = fillTrackColor,
+                                    size = size.copy(width = size.width * fraction),
+                                )
+                            }
+                        }
+                        .clickable(onClick = onReset),
+                    contentAlignment = Alignment.Center,
                 ) {
-                    Text("Dismiss")
+                    Row(
+                        modifier = Modifier.fillMaxSize(),
+                        horizontalArrangement = Arrangement.Center,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Close,
+                            contentDescription = null,
+                            modifier = Modifier.size(14.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "Dismiss",
+                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Medium),
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                    }
                 }
             }
         }
@@ -1668,27 +1710,139 @@ private fun UnlockedStateCard(
 
 
 @Composable
+private fun BiometricRevokeIcon(
+    onTriggerTurnOff: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val holdProgress = remember { Animatable(0f) }
+    var isHolding by remember { mutableStateOf(false) }
+
+    // Guarantee vibrator motor is cancelled if composable unmounts while being touched
+    DisposableEffect(Unit) {
+        onDispose {
+            LuksHaptics.cancel(context)
+        }
+    }
+
+    // Faded dark reddish tones (calm, subtle, non-intrusive)
+    val containerBg = Color(0xFF281A1C)
+    val iconTint = Color(0xFFC76D6D)
+    val activeBorder = DestructiveRed.copy(alpha = 0.7f)
+
+    Box(
+        modifier = modifier
+            .size(24.dp)
+            .clip(RoundedCornerShape(6.dp))
+            .background(containerBg)
+            .border(
+                BorderStroke(
+                    width = 1.dp,
+                    color = if (isHolding) activeBorder else iconTint.copy(alpha = 0.25f),
+                ),
+                shape = RoundedCornerShape(6.dp),
+            )
+            .drawBehind {
+                val fraction = holdProgress.value
+                if (fraction > 0f) {
+                    drawRect(activeBorder.copy(alpha = 0.35f * fraction))
+                }
+            }
+            .pointerInput(Unit) {
+                awaitEachGesture {
+                    awaitFirstDown(requireUnconsumed = false)
+                    isHolding = true
+                    var triggered = false
+
+                    val holdJob = scope.launch {
+                        LuksHaptics.startUphillRamp(context)
+                        holdProgress.snapTo(0f)
+                        holdProgress.animateTo(
+                            targetValue = 1f,
+                            animationSpec = tween(durationMillis = 1120, easing = LinearEasing),
+                        )
+                        triggered = true
+                        LuksHaptics.rampPeakAndDrop(context)
+                        onTriggerTurnOff()
+                    }
+
+                    try {
+                        waitForUpOrCancellation()
+                    } finally {
+                        if (!triggered) {
+                            holdJob.cancel()
+                            LuksHaptics.cancel(context)
+                            scope.launch {
+                                holdProgress.animateTo(0f, animationSpec = tween(120))
+                            }
+                        }
+                        isHolding = false
+                    }
+                }
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(
+            imageVector = Icons.Default.Fingerprint,
+            contentDescription = "Fingerprint enrolled. Touch and hold to turn off.",
+            tint = iconTint,
+            modifier = Modifier.size(13.dp),
+        )
+    }
+}
+
+@Composable
 private fun ForgetBiometricDialog(
     label: String,
     onConfirm: () -> Unit,
     onDismiss: () -> Unit,
 ) {
+    val context = LocalContext.current
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Turn off fingerprint unlock?") },
+        title = {
+            Text(
+                text = "Turn off fingerprint unlock?",
+                style = MaterialTheme.typography.titleLarge,
+                color = MaterialTheme.colorScheme.error,
+            )
+        },
         text = {
-            Text("The saved passphrase for $label will be deleted from this phone. You'll need to type it next time.")
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(
+                    text = "Are you sure you want to turn off fingerprint unlock for \"$label\"?",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Text(
+                    text = "The saved passphrase will be removed from secure hardware storage.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                    fontWeight = FontWeight.Medium,
+                )
+                Text(
+                    text = "You will need to manually type the passphrase next time you unlock this partition.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         },
         confirmButton = {
             Button(
-                onClick = onConfirm,
+                onClick = {
+                    LuksHaptics.deadboltLock(context)
+                    onConfirm()
+                },
                 colors = ButtonDefaults.buttonColors(
                     containerColor = MaterialTheme.colorScheme.error,
                     contentColor = MaterialTheme.colorScheme.onError,
                 ),
                 shape = RoundedCornerShape(8.dp),
             ) {
-                Text("Turn off")
+                Text("Turn Off")
             }
         },
         dismissButton = {

@@ -115,7 +115,13 @@ object LuksHaptics {
                         if (i == 0) 0
                         else {
                             val t = (i - 1).toDouble() / (stepCount - 1).toDouble()
-                            (25.0 + 230.0 * Math.pow(t, 1.8)).toInt().coerceIn(1, 255)
+                            // Baseline reduced to 15 (60% of previous 25) for a gentle touch response
+                            val base = 15.0
+                            val peak = 255.0
+                            val linear = base + (peak - base) * t
+                            val exponential = base * Math.pow(peak / base, t)
+                            // Exponential growth curved closer to linear (50/50 blend)
+                            ((0.50 * linear + 0.50 * exponential) + 0.5).toInt().coerceIn(1, 255)
                         }
                     }
                     vibrator.vibrate(VibrationEffect.createWaveform(timings, amplitudes, -1))

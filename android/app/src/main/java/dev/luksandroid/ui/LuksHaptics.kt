@@ -115,13 +115,13 @@ object LuksHaptics {
                         if (i == 0) 0
                         else {
                             val t = (i - 1).toDouble() / (stepCount - 1).toDouble()
-                            // Baseline at 15 for a gentle touch response
-                            val base = 15.0
+                            // Baseline calibrated so finger feels immediate presence without being loud (~60% threshold)
+                            val base = 40.0
                             val peak = 255.0
-                            val linear = base + (peak - base) * t
-                            val exponential = base * Math.pow(peak / base, t)
-                            // Exponential growth curved closer to linear (50/50 blend)
-                            ((0.50 * linear + 0.50 * exponential) + 0.5).toInt().coerceIn(1, 255)
+                            // Smooth power curve (t^1.35) - closer to linear than pure exponential, but still building crescendo
+                            val curvedT = Math.pow(t, 1.35)
+                            val amp = base + (peak - base) * curvedT
+                            (amp + 0.5).toInt().coerceIn(1, 255)
                         }
                     }
                     vibrator.vibrate(VibrationEffect.createWaveform(timings, amplitudes, -1))

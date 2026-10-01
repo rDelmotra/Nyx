@@ -79,6 +79,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -617,6 +618,7 @@ fun BrowserScreen(
     // The transfer itself lives and runs in TransferManager regardless of this
     // screen's lifecycle; this id is only used to pick which one to show inline.
     var activeTransferId by remember { mutableStateOf<Long?>(null) }
+    val pendingTransferIds = remember { mutableStateListOf<Long>() }
     val allTransfers by TransferManager.transfers.collectAsState()
     val activeTransferItem = activeTransferId?.let { id -> allTransfers.find { it.id == id } }
 
@@ -719,47 +721,55 @@ fun BrowserScreen(
     // this effect: it runs on TransferManager's own scope (see
     // TransferManager.startExport/startImport/startHash) and keeps going even
     // if this Composable is disposed before this effect observes completion.
-    LaunchedEffect(activeTransferId) {
-        val id = activeTransferId ?: return@LaunchedEffect
-        val terminal = TransferManager.transfers
-            .map { list -> list.find { it.id == id } }
-            .first { it == null || (it.state != TransferState.RUNNING && it.state != TransferState.QUEUED) }
-
-        when (terminal?.state) {
-            TransferState.COMPLETED -> {
-                when (terminal.type) {
-                    TransferType.IMPORT -> {
-                        snackbarHostState.showSnackbar("Copied \"${terminal.name}\" to drive")
-                        loadDirectory(currentPath)
+    // Watches transfers started from this screen and reacts once they reach terminal states.
+    // Supports multi-file batches without dropping notifications or desynchronizing directory listings.
+    LaunchedEffect(Unit) {
+        TransferManager.transfers.collect { transferList ->
+            val snapshot = pendingTransferIds.toList()
+            for (id in snapshot) {
+                val terminal = transferList.find { it.id == id }
+                if (terminal != null && terminal.state != TransferState.RUNNING && terminal.state != TransferState.QUEUED) {
+                    pendingTransferIds.remove(id)
+                    when (terminal.state) {
+                        TransferState.COMPLETED -> {
+                            when (terminal.type) {
+                                TransferType.IMPORT -> {
+                                    snackbarHostState.showSnackbar("Copied \"${terminal.name}\" to drive")
+                                    loadDirectory(currentPath)
+                                }
+                                TransferType.EXPORT -> {
+                                    snackbarHostState.showSnackbar("Saved \"${terminal.name}\" to phone")
+                                }
+                                TransferType.HASH -> {} // ChecksumResultDialog is driven by startHash's onResult callback.
+                            }
+                        }
+                        TransferState.FAILED -> {
+                            val code = terminal.errorCode
+                            if (terminal.type == TransferType.IMPORT &&
+                                (code == LuksException.NO_SPACE || code == LuksException.ITEM_TOO_LARGE || code == LuksException.UNSUPPORTED)
+                            ) {
+                                if (volumeInfo.fsType == "ext4") {
+                                    isSlackLimitReached = true
+                                }
+                            }
+                            val label = when (terminal.type) {
+                                TransferType.IMPORT -> "Copy to drive"
+                                TransferType.EXPORT -> "Save to phone"
+                                TransferType.HASH -> "Integrity check"
+                            }
+                            snackbarHostState.showSnackbar("$label failed: ${terminal.error ?: "unknown error"}")
+                        }
+                        TransferState.CANCELLED -> {
+                            snackbarHostState.showSnackbar("Transfer cancelled")
+                        }
+                        TransferState.QUEUED,
+                        TransferState.RUNNING -> {}
                     }
-                    TransferType.EXPORT -> {
-                        snackbarHostState.showSnackbar("Saved \"${terminal.name}\" to phone")
-                    }
-                    TransferType.HASH -> {} // ChecksumResultDialog is driven by startHash's onResult callback.
                 }
             }
-            TransferState.FAILED -> {
-                val code = terminal.errorCode
-                if (terminal.type == TransferType.IMPORT &&
-                    (code == LuksException.NO_SPACE || code == LuksException.ITEM_TOO_LARGE || code == LuksException.UNSUPPORTED)
-                ) {
-                    if (volumeInfo.fsType == "ext4") {
-                        isSlackLimitReached = true
-                    }
-                }
-                val label = when (terminal.type) {
-                    TransferType.IMPORT -> "Copy to drive"
-                    TransferType.EXPORT -> "Save to phone"
-                    TransferType.HASH -> "Integrity check"
-                }
-                snackbarHostState.showSnackbar("$label failed: ${terminal.error ?: "unknown error"}")
-            }
-            TransferState.CANCELLED -> {
-                snackbarHostState.showSnackbar("Transfer cancelled")
-            }
-            else -> {}
+            val nextActive = transferList.firstOrNull { it.id in pendingTransferIds && (it.state == TransferState.RUNNING || it.state == TransferState.QUEUED) }
+            activeTransferId = nextActive?.id
         }
-        if (activeTransferId == id) activeTransferId = null
     }
 
     // SAF Exporter
@@ -773,7 +783,9 @@ fun BrowserScreen(
         // Routed through TransferManager (N.2): the actual copy runs on
         // TransferManager's own scope, not this screen's, and is visible on
         // the Transfers screen for the whole time it runs.
-        activeTransferId = TransferManager.startExport(context, source.fullPath, uri)
+        val id = TransferManager.startExport(context, source.fullPath, uri)
+        pendingTransferIds.add(id)
+        if (activeTransferId == null) activeTransferId = id
     }
 
     // SAF Importer
@@ -783,7 +795,9 @@ fun BrowserScreen(
         if (uris.isEmpty()) return@rememberLauncherForActivityResult
 
         for (uri in uris) {
-            activeTransferId = TransferManager.startImport(context, currentPath, uri)
+            val id = TransferManager.startImport(context, currentPath, uri)
+            pendingTransferIds.add(id)
+            if (activeTransferId == null) activeTransferId = id
         }
     }
 
@@ -826,9 +840,11 @@ fun BrowserScreen(
                         collisionChoice = prompt
                     }
                     is TransferPrompt.ReadyToRun -> {
-                        activeTransferId = TransferManager.startDirectoryTransfer(
+                        val id = TransferManager.startDirectoryTransfer(
                             context, direction, request, treeUri, CollisionMode.SKIP,
                         )
+                        pendingTransferIds.add(id)
+                        if (activeTransferId == null) activeTransferId = id
                     }
                 }
             } catch (e: CancellationException) {
@@ -862,7 +878,7 @@ fun BrowserScreen(
 
     // SHA-256 Checksum Calculation
     fun calculateChecksum(item: BrowserItem) {
-        activeTransferId = TransferManager.startHash(item.fullPath) { result ->
+        val id = TransferManager.startHash(item.fullPath) { result ->
             result.onSuccess { digest ->
                 activeChecksum = ChecksumResult(
                     fileName = item.name,
@@ -873,6 +889,8 @@ fun BrowserScreen(
                 )
             }
         }
+        pendingTransferIds.add(id)
+        if (activeTransferId == null) activeTransferId = id
     }
 
     // Create Directory
@@ -1802,9 +1820,11 @@ fun BrowserScreen(
             collisionChoice = null
             pendingDirectory = null
             if (pending != null) {
-                activeTransferId = TransferManager.startDirectoryTransfer(
+                val id = TransferManager.startDirectoryTransfer(
                     context, pending.first, pending.second, pending.third, mode,
                 )
+                pendingTransferIds.add(id)
+                if (activeTransferId == null) activeTransferId = id
             }
         }
 

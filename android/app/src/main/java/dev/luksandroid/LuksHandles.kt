@@ -569,8 +569,11 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
 
         private fun scrubScratch() {
             scratch?.let { buf ->
-                for (i in 0 until buf.capacity()) {
-                    buf.put(i, 0.toByte())
+                runCatching {
+                    buf.clear()
+                    while (buf.hasRemaining()) {
+                        buf.put(0.toByte())
+                    }
                 }
             }
             scratch = null

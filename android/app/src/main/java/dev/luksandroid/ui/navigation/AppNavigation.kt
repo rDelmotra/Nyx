@@ -81,6 +81,7 @@ fun LuksAppNavigation(
 
     LaunchedEffect(isUnlocked) {
         if (isUnlocked) {
+            kotlinx.coroutines.delay(60)
             LuksHaptics.tapIn(context)
         }
     }
@@ -103,22 +104,22 @@ fun LuksAppNavigation(
             targetState = isUnlocked,
             transitionSpec = {
                 if (targetState) {
-                    (fadeIn(animationSpec = tween(340, easing = FastOutSlowInEasing)) +
+                    (fadeIn(animationSpec = tween(380, easing = FastOutSlowInEasing)) +
                      slideInVertically(
-                         animationSpec = tween(340, easing = FastOutSlowInEasing),
-                         initialOffsetY = { 28 },
+                         animationSpec = tween(380, easing = FastOutSlowInEasing),
+                         initialOffsetY = { fullHeight -> (fullHeight * 0.05f).toInt() },
                      ) +
                      scaleIn(
-                         initialScale = 0.96f,
-                         animationSpec = tween(340, easing = FastOutSlowInEasing),
+                         initialScale = 0.95f,
+                         animationSpec = tween(380, easing = FastOutSlowInEasing),
                      )).togetherWith(
-                         fadeOut(animationSpec = tween(180))
+                         fadeOut(animationSpec = tween(160))
                      )
                 } else {
-                    fadeIn(animationSpec = tween(220))
+                    fadeIn(animationSpec = tween(240, easing = FastOutSlowInEasing))
                         .togetherWith(
-                            fadeOut(animationSpec = tween(180)) +
-                            scaleOut(targetScale = 0.96f, animationSpec = tween(180))
+                            fadeOut(animationSpec = tween(160)) +
+                            scaleOut(targetScale = 0.96f, animationSpec = tween(160))
                         )
                 }
             },

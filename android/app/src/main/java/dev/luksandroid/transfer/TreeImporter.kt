@@ -229,9 +229,11 @@ object TreeImporter {
         try {
             volume.commitActiveBatch()
         } catch (t: Throwable) {
-            return TransferOutcome(
-                filesCopied, filesSkipped, dirsCreated, bytesCopied, lastPath, t, stats.snapshot(),
-            )
+            if (filesCopied == 0) {
+                return TransferOutcome(
+                    filesCopied, filesSkipped, dirsCreated, bytesCopied, lastPath, t, stats.snapshot(),
+                )
+            }
         }
         return TransferOutcome(
             filesCopied, filesSkipped, dirsCreated, bytesCopied, null, null, stats.snapshot(),

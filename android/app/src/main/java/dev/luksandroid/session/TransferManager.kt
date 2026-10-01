@@ -179,6 +179,27 @@ open class TransferController {
                 }.onFailure { t ->
                     if (t !is CancellationException) {
                         Trace.err(LuksException.GENERIC, "export")
+                        val errorMsg = UiErrorMessage.getUserMessage(t, "Export")
+                        updateTransfer(transferId) {
+                            if (it.state == TransferState.QUEUED || it.state == TransferState.RUNNING) {
+                                it.copy(
+                                    state = TransferState.FAILED,
+                                    error = errorMsg,
+                                    etaSeconds = 0L,
+                                    speedBytesPerSec = 0L,
+                                )
+                            } else it
+                        }
+                    } else {
+                        updateTransfer(transferId) {
+                            if (it.state == TransferState.QUEUED || it.state == TransferState.RUNNING) {
+                                it.copy(
+                                    state = TransferState.CANCELLED,
+                                    etaSeconds = 0L,
+                                    speedBytesPerSec = 0L,
+                                )
+                            } else it
+                        }
                     }
                 }
             } finally {
@@ -253,6 +274,27 @@ open class TransferController {
                 }.onFailure { t ->
                     if (t !is CancellationException) {
                         Trace.err(LuksException.GENERIC, "import")
+                        val errorMsg = UiErrorMessage.getUserMessage(t, "Import")
+                        updateTransfer(transferId) {
+                            if (it.state == TransferState.QUEUED || it.state == TransferState.RUNNING) {
+                                it.copy(
+                                    state = TransferState.FAILED,
+                                    error = errorMsg,
+                                    etaSeconds = 0L,
+                                    speedBytesPerSec = 0L,
+                                )
+                            } else it
+                        }
+                    } else {
+                        updateTransfer(transferId) {
+                            if (it.state == TransferState.QUEUED || it.state == TransferState.RUNNING) {
+                                it.copy(
+                                    state = TransferState.CANCELLED,
+                                    etaSeconds = 0L,
+                                    speedBytesPerSec = 0L,
+                                )
+                            } else it
+                        }
                     }
                 }
             } finally {
@@ -615,16 +657,8 @@ open class TransferController {
             }
             Trace.i("TransferManager", "Export completed: $transferId in ${totalSec}s")
         } catch (e: CancellationException) {
-            updateTransfer(transferId) {
-                it.copy(
-                    state = TransferState.CANCELLED,
-                    etaSeconds = 0L,
-                    speedBytesPerSec = 0L,
-                )
-            }
-            Trace.err(LuksException.CANCELLED, "export")
-        } catch (e: LuksException) {
-            if (e.isCancelled || isTransferCancelled(transferId)) {
+            val current = getTransfer(transferId)
+            if (current?.state != TransferState.COMPLETED) {
                 updateTransfer(transferId) {
                     it.copy(
                         state = TransferState.CANCELLED,
@@ -633,30 +667,51 @@ open class TransferController {
                     )
                 }
                 Trace.err(LuksException.CANCELLED, "export")
+            }
+        } catch (e: LuksException) {
+            val current = getTransfer(transferId)
+            if (current?.state != TransferState.COMPLETED) {
+                if (e.isCancelled || isTransferCancelled(transferId)) {
+                    updateTransfer(transferId) {
+                        it.copy(
+                            state = TransferState.CANCELLED,
+                            etaSeconds = 0L,
+                            speedBytesPerSec = 0L,
+                        )
+                    }
+                    Trace.err(LuksException.CANCELLED, "export")
+                } else {
+                    val errorMsg = UiErrorMessage.getUserMessage(e, "Export")
+                    updateTransfer(transferId) {
+                        it.copy(
+                            state = TransferState.FAILED,
+                            error = errorMsg,
+                            errorCode = e.code,
+                            etaSeconds = 0L,
+                            speedBytesPerSec = 0L,
+                        )
+                    }
+                    Trace.err(e.code, "export")
+                }
             } else {
-                val errorMsg = UiErrorMessage.getUserMessage(e, "Export")
+                Trace.w("TransferManager", "Export $transferId already completed; ignoring post-completion LuksException: ${Trace.throwableSummary(e)}")
+            }
+        } catch (t: Throwable) {
+            val current = getTransfer(transferId)
+            if (current?.state != TransferState.COMPLETED) {
+                val errorMsg = UiErrorMessage.getUserMessage(t, "Export")
                 updateTransfer(transferId) {
                     it.copy(
                         state = TransferState.FAILED,
                         error = errorMsg,
-                        errorCode = e.code,
                         etaSeconds = 0L,
                         speedBytesPerSec = 0L,
                     )
                 }
-                Trace.err(e.code, "export")
+                Trace.err(LuksException.GENERIC, "export")
+            } else {
+                Trace.w("TransferManager", "Export $transferId already completed; ignoring post-completion error: ${Trace.throwableSummary(t)}")
             }
-        } catch (t: Throwable) {
-            val errorMsg = UiErrorMessage.getUserMessage(t, "Export")
-            updateTransfer(transferId) {
-                it.copy(
-                    state = TransferState.FAILED,
-                    error = errorMsg,
-                    etaSeconds = 0L,
-                    speedBytesPerSec = 0L,
-                )
-            }
-            Trace.err(LuksException.GENERIC, "export")
         } finally {
             activeJobs.remove(transferId)
             if (cancelToken > 0L) {
@@ -753,23 +808,27 @@ open class TransferController {
         var lastUpdateBytes = 0L
 
         try {
-            if (totalBytes < 0L) {
-                throw IllegalStateException("Cannot determine file size for import")
+            val writer = if (totalBytes >= 0L) {
+                volume.beginFile(totalBytes)
+            } else {
+                volume.beginFileStreaming()
             }
-
-            val writer = volume.beginFile(totalBytes)
             val buffer = ByteBuffer.allocateDirect(CHUNK_SIZE)
 
             try {
                 contentResolver.openFileDescriptor(sourceUri, "r")?.use { pfd ->
                     FileInputStream(pfd.fileDescriptor).channel.use { channel ->
-                        while (done < totalBytes && currentCoroutineContext().isActive) {
+                        while ((totalBytes < 0L || done < totalBytes) && currentCoroutineContext().isActive) {
                             if (isTransferCancelled(transferId)) {
                                 throw CancellationException("Transfer cancelled")
                             }
 
                             buffer.clear()
-                            val toRead = (totalBytes - done).coerceAtMost(CHUNK_SIZE.toLong()).toInt()
+                            val toRead = if (totalBytes >= 0L) {
+                                (totalBytes - done).coerceAtMost(CHUNK_SIZE.toLong()).toInt()
+                            } else {
+                                CHUNK_SIZE
+                            }
                             buffer.limit(toRead)
 
                             // Timed with the same recorder the directory paths
@@ -794,13 +853,13 @@ open class TransferController {
 
                             val now = System.currentTimeMillis()
                             val dt = now - lastUpdateMs
-                            if (dt >= 200 || done >= totalBytes) {
+                            if (dt >= 200 || (totalBytes >= 0L && done >= totalBytes)) {
                                 val speed = if (dt > 0) ((done - lastUpdateBytes) * 1000L) / dt else 0L
                                 val totalElapsedSec = (now - started) / 1000.0
                                 val avgSpeed = if (totalElapsedSec > 0) (done / totalElapsedSec).toLong() else speed
                                 val currentSpeed = if (speed > 0) speed else avgSpeed
-                                val remainingBytes = (totalBytes - done).coerceAtLeast(0L)
-                                val eta = if (currentSpeed > 0) remainingBytes / currentSpeed else 0L
+                                val remainingBytes = if (totalBytes >= 0L) (totalBytes - done).coerceAtLeast(0L) else 0L
+                                val eta = if (currentSpeed > 0 && remainingBytes > 0) remainingBytes / currentSpeed else 0L
 
                                 lastUpdateMs = now
                                 lastUpdateBytes = done
@@ -821,16 +880,18 @@ open class TransferController {
                     throw CancellationException("Transfer cancelled")
                 }
 
-                if (done < totalBytes) {
+                if (totalBytes >= 0L && done < totalBytes) {
                     throw IllegalStateException("Short read: imported $done bytes of $totalBytes expected")
                 }
 
                 val ino = stats.commit { writer.finish(parentPath, targetName) }
+                stats.commit { volume.commitActiveBatch() }
                 val totalSec = (System.currentTimeMillis() - started).coerceAtLeast(1) / 1000.0
                 val finalSpeed = (done / totalSec).toLong()
                 updateTransfer(transferId) {
                     it.copy(
                         transferredBytes = done,
+                        totalBytes = if (it.totalBytes >= 0L) it.totalBytes else done,
                         speedBytesPerSec = finalSpeed,
                         etaSeconds = 0L,
                         state = TransferState.COMPLETED,
@@ -839,22 +900,17 @@ open class TransferController {
                 Trace.i("TransferManager", "Import completed: $transferId in ${totalSec}s (inode $ino)")
                 Trace.i(formatThroughput("import-single", done, stats.snapshot()))
             } finally {
-                for (i in 0 until buffer.capacity()) {
-                    buffer.put(i, 0.toByte())
+                runCatching {
+                    buffer.clear()
+                    while (buffer.hasRemaining()) {
+                        buffer.put(0.toByte())
+                    }
                 }
-                writer.close()
+                runCatching { writer.close() }
             }
         } catch (e: CancellationException) {
-            updateTransfer(transferId) {
-                it.copy(
-                    state = TransferState.CANCELLED,
-                    etaSeconds = 0L,
-                    speedBytesPerSec = 0L,
-                )
-            }
-            Trace.err(LuksException.CANCELLED, "import")
-        } catch (e: LuksException) {
-            if (e.isCancelled || isTransferCancelled(transferId)) {
+            val current = getTransfer(transferId)
+            if (current?.state != TransferState.COMPLETED) {
                 updateTransfer(transferId) {
                     it.copy(
                         state = TransferState.CANCELLED,
@@ -863,30 +919,51 @@ open class TransferController {
                     )
                 }
                 Trace.err(LuksException.CANCELLED, "import")
+            }
+        } catch (e: LuksException) {
+            val current = getTransfer(transferId)
+            if (current?.state != TransferState.COMPLETED) {
+                if (e.isCancelled || isTransferCancelled(transferId)) {
+                    updateTransfer(transferId) {
+                        it.copy(
+                            state = TransferState.CANCELLED,
+                            etaSeconds = 0L,
+                            speedBytesPerSec = 0L,
+                        )
+                    }
+                    Trace.err(LuksException.CANCELLED, "import")
+                } else {
+                    val errorMsg = UiErrorMessage.getUserMessage(e, "Import")
+                    updateTransfer(transferId) {
+                        it.copy(
+                            state = TransferState.FAILED,
+                            error = errorMsg,
+                            errorCode = e.code,
+                            etaSeconds = 0L,
+                            speedBytesPerSec = 0L,
+                        )
+                    }
+                    Trace.err(e.code, "import")
+                }
             } else {
-                val errorMsg = UiErrorMessage.getUserMessage(e, "Import")
+                Trace.w("TransferManager", "Import $transferId already completed; ignoring post-completion LuksException: ${Trace.throwableSummary(e)}")
+            }
+        } catch (t: Throwable) {
+            val current = getTransfer(transferId)
+            if (current?.state != TransferState.COMPLETED) {
+                val errorMsg = UiErrorMessage.getUserMessage(t, "Import")
                 updateTransfer(transferId) {
                     it.copy(
                         state = TransferState.FAILED,
                         error = errorMsg,
-                        errorCode = e.code,
                         etaSeconds = 0L,
                         speedBytesPerSec = 0L,
                     )
                 }
-                Trace.err(e.code, "import")
+                Trace.err(LuksException.GENERIC, "import")
+            } else {
+                Trace.w("TransferManager", "Import $transferId already completed; ignoring post-completion error: ${Trace.throwableSummary(t)}")
             }
-        } catch (t: Throwable) {
-            val errorMsg = UiErrorMessage.getUserMessage(t, "Import")
-            updateTransfer(transferId) {
-                it.copy(
-                    state = TransferState.FAILED,
-                    error = errorMsg,
-                    etaSeconds = 0L,
-                    speedBytesPerSec = 0L,
-                )
-            }
-            Trace.err(LuksException.GENERIC, "import")
         } finally {
             activeJobs.remove(transferId)
             if (cancelToken > 0L) {

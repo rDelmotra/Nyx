@@ -7,6 +7,7 @@ import android.content.IntentFilter
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.text.Editable
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.LinearEasing
@@ -15,6 +16,7 @@ import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -453,6 +455,7 @@ fun DevicesScreen(
             GlobalSessionNotices(
                 sessionState = sessionState,
                 deviceStates = deviceStates,
+                hasActiveInPlaceUnlock = promptDialogTarget != null,
                 onRetryPartition = onRetryPartition,
                 onReset = onResetSession,
             )
@@ -592,13 +595,16 @@ private fun QuietRoomHeader(
 private fun GlobalSessionNotices(
     sessionState: SessionState,
     deviceStates: Map<String, DeviceItemState>,
+    hasActiveInPlaceUnlock: Boolean = false,
     onRetryPartition: (LuksDevice, PartitionInfo) -> Unit,
     onReset: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     when (val s = sessionState) {
         is SessionState.Unlocking -> {
-            UnlockingStateCard(partition = s.partition, modifier = modifier)
+            if (!hasActiveInPlaceUnlock) {
+                UnlockingStateCard(partition = s.partition, modifier = modifier)
+            }
         }
         is SessionState.Detached -> {
             DetachedStateCard(
@@ -896,7 +902,9 @@ private fun TargetDeviceCard(
 
                             // Show unlock challenge directly under map if a partition is selected
                             val selectedPartition = promptDialogTarget?.takeIf { it.first == dev }?.second
-                            if (selectedPartition != null && sessionState is SessionState.Locked) {
+                            val isUnlockingThis = sessionState is SessionState.Unlocking &&
+                                sessionState.partition.offsetBytes == selectedPartition?.offsetBytes
+                            if (selectedPartition != null && (sessionState is SessionState.Locked || isUnlockingThis)) {
                                 val bioKey = remember(dev, selectedPartition) { dev.biometricKeyFor(selectedPartition) }
                                 val enrolled = remember(bioKey, vaultVersion) {
                                     bioKey != null && BiometricPassphraseVault.isEnrolled(context, bioKey)
@@ -918,6 +926,7 @@ private fun TargetDeviceCard(
                                             biometricBusy = biometricBusy,
                                             offerBiometricEnroll = offerEnroll,
                                             dialogNotice = dialogNotice,
+                                            isUnlocking = isUnlockingThis,
                                             onBiometricUnlock = { onBiometricUnlockPartition(dev, selectedPartition) },
                                             onForgetBiometric = { bioKey?.let { onForgetBiometric(it, selectedPartition) } },
                                             onSubmitPassphrase = { buffer, enroll ->
@@ -997,17 +1006,20 @@ private fun InPlaceUnlockSection(
     biometricBusy: Boolean,
     offerBiometricEnroll: Boolean,
     dialogNotice: String?,
+    isUnlocking: Boolean = false,
     onBiometricUnlock: () -> Unit,
     onForgetBiometric: () -> Unit,
     onSubmitPassphrase: (SecurePassphraseBuffer, Boolean) -> Unit,
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val keyboardController = LocalSoftwareKeyboardController.current
     var activeEditable by remember { mutableStateOf<Editable?>(null) }
     var hasContent by remember { mutableStateOf(false) }
     var enrollChecked by remember { mutableStateOf(false) }
 
     fun submit() {
+        keyboardController?.hide()
         val editable = activeEditable ?: return
         val buffer = PassphraseScrubber.extractAndScrub(editable)
         onSubmitPassphrase(buffer, offerBiometricEnroll && enrollChecked)
@@ -1016,143 +1028,186 @@ private fun InPlaceUnlockSection(
     Column(
         modifier = modifier
             .fillMaxWidth()
-            .padding(top = 8.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
+            .padding(top = 4.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.25f))
-
+        // Slim Header Row: Partition label + Revoke Icon & Close affordance
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text(
-                text = "Unlock ${partition.name.ifBlank { "Partition #${partition.index}" }}",
-                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                color = MaterialTheme.colorScheme.onSurface,
-            )
-            if (biometricEnrolled) {
-                BiometricRevokeIcon(onTriggerTurnOff = onForgetBiometric)
-            }
-        }
-
-        if (dialogNotice != null) {
-            Text(
-                text = dialogNotice,
-                style = MaterialTheme.typography.bodySmall,
-                color = WarningAmber,
-            )
-        }
-
-        if (showBiometricUnlock) {
-            FilledTonalButton(
-                onClick = onBiometricUnlock,
-                enabled = !biometricBusy,
-                shape = RoundedCornerShape(8.dp),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(36.dp),
-                colors = ButtonDefaults.filledTonalButtonColors(
-                    containerColor = StateUnlocked.copy(alpha = 0.12f),
-                    contentColor = StateUnlocked,
-                ),
-                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
-            ) {
-                Icon(
-                    imageVector = Icons.Default.Fingerprint,
-                    contentDescription = null,
-                    modifier = Modifier.size(16.dp),
-                )
-                Spacer(modifier = Modifier.width(6.dp))
-                Text(
-                    text = "Touch sensor to unlock with Fingerprint",
-                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Medium),
-                )
-            }
-        }
-
-        // Compact Passphrase Entry Row: Input + Unlock button side-by-side
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            Box(modifier = Modifier.weight(1f)) {
-                SecurePassphraseField(
-                    onEditableReady = { activeEditable = it },
-                    onHasContentChange = { hasContent = it },
-                )
-            }
-
-            FilledTonalButton(
-                onClick = ::submit,
-                enabled = hasContent,
-                shape = RoundedCornerShape(8.dp),
-                modifier = Modifier.height(40.dp),
-                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 0.dp),
-            ) {
-                Icon(
-                    imageVector = Icons.Default.LockOpen,
-                    contentDescription = null,
-                    modifier = Modifier.size(15.dp),
-                )
-                Spacer(modifier = Modifier.width(4.dp))
-                Text(
-                    text = "Unlock",
-                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
-                )
-            }
-        }
-
-        // Sub-row: Memory security reassurance + Cancel affordance
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(
-                text = "Protected memory · Wiped on lock",
-                style = MaterialTheme.typography.labelSmall.copy(
-                    fontSize = 10.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
-                ),
-            )
-
-            TextButton(
-                onClick = onDismiss,
-                contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
-                modifier = Modifier.height(26.dp),
-            ) {
-                Text(
-                    text = "Cancel",
-                    style = MaterialTheme.typography.labelSmall.copy(color = MaterialTheme.colorScheme.onSurfaceVariant),
-                )
-            }
-        }
-
-        if (offerBiometricEnroll) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .toggleable(
-                        value = enrollChecked,
-                        role = Role.Checkbox,
-                        onValueChange = { enrollChecked = it },
-                    )
-                    .padding(vertical = 2.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                Checkbox(
-                    checked = enrollChecked,
-                    onCheckedChange = null,
-                    modifier = Modifier.size(18.dp),
+                Icon(
+                    imageVector = Icons.Default.Lock,
+                    contentDescription = null,
+                    tint = StateLocked,
+                    modifier = Modifier.size(13.dp),
                 )
-                Spacer(modifier = Modifier.width(8.dp))
                 Text(
-                    text = "Save passphrase to fingerprint for this drive",
-                    style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
+                    text = partition.name.ifBlank { "Partition #${partition.index}" },
+                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
                     color = MaterialTheme.colorScheme.onSurface,
                 )
+                Text(
+                    text = "· ${formatSize(partition.sizeBytes)}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                if (biometricEnrolled) {
+                    BiometricRevokeIcon(onTriggerTurnOff = onForgetBiometric)
+                }
+                TextButton(
+                    onClick = onDismiss,
+                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
+                    modifier = Modifier.height(24.dp),
+                ) {
+                    Text(
+                        text = "Close",
+                        style = MaterialTheme.typography.labelSmall.copy(color = MaterialTheme.colorScheme.onSurfaceVariant),
+                    )
+                }
+            }
+        }
+
+        AnimatedContent(
+            targetState = isUnlocking,
+            label = "InPlaceUnlockState",
+        ) { unlocking ->
+            if (unlocking) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.Center,
+                ) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        color = StateUnlocked,
+                        strokeWidth = 2.dp,
+                    )
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Text(
+                        text = "Deriving key…",
+                        style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium),
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "Argon2id",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                    )
+                }
+            } else {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (dialogNotice != null) {
+                        Text(
+                            text = dialogNotice,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = WarningAmber,
+                        )
+                    }
+
+                    if (showBiometricUnlock) {
+                        FilledTonalButton(
+                            onClick = {
+                                keyboardController?.hide()
+                                onBiometricUnlock()
+                            },
+                            enabled = !biometricBusy,
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(34.dp),
+                            colors = ButtonDefaults.filledTonalButtonColors(
+                                containerColor = StateUnlocked.copy(alpha = 0.12f),
+                                contentColor = StateUnlocked,
+                            ),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Fingerprint,
+                                contentDescription = null,
+                                modifier = Modifier.size(15.dp),
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "Unlock with Fingerprint",
+                                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Medium),
+                            )
+                        }
+                    }
+
+                    // Compact Passphrase Entry Row: Input + Unlock button side-by-side
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Box(modifier = Modifier.weight(1f)) {
+                            SecurePassphraseField(
+                                onEditableReady = { activeEditable = it },
+                                onHasContentChange = { hasContent = it },
+                            )
+                        }
+
+                        FilledTonalButton(
+                            onClick = ::submit,
+                            enabled = hasContent,
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.height(38.dp),
+                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 0.dp),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.LockOpen,
+                                contentDescription = null,
+                                modifier = Modifier.size(14.dp),
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = "Unlock",
+                                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                            )
+                        }
+                    }
+
+                    if (offerBiometricEnroll) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .toggleable(
+                                    value = enrollChecked,
+                                    role = Role.Checkbox,
+                                    onValueChange = { enrollChecked = it },
+                                )
+                                .padding(vertical = 1.dp),
+                        ) {
+                            Checkbox(
+                                checked = enrollChecked,
+                                onCheckedChange = null,
+                                modifier = Modifier.size(16.dp),
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "Save passphrase to fingerprint for this drive",
+                                style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
             }
         }
     }

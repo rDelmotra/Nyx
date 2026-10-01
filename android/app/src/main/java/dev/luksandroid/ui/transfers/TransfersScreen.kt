@@ -293,7 +293,7 @@ private fun CompletedTransferCard(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 val sizeText = when (item.state) {
-                    TransferState.COMPLETED -> formatSize(item.totalBytes)
+                    TransferState.COMPLETED -> if (item.totalBytes > 0) formatSize(item.totalBytes) else formatSize(item.transferredBytes)
                     else -> "${formatSize(item.transferredBytes)} transferred"
                 }
                 Text(
@@ -341,8 +341,8 @@ private fun TypeBadge(type: TransferType) {
             style = MaterialTheme.typography.labelSmall,
             modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
             color = when (type) {
-                TransferType.IMPORT -> MaterialTheme.colorScheme.onSecondaryContainer
-                TransferType.EXPORT -> MaterialTheme.colorScheme.onTertiaryContainer
+                TransferType.IMPORT -> MaterialTheme.colorScheme.onTertiaryContainer
+                TransferType.EXPORT -> MaterialTheme.colorScheme.onSecondaryContainer
                 TransferType.HASH -> MaterialTheme.colorScheme.onSurfaceVariant
             },
         )

@@ -87,6 +87,22 @@ object Trace {
         }
     }
 
+    fun w(msg: String) {
+        if (BuildConfig.DEBUG) {
+            val formatted = "[${currentThreadTag()}] $msg"
+            runCatching { Log.w(TAG, formatted) }
+            appendToFile("W", TAG, formatted)
+        }
+    }
+
+    fun w(tag: String, msg: String) {
+        if (BuildConfig.DEBUG) {
+            val formatted = "[${currentThreadTag()}] $msg"
+            runCatching { Log.w(tag, formatted) }
+            appendToFile("W", tag, formatted)
+        }
+    }
+
     /**
      * Deliberately has no `Throwable`-accepting overload: `Log.e(tag, msg, t)`
      * prints `t`'s own message and stack trace, and `LuksException`/`LuksError`

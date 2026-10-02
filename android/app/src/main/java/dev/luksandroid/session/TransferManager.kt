@@ -7,6 +7,7 @@ import dev.luksandroid.LuksException
 import dev.luksandroid.LuksNative
 import dev.luksandroid.LuksVolume
 import dev.luksandroid.Trace
+import dev.luksandroid.zeroEntireCapacity
 import dev.luksandroid.ui.UiErrorMessage
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -179,6 +180,27 @@ open class TransferController {
                 }.onFailure { t ->
                     if (t !is CancellationException) {
                         Trace.err(LuksException.GENERIC, "export")
+                        val errorMsg = UiErrorMessage.getUserMessage(t, "Export")
+                        updateTransfer(transferId) {
+                            if (it.state == TransferState.QUEUED || it.state == TransferState.RUNNING) {
+                                it.copy(
+                                    state = TransferState.FAILED,
+                                    error = errorMsg,
+                                    etaSeconds = 0L,
+                                    speedBytesPerSec = 0L,
+                                )
+                            } else it
+                        }
+                    } else {
+                        updateTransfer(transferId) {
+                            if (it.state == TransferState.QUEUED || it.state == TransferState.RUNNING) {
+                                it.copy(
+                                    state = TransferState.CANCELLED,
+                                    etaSeconds = 0L,
+                                    speedBytesPerSec = 0L,
+                                )
+                            } else it
+                        }
                     }
                 }
             } finally {
@@ -253,6 +275,27 @@ open class TransferController {
                 }.onFailure { t ->
                     if (t !is CancellationException) {
                         Trace.err(LuksException.GENERIC, "import")
+                        val errorMsg = UiErrorMessage.getUserMessage(t, "Import")
+                        updateTransfer(transferId) {
+                            if (it.state == TransferState.QUEUED || it.state == TransferState.RUNNING) {
+                                it.copy(
+                                    state = TransferState.FAILED,
+                                    error = errorMsg,
+                                    etaSeconds = 0L,
+                                    speedBytesPerSec = 0L,
+                                )
+                            } else it
+                        }
+                    } else {
+                        updateTransfer(transferId) {
+                            if (it.state == TransferState.QUEUED || it.state == TransferState.RUNNING) {
+                                it.copy(
+                                    state = TransferState.CANCELLED,
+                                    etaSeconds = 0L,
+                                    speedBytesPerSec = 0L,
+                                )
+                            } else it
+                        }
                     }
                 }
             } finally {
@@ -826,6 +869,7 @@ open class TransferController {
                 }
 
                 val ino = stats.commit { writer.finish(parentPath, targetName) }
+                stats.commit { volume.commitActiveBatch() }
                 val totalSec = (System.currentTimeMillis() - started).coerceAtLeast(1) / 1000.0
                 val finalSpeed = (done / totalSec).toLong()
                 updateTransfer(transferId) {
@@ -839,10 +883,11 @@ open class TransferController {
                 Trace.i("TransferManager", "Import completed: $transferId in ${totalSec}s (inode $ino)")
                 Trace.i(formatThroughput("import-single", done, stats.snapshot()))
             } finally {
-                for (i in 0 until buffer.capacity()) {
-                    buffer.put(i, 0.toByte())
+                try {
+                    buffer.zeroEntireCapacity()
+                } finally {
+                    writer.close()
                 }
-                writer.close()
             }
         } catch (e: CancellationException) {
             updateTransfer(transferId) {

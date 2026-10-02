@@ -6,6 +6,20 @@ import android.hardware.usb.UsbInterface
 import org.json.JSONObject
 
 /**
+ * Zeroes this buffer's entire capacity regardless of its current position and
+ * limit. Absolute `put(index, b)` is bounded by limit, not capacity, so a
+ * per-index loop throws once limit < capacity (e.g. after a short last chunk).
+ * Leaves the buffer cleared (position 0, limit = capacity).
+ */
+internal fun java.nio.ByteBuffer.zeroEntireCapacity() {
+    clear()
+    val zeros = ByteArray(minOf(capacity(), 64 * 1024))
+    while (hasRemaining()) {
+        put(zeros, 0, minOf(remaining(), zeros.size))
+    }
+}
+
+/**
  * Kotlin-side owners for the two native handles.
  *
  * The handles are bare `Long`s across JNI. Wrapping them in [AutoCloseable]
@@ -568,11 +582,7 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
         }
 
         private fun scrubScratch() {
-            scratch?.let { buf ->
-                for (i in 0 until buf.capacity()) {
-                    buf.put(i, 0.toByte())
-                }
-            }
+            scratch?.zeroEntireCapacity()
             scratch = null
         }
 
@@ -582,10 +592,13 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
             val wh = writerHandle
             writerHandle = 0
             activeWriters -= this
-            scrubScratch()
-            val result = LuksNative.nativeFinishFile(handle, wh, parentPath, name)
-            invalidateStatFsCache()
-            return result
+            try {
+                val result = LuksNative.nativeFinishFile(handle, wh, parentPath, name)
+                invalidateStatFsCache()
+                return result
+            } finally {
+                scrubScratch()
+            }
         }
 
         open fun abandon() {
@@ -593,14 +606,19 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
         }
 
         open override fun close() {
-            scrubScratch()
-            if (writerHandle != 0L && handle != 0L) {
-                try {
-                    LuksNative.nativeCloseWriter(handle, writerHandle)
-                } catch (_: UnsatisfiedLinkError) {}
+            try {
+                if (writerHandle != 0L && handle != 0L) {
+                    try {
+                        LuksNative.nativeCloseWriter(handle, writerHandle)
+                    } catch (_: UnsatisfiedLinkError) {}
+                }
+            } finally {
+                // The native side drops the writer handle whether or not the
+                // abandon succeeded, so this one must never be reused.
+                writerHandle = 0
+                activeWriters -= this
+                scrubScratch()
             }
-            writerHandle = 0
-            activeWriters -= this
         }
     }
 

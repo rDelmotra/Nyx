@@ -3,6 +3,7 @@ package dev.luksandroid.session
 import dev.luksandroid.Entry
 import dev.luksandroid.LuksException
 import dev.luksandroid.PartitionInfo
+import dev.luksandroid.zeroEntireCapacity
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -691,6 +692,89 @@ class LuksSessionTest {
 
         org.junit.Assert.assertNull(field.get(writer))
         assertTrue((0 until buf.capacity()).all { buf.get(it) == 0.toByte() })
+    }
+
+    private fun scratchField() =
+        dev.luksandroid.LuksVolume.FileWriter::class.java.getDeclaredField("scratch").apply { isAccessible = true }
+
+    /** Writes a 64-byte chunk then a 5-byte chunk: scratch capacity 64, limit 5. */
+    private fun writerWithShortLastChunk(
+        volume: dev.luksandroid.LuksVolume,
+    ): Pair<dev.luksandroid.LuksVolume.FileWriter, java.nio.ByteBuffer> {
+        val writer = volume.run {
+            object : dev.luksandroid.LuksVolume.FileWriter(100L) {
+                override fun write(data: java.nio.ByteBuffer, len: Int) {}
+            }
+        }
+        writer.write(ByteArray(64) { 7 })
+        writer.write(byteArrayOf(1, 2, 3, 4, 5))
+        val buf = scratchField().get(writer) as java.nio.ByteBuffer
+        org.junit.Assert.assertEquals(64, buf.capacity())
+        org.junit.Assert.assertEquals(5, buf.limit())
+        assertTrue((0 until buf.capacity()).any { buf.get(it) != 0.toByte() })
+        return writer to buf
+    }
+
+    @Test
+    fun testZeroEntireCapacityIgnoresPositionAndLimit() {
+        val buf = java.nio.ByteBuffer.allocateDirect(200_000)
+        for (i in 0 until buf.capacity()) buf.put(i, 0x55)
+        buf.position(10)
+        buf.limit(100)
+
+        buf.zeroEntireCapacity()
+
+        assertEquals(200_000, buf.capacity())
+        for (i in 0 until buf.capacity()) {
+            org.junit.Assert.assertEquals("byte $i", 0.toByte(), buf.get(i))
+        }
+    }
+
+    @Test
+    fun testFileWriterCloseScrubsWhenLastChunkShorterThanScratch() {
+        val volume = object : dev.luksandroid.LuksVolume(0L) {
+            override val info = dev.luksandroid.VolumeInfo("label", "uuid", 4096, 1024L, "ext4", emptyList())
+        }
+        val (writer, buf) = writerWithShortLastChunk(volume)
+
+        writer.close()
+
+        org.junit.Assert.assertNull(scratchField().get(writer))
+        for (i in 0 until buf.capacity()) {
+            org.junit.Assert.assertEquals("byte $i", 0.toByte(), buf.get(i))
+        }
+    }
+
+    @Test
+    fun testFileWriterFinishReachesNativeAndScrubsAfterwards() {
+        // Handle must be non-zero for finish() to pass its precondition. The
+        // native library is not loaded on the host JVM, so nativeFinishFile
+        // throws UnsatisfiedLinkError: reaching it proves scrubbing did not
+        // abort finish() first, and the buffer must still end up zeroed.
+        // Constructing with a non-zero handle would call native nativeVolumeInfo,
+        // so build with 0 and set the private handle reflectively.
+        val volume = object : dev.luksandroid.LuksVolume(0L) {
+            override val info = dev.luksandroid.VolumeInfo("label", "uuid", 4096, 1024L, "ext4", emptyList())
+        }
+        dev.luksandroid.LuksVolume::class.java.getDeclaredField("handle").apply { isAccessible = true }
+            .setLong(volume, 1L)
+        val (writer, buf) = writerWithShortLastChunk(volume)
+
+        val thrown = try {
+            writer.finish("/", "f")
+            null
+        } catch (t: Throwable) {
+            t
+        }
+
+        org.junit.Assert.assertTrue(
+            "expected UnsatisfiedLinkError from native call, got $thrown",
+            thrown is UnsatisfiedLinkError,
+        )
+        org.junit.Assert.assertNull(scratchField().get(writer))
+        for (i in 0 until buf.capacity()) {
+            org.junit.Assert.assertEquals("byte $i", 0.toByte(), buf.get(i))
+        }
     }
 }
 

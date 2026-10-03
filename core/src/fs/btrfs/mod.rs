@@ -42,7 +42,7 @@ pub use chunk::{Chunk, ChunkMap, DevExtent, Stripe};
 pub use csum::Verified;
 pub use cursor::Cursor;
 pub use dir::Located;
-pub use extent::{ExtentKind, FileExtent};
+pub use extent::{ExtentKind, FileExtent, ReadCoverage};
 pub use inode::{DirEntryItem, Inode};
 pub use subvol::Subvolume;
 pub use superblock::{CsumType, Superblock};
@@ -103,6 +103,10 @@ pub struct Btrfs<D: ReadAt> {
     /// Same reasoning, and it matters more: every data read consults this.
     /// `None` on a filesystem that keeps no data checksums.
     csum_tree: Option<TreeRoot>,
+    /// Set when reloading the csum root after a commit *failed*, as opposed to
+    /// finding it absent. Reads then look it up again and report the real
+    /// error rather than running unverified.
+    csum_tree_failed: bool,
     /// Tree nodes already read and verified. See [`cache`] for the measurement
     /// that put it here — six metadata reads per data read, all of them
     /// re-descending the same two trees.
@@ -155,6 +159,7 @@ impl<D: ReadAt> Btrfs<D> {
             // lines build. Nothing reads it in between.
             fs_tree: TreeRoot::default(),
             csum_tree: None,
+            csum_tree_failed: false,
             subvol_cache: std::sync::Mutex::new(None),
             #[cfg(feature = "dangerous-write-support")]
             active_batch: None,
@@ -166,7 +171,7 @@ impl<D: ReadAt> Btrfs<D> {
         fs.load_chunk_tree()?;
         fs.chunks.check_single_device(fs.sb.dev_id)?;
         fs.fs_tree = fs.tree_root(tree::FS_TREE_OBJECTID)?;
-        fs.csum_tree = csum::load(&fs);
+        fs.csum_tree = csum::load(&fs)?;
         crate::forensic::record_btrfs(crate::forensic::BtrfsEvent::Mount {
             generation: fs.sb.generation,
             root_bytenr: fs.fs_tree.bytenr,
@@ -327,32 +332,39 @@ impl<D: ReadAt> Btrfs<D> {
     /// item for this objectid is what the kernel does, and it picks the newest
     /// root when there is more than one.
     pub fn tree_root(&self, objectid: u64) -> Result<TreeRoot> {
+        // A tree named in the superblock but absent from the root tree is
+        // corruption, not an empty filesystem.
+        self.find_tree_root(objectid)?
+            .ok_or(LuksError::CorruptFs("btrfs root item is missing"))
+    }
+
+    /// Like [`Btrfs::tree_root`], but a root item that is not there is
+    /// `Ok(None)`, kept distinct from a lookup that *failed*. A tree that may
+    /// legally be absent (the csum tree) must not treat the two alike.
+    pub fn find_tree_root(&self, objectid: u64) -> Result<Option<TreeRoot>> {
         let key = Key::new(objectid, tree::ROOT_ITEM_KEY, u64::MAX);
         let cursor = self.search_le(self.sb.root, &key)?;
 
-        // A tree named in the superblock but absent from the root tree is
-        // corruption, not an empty filesystem.
-        let missing = || LuksError::CorruptFs("btrfs root item is missing");
         if !cursor.valid() {
-            return Err(missing());
+            return Ok(None);
         }
         let found = cursor.key()?;
         if found.objectid != objectid || found.item_type != tree::ROOT_ITEM_KEY {
-            return Err(missing());
+            return Ok(None);
         }
         let data = cursor.data()?;
 
         if data.len() < 239 {
             return Err(LuksError::CorruptFs("btrfs root item truncated"));
         }
-        Ok(TreeRoot {
+        Ok(Some(TreeRoot {
             objectid,
             bytenr: u64::from_le_bytes(data[176..184].try_into().unwrap()),
             level: data[238],
             root_dirid: u64::from_le_bytes(data[168..176].try_into().unwrap()),
             generation: u64::from_le_bytes(data[160..168].try_into().unwrap()),
             flags: u64::from_le_bytes(data[208..216].try_into().unwrap()),
-        })
+        }))
     }
 
     pub fn fs_tree(&self) -> TreeRoot {
@@ -439,7 +451,18 @@ impl<D: ReadAt> Btrfs<D> {
             self.fs_tree = fs_tree;
         }
         self.nodes.clear();
-        self.csum_tree = self.tree_root(tree::CSUM_TREE_OBJECTID).ok();
+        match self.find_tree_root(tree::CSUM_TREE_OBJECTID) {
+            Ok(root) => {
+                self.csum_tree = root;
+                self.csum_tree_failed = false;
+            }
+            // Not "no checksums": remember the failure so reads retry the
+            // lookup and surface the actual error (L3c-O6).
+            Err(_) => {
+                self.csum_tree = None;
+                self.csum_tree_failed = true;
+            }
+        }
         if let Ok(mut guard) = self.statfs_cache.lock() {
             *guard = None;
         }

@@ -48,4 +48,8 @@ pub struct Transaction {
     pub pending_blocks: HashMap<u64, Vec<u8>>,
     pub pending_data: Vec<(u64, Vec<u8>)>,
     pub final_allocator: Option<crate::fs::btrfs::write::alloc::FreeSpaceMap>,
+    /// Chunks created by this transaction. The commit resolves addresses
+    /// through them, but the live chunk map only learns them after the commit
+    /// succeeded (B4).
+    pub new_chunks: Vec<crate::fs::btrfs::chunk::Chunk>,
 }

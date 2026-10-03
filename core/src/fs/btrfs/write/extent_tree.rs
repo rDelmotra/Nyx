@@ -545,6 +545,20 @@ pub(crate) fn record_cow_result(
     Ok(())
 }
 
+/// Root of tree `objectid`, `Ok(None)` only if the root tree has no ROOT_ITEM
+/// for it. Every other failure (I/O, checksum, truncated item) is an `Err`, so a
+/// caller can never mistake "could not look" for "does not exist" (B7).
+pub fn tree_root_if_present<D: ReadAt>(
+    fs: &Btrfs<D>,
+    objectid: u64,
+) -> Result<Option<crate::fs::btrfs::TreeRoot>> {
+    let key = Key::new(objectid, ROOT_ITEM_KEY, 0);
+    match find_item_in_tree(fs, &HashMap::new(), fs.superblock().root, &key)? {
+        None => Ok(None),
+        Some(_) => fs.tree_root(objectid).map(Some),
+    }
+}
+
 /// Find an item with `key` in the tree rooted at `root_bytenr`, consulting `pending_blocks` if available.
 pub(crate) fn find_item_in_tree<D: ReadAt>(
     fs: &Btrfs<D>,
@@ -691,10 +705,12 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
     };
     let mut fst_root_opt: Option<(u64, u8)> =
         if sb.compat_ro_flags & BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE != 0 {
-            match fs.tree_root(FREE_SPACE_TREE_OBJECTID) {
-                Ok(r) => Some((r.bytenr, r.level)),
-                Err(_) => None,
-            }
+            // B7: the superblock advertises the free-space tree, so it must be
+            // reconciled. A lookup failure (I/O error, or a root item that is
+            // missing/truncated) fails the commit; it used to become `None`,
+            // which skipped reconciliation while the flag stayed set.
+            let r = fs.tree_root(FREE_SPACE_TREE_OBJECTID)?;
+            Some((r.bytenr, r.level))
         } else {
             None
         };
@@ -1302,5 +1318,6 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
         pending_blocks,
         pending_data,
         final_allocator: Some(allocator),
+        new_chunks: Vec::new(),
     })
 }

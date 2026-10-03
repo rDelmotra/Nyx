@@ -581,15 +581,23 @@ fn test_pass_i3_chunk_map_refresh_omission_fails_commit() {
     let dummy_data = vec![0x42u8; 4096];
     txn.pending_data.push((new_chunk_logical, dummy_data));
 
-    // 2. Control: Skipping chunks.insert(new_chunk) MUST fail to map and fail commit_transaction
-    let commit_res = commit_transaction(&mut fs, txn.clone());
+    // 2. Control: a transaction that does not carry its new chunk cannot map the
+    // pending data it wrote into that chunk, so the commit MUST fail (and, B4,
+    // must leave the live chunk map untouched).
+    let mut without_chunk = txn.clone();
+    without_chunk.new_chunks.clear();
+    let commit_res = commit_transaction(&mut fs, without_chunk);
     assert!(
         commit_res.is_err(),
-        "commit_transaction MUST fail when ChunkMap refresh was skipped"
+        "commit_transaction MUST fail when the new chunk is not available for mapping"
+    );
+    assert!(
+        fs.chunk_map().chunks().iter().all(|c| c.logical != new_chunk_logical),
+        "a failed commit must not add the chunk to the live chunk map"
     );
 
-    // 3. Now perform the ChunkMap refresh and commit successfully
-    fs.chunk_map_mut().insert(new_chunk);
+    // 3. The real transaction carries `new_chunks`; the commit resolves through it
+    // and registers the chunk only once it has succeeded (F3/B4).
     let commit_success = commit_transaction(&mut fs, txn);
     assert!(
         commit_success.is_ok(),

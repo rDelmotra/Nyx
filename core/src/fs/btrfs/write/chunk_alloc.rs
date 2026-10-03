@@ -423,7 +423,7 @@ pub fn allocate_data_chunk_transaction_excluding<D: ReadAt>(
     allocator.exclude_ranges(&exclusions);
 
     // 7. Converge and finalize transaction
-    let txn = converge_and_finalize(
+    let mut txn = converge_and_finalize(
         fs,
         new_generation,
         fs.fs_tree(),
@@ -440,6 +440,7 @@ pub fn allocate_data_chunk_transaction_excluding<D: ReadAt>(
         Vec::new(),
     )?;
 
+    txn.new_chunks = vec![new_chunk.clone()];
     Ok((txn, new_chunk))
 }
 

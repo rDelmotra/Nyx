@@ -93,7 +93,7 @@ impl<D: ReadAt> Btrfs<D> {
     /// `logical` must be sector-aligned and `data` a whole number of sectors —
     /// a checksum covers a sector, so anything else cannot be checked.
     pub fn verify_data(&self, logical: u64, data: &[u8]) -> Result<Verified> {
-        let Some(csum_root) = self.csum_tree() else {
+        let Some(csum_root) = self.csum_root_for_read()? else {
             return Ok(Verified::NoChecksumTree);
         };
         let sector = self.sector_size() as usize;
@@ -195,18 +195,36 @@ impl<D: ReadAt> Btrfs<D> {
     }
 
     /// Where the checksum tree lives, or `None` on a filesystem that keeps
-    /// none.
+    /// none. Includes the open batch's csum root, so data written in this
+    /// session reads back verified before it is committed.
     pub fn csum_tree(&self) -> Option<TreeRoot> {
+        #[cfg(feature = "dangerous-write-support")]
+        if let Some((bytenr, level)) = self.active_batch.as_ref().and_then(|b| b.csum_root) {
+            let mut root = self.csum_tree.unwrap_or_default();
+            root.objectid = tree::CSUM_TREE_OBJECTID;
+            root.bytenr = bytenr;
+            root.level = level;
+            return Some(root);
+        }
         self.csum_tree
+    }
+
+    /// The csum root a read should use. If the post-commit reload of the root
+    /// failed, look it up again here so the caller gets the real error rather
+    /// than reading unverified (L3c-O6).
+    fn csum_root_for_read(&self) -> Result<Option<TreeRoot>> {
+        if self.csum_tree_failed {
+            return self.find_tree_root(tree::CSUM_TREE_OBJECTID);
+        }
+        Ok(self.csum_tree())
     }
 }
 
 /// Resolved once at mount by [`Btrfs::mount`].
-pub(super) fn load<D: ReadAt>(fs: &Btrfs<D>) -> Option<TreeRoot> {
-    // A filesystem without a checksum tree is unusual but legal — every file
-    // on it is simply unverifiable. Treating a missing root as "no checksums"
-    // rather than as corruption keeps such a drive readable, which for a
-    // rescue tool is the right trade as long as the reads are reported as
-    // unverified, which `Verified::NoChecksumTree` does.
-    fs.tree_root(tree::CSUM_TREE_OBJECTID).ok()
+///
+/// `Ok(None)` is a filesystem with no checksum tree at all, which is legal;
+/// reads of checksummed files then fail rather than pass unverified. A lookup
+/// that *errors* is not the same thing and fails the mount.
+pub(super) fn load<D: ReadAt>(fs: &Btrfs<D>) -> Result<Option<TreeRoot>> {
+    fs.find_tree_root(tree::CSUM_TREE_OBJECTID)
 }

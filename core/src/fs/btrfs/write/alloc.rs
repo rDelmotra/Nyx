@@ -638,38 +638,14 @@ impl FreeSpaceMap {
     ///
     /// The block is recorded in `pinned_freed` rather than returned to `free_ranges`
     /// to avoid reusing it within the same transaction.
+    ///
+    /// Same four checks as [`FreeSpaceMap::free_data`] (B6): no u64 overflow,
+    /// the block must lie in a block group (the old silent `Ok(())` hid a
+    /// phantom free), it must not exceed the group's `used` (the old
+    /// `saturating_sub` hid drift), and it must not overlap a range already
+    /// pending release (double free).
     pub fn free_metadata(&mut self, bytenr: u64, size: u32) -> Result<()> {
-        let freed_len = size as u64;
-        for bg in &mut self.block_groups {
-            if bytenr >= bg.block_group.start
-                && bytenr + freed_len <= bg.block_group.start + bg.block_group.length
-            {
-                let pos = bg.pinned_freed.partition_point(|r| r.start < bytenr);
-                bg.pinned_freed.insert(
-                    pos,
-                    FreeRange {
-                        start: bytenr,
-                        length: freed_len,
-                    },
-                );
-
-                let mut merged: Vec<FreeRange> = Vec::new();
-                for r in bg.pinned_freed.drain(..) {
-                    if let Some(last) = merged.last_mut() {
-                        if last.start + last.length == r.start {
-                            last.length += r.length;
-                            continue;
-                        }
-                    }
-                    merged.push(r);
-                }
-                bg.pinned_freed = merged;
-
-                bg.block_group.used = bg.block_group.used.saturating_sub(freed_len);
-                return Ok(());
-            }
-        }
-        Ok(())
+        self.free_data(bytenr, size as u64)
     }
 
     /// Unpin freed ranges after a transaction has committed, returning them to available `free_ranges`
@@ -1248,6 +1224,47 @@ mod tests {
         // Exact duplicate free is also an overlap.
         let err = map.free_data(10_000, 4096).unwrap_err();
         assert!(matches!(err, LuksError::CorruptFs(_)));
+    }
+
+    /// B6: `free_metadata` must apply the same four checks as `free_data`.
+    #[test]
+    fn free_metadata_applies_free_data_checks() {
+        let mk = || FreeSpaceMap {
+            block_groups: vec![create_test_data_bg(0, 1_000_000, Vec::new())],
+        };
+        // Overflow.
+        assert!(matches!(
+            mk().free_metadata(u64::MAX - 10, 16384).unwrap_err(),
+            LuksError::CorruptFs(_)
+        ));
+        // Outside any block group: was a silent Ok(()).
+        assert!(matches!(
+            mk().free_metadata(5_000_000, 16384).unwrap_err(),
+            LuksError::CorruptFs(_)
+        ));
+        // More than `used`: was saturating_sub.
+        let mut m = mk();
+        m.block_groups[0].block_group.used = 4096;
+        assert!(matches!(
+            m.free_metadata(16384, 16384).unwrap_err(),
+            LuksError::CorruptFs(_)
+        ));
+        assert_eq!(m.block_groups[0].block_group.used, 4096, "rejected free must not change used");
+        // Double free / overlap with a pinned range.
+        let mut m = mk();
+        m.free_metadata(16384, 16384).expect("first free");
+        assert!(matches!(
+            m.free_metadata(16384, 16384).unwrap_err(),
+            LuksError::CorruptFs(_)
+        ));
+        assert!(matches!(
+            m.free_data(20_000, 4096).unwrap_err(),
+            LuksError::CorruptFs(_)
+        ));
+        // Legitimate free still works and decrements `used` exactly.
+        let mut m = mk();
+        m.free_metadata(32768, 16384).expect("legit free");
+        assert_eq!(m.block_groups[0].block_group.used, 1_000_000 - 16384);
     }
 
     #[test]

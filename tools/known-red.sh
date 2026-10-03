@@ -27,8 +27,6 @@ kt_red() {
 }
 export -f kt_red
 RED=(
-  "D2|$CORE --test btrfs_batch_ack_durability f0_4_d2 -- --include-ignored"
-  "B1|$CORE --test btrfs_batch_ack_durability f0_5_b1 -- --include-ignored"
   # Kotlin (F0.7): gated by -PknownRed=1 (Assume), never by editing source.
   # Filters are per test method, because the same class also holds a deliberately green test.
   "W5|$KT '*TransferIntegrityRedTest.w5_*'"

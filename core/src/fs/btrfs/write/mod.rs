@@ -53,11 +53,20 @@ impl<D: WriteAt> Btrfs<D> {
                 "attempted to commit active batch while a file writer is open",
             ));
         }
-        if let Some(batch) = self.active_batch.take() {
+        if let Some(mut batch) = self.active_batch.take() {
             if batch.has_uncommitted_files() {
-                let txn = batch.commit(self)?;
-                commit_transaction(self, txn)?;
+                // Non-destructive (D2/N7/N14): on failure the batch, with
+                // every acknowledged file in it, goes back to `active_batch`
+                // for a later retry. If the session is fenced the bridge
+                // discards it via `discard_active_batch`.
+                if let Err(ce) = batch.commit_and_rearm(self) {
+                    self.active_batch = Some(batch);
+                    return Err(ce.error);
+                }
             }
+            // Committed (or nothing to commit): drop it. The non-batch caller
+            // that follows builds its own transaction on the new committed
+            // trees, so a re-armed batch would be stale.
         }
         Ok(())
     }
@@ -199,7 +208,8 @@ impl<D: WriteAt> Btrfs<D> {
         let mut writer = self.begin_file(data.len() as u64)?;
         if !data.is_empty() {
             if let Err(e) = self.write_chunk(&mut writer, data) {
-                let _ = self.abandon_file(writer);
+                // A failed abandon (ledger/commit trouble) outranks the write error.
+                self.abandon_file(writer)?;
                 return Err(e);
             }
         }
@@ -298,8 +308,9 @@ impl<D: WriteAt> Btrfs<D> {
             self.commit_active_batch()?;
         }
         let (txn, new_chunk) = Transaction::allocate_data_chunk_excluding(self, reserved)?;
-        self.chunks.insert(new_chunk.clone());
         let logical = new_chunk.logical;
+        // `commit_transaction` adds `txn.new_chunks` to the live chunk map once
+        // the commit has succeeded (B4); a failed commit leaves the map alone.
         commit_transaction(self, txn)?;
         Ok(logical)
     }

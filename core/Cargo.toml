@@ -468,3 +468,12 @@ required-features = ["dangerous-write-support"]
 name = "btrfs_batch_ack_durability"
 path = "tests/txn_batch/btrfs_batch_ack_durability.rs"
 required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_f3_commit_semantics"
+path = "tests/txn_batch/btrfs_f3_commit_semantics.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_read_integrity"
+path = "tests/btrfs_ops/btrfs_read_integrity.rs"

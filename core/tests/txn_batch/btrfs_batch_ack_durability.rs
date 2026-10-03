@@ -1,7 +1,7 @@
 //! F0.4 (D2) and F0.5 (B1): btrfs batch durability and generation discipline.
 //!
 //! ```text
-//! cargo test --features dangerous-write-support --test btrfs_batch_ack_durability -- --include-ignored
+//! cargo test --features dangerous-write-support --test btrfs_batch_ack_durability
 //! ```
 //!
 //! Both files are tiny (one block) and finished in one live `Batch`; the 16th
@@ -57,7 +57,6 @@ macro_rules! small_file {
 /// live batch write the same superblock generation with different roots. Correct:
 /// every commit's generation is strictly greater than the previous one.
 #[test]
-#[ignore = "KNOWN-RED B1: fixed by F3 (bump Batch.generation on commit_and_rearm)"]
 fn f0_5_b1_two_commits_from_one_batch_have_increasing_generations() {
     let img = scratch("b1");
     let mut fs = Btrfs::mount(dev(&img)).expect("mount");
@@ -84,7 +83,6 @@ fn f0_5_b1_two_commits_from_one_batch_have_increasing_generations() {
 /// follow-up `commit_active_batch` errors). Today the batch is dropped on the
 /// failed commit, so A vanishes and every call afterwards says Ok.
 #[test]
-#[ignore = "KNOWN-RED D2: fixed by F3 (keep batch on commit failure / report loss)"]
 fn f0_4_d2_acked_file_survives_or_loss_is_reported_after_commit_failure() {
     const A: &str = "A_acked.bin";
     let img = scratch("d2");

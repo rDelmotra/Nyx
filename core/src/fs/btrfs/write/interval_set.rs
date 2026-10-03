@@ -3,16 +3,32 @@
 //! Maintains a collection of non-overlapping, half-open ranges `[start, end)`
 //! sorted by start address. Detects overlaps in $O(\log K)$ time.
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct IntervalSet {
     intervals: Vec<(u64, u64)>, // sorted strictly by start: interval[i].1 < interval[i+1].0
+    /// Every range exactly as inserted (start -> end), NOT merged. `intervals`
+    /// merges touching inserts, which loses the boundaries a release must
+    /// match; `remove_exact` is checked against this map, so releasing a
+    /// sub-range, a range spanning two inserts, or the same range twice is
+    /// detected (W16).
+    parts: std::collections::BTreeMap<u64, u64>,
 }
+
+/// Equality is over the covered address ranges only; how they were inserted is
+/// bookkeeping for `remove_exact`.
+impl PartialEq for IntervalSet {
+    fn eq(&self, other: &Self) -> bool {
+        self.intervals == other.intervals
+    }
+}
+impl Eq for IntervalSet {}
 
 impl IntervalSet {
     /// Create an empty interval set.
     pub fn new() -> Self {
         Self {
             intervals: Vec::new(),
+            parts: std::collections::BTreeMap::new(),
         }
     }
 
@@ -77,6 +93,7 @@ impl IntervalSet {
 
         self.intervals
             .splice(remove_start..remove_end, std::iter::once((new_start, new_end)));
+        self.parts.insert(start, end);
         true
     }
 
@@ -104,6 +121,21 @@ impl IntervalSet {
             }
         }
         self.intervals = new_intervals;
+
+        let mut new_parts = std::collections::BTreeMap::new();
+        for (&s, &e) in &self.parts {
+            if e <= start || s >= end {
+                new_parts.insert(s, e);
+            } else {
+                if s < start {
+                    new_parts.insert(s, start);
+                }
+                if e > end {
+                    new_parts.insert(end, e);
+                }
+            }
+        }
+        self.parts = new_parts;
     }
 
     /// Check if `[start, start + length)` is wholly enclosed within a single interval in the set.
@@ -127,14 +159,20 @@ impl IntervalSet {
         false
     }
 
-    /// Remove an interval `[start, start + length)` from the set.
-    /// Returns `true` if the interval was completely present in the set and removed,
-    /// or `false` if it was not present or only partially present (detecting double release / foreign range).
+    /// Remove `[start, start + length)`, which must be EXACTLY a range that was
+    /// passed to `insert` and not yet removed.
+    /// Returns `false` (and changes nothing) for a never-inserted range, a
+    /// strict sub-range, a range spanning several inserts, or a second release
+    /// of the same range. (Touching inserts merge in `intervals()`, so
+    /// coverage alone cannot tell these apart; `parts` can.)
     pub fn remove_exact(&mut self, start: u64, length: u64) -> bool {
         if length == 0 {
             return true;
         }
-        if !self.contains_range(start, length) {
+        let Some(end) = start.checked_add(length) else {
+            return false;
+        };
+        if self.parts.get(&start) != Some(&end) {
             return false;
         }
         self.remove(start, length);
@@ -167,6 +205,7 @@ impl IntervalSet {
     /// Clear all intervals in the set.
     pub fn clear(&mut self) {
         self.intervals.clear();
+        self.parts.clear();
     }
 
     /// Borrow the sorted disjoint intervals as `[(start, end)]`.
@@ -266,21 +305,37 @@ mod tests {
         set.insert(100, 100); // [100, 200)
         set.insert(300, 100); // [300, 400)
 
-        // Attempting to remove non-existent or overlapping range returns false
+        // Non-existent, partial or overlapping ranges return false and mutate nothing.
         assert!(!set.remove_exact(50, 100));
         assert!(!set.remove_exact(150, 100));
         assert!(!set.remove_exact(200, 100));
-        assert_eq!(set.intervals(), &[(100, 200), (300, 400)]); // Unmutated
+        assert_eq!(set.intervals(), &[(100, 200), (300, 400)]);
 
-        // Exact subrange removal succeeds
-        assert!(set.remove_exact(120, 30)); // remove [120, 150)
-        assert_eq!(set.intervals(), &[(100, 120), (150, 200), (300, 400)]);
-
-        // Second removal of same range returns false (double-release prevention)
+        // W16: a strict sub-range of an inserted range is NOT an exact release.
         assert!(!set.remove_exact(120, 30));
+        assert_eq!(set.intervals(), &[(100, 200), (300, 400)]);
 
-        // Exact full interval removal succeeds
+        // Exact full-range removal succeeds, once.
         assert!(set.remove_exact(300, 100));
-        assert_eq!(set.intervals(), &[(100, 120), (150, 200)]);
+        assert!(!set.remove_exact(300, 100), "double release must be detected");
+        assert_eq!(set.intervals(), &[(100, 200)]);
+    }
+
+    /// W16: adjacent inserts merge in `intervals()`, but each inserted range
+    /// stays individually releasable exactly once, and a range spanning two
+    /// inserts (or a sub-range of one) is rejected.
+    #[test]
+    fn test_interval_set_remove_exact_across_merged_ranges() {
+        let mut set = IntervalSet::new();
+        assert!(set.insert(100, 50));
+        assert!(set.insert(150, 50));
+        assert_eq!(set.intervals(), &[(100, 200)]);
+        assert!(!set.remove_exact(100, 100), "spans two inserted ranges");
+        assert!(!set.remove_exact(120, 10), "sub-range of an inserted range");
+        assert!(set.remove_exact(100, 50));
+        assert!(!set.remove_exact(100, 50), "double release of the first range");
+        assert_eq!(set.intervals(), &[(150, 200)]);
+        assert!(set.remove_exact(150, 50));
+        assert!(set.is_empty());
     }
 }

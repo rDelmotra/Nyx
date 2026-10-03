@@ -27,8 +27,6 @@ kt_red() {
 }
 export -f kt_red
 RED=(
-  "W1/W2|$CORE --test ext4_writer_leak f0_1_w1_w2 -- --include-ignored"
-  "W1/W8/W9/D4|$CORE --test ext4_writer_leak f0_2_ -- --include-ignored"
   "D2|$CORE --test btrfs_batch_ack_durability f0_4_d2 -- --include-ignored"
   "B1|$CORE --test btrfs_batch_ack_durability f0_5_b1 -- --include-ignored"
   # Kotlin (F0.7): gated by -PknownRed=1 (Assume), never by editing source.
@@ -37,9 +35,6 @@ RED=(
   "W6|$KT '*TransferIntegrityRedTest.w6_*'"
   "C1|$KT '*TransferIntegrityRedTest.c1_*'"
   "C5|$KT '*TransferIntegrityRedTest.c5_cancelRecorded*'"
-  "W3|$JNI w3_abandon_after_fence_leaves_ext4_clean"
-  "W4|$JNI w4_finish_after_fence_leaves_ext4_clean"
-  "W2|$JNI w2_drop_volume_with_open_writer_leaves_ext4_clean"
   "N3-ext4|$JNI n3_export_chunks_never_stitch_another_file_ext4"
   "N3-btrfs|$JNI n3_export_chunks_never_stitch_another_file_btrfs"
 )

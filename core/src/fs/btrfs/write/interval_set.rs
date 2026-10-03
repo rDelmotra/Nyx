@@ -151,6 +151,19 @@ impl IntervalSet {
         self.intervals.is_empty()
     }
 
+    /// How many units of `[start, end)` are covered by the set.
+    pub fn covered_within(&self, start: u64, end: u64) -> u64 {
+        if start >= end {
+            return 0;
+        }
+        let first = self.intervals.partition_point(|&(_, e)| e <= start);
+        self.intervals[first..]
+            .iter()
+            .take_while(|&&(s, _)| s < end)
+            .map(|&(s, e)| e.min(end) - s.max(start))
+            .sum()
+    }
+
     /// Clear all intervals in the set.
     pub fn clear(&mut self) {
         self.intervals.clear();
@@ -165,6 +178,18 @@ impl IntervalSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_interval_set_covered_within() {
+        let mut set = IntervalSet::new();
+        assert!(set.insert(10, 10)); // [10, 20)
+        assert!(set.insert(30, 5)); // [30, 35)
+        assert_eq!(set.covered_within(0, 100), 15);
+        assert_eq!(set.covered_within(15, 32), 5 + 2);
+        assert_eq!(set.covered_within(20, 30), 0);
+        assert_eq!(set.covered_within(34, 34), 0);
+        assert_eq!(set.covered_within(0, 11), 1);
+    }
 
     #[test]
     fn test_interval_set_insert_and_merge() {

@@ -31,7 +31,7 @@
 
 use crate::device::WriteAt;
 use crate::error::{LuksError, Result};
-use crate::fs::ext4::alloc::Extent;
+use crate::fs::ext4::alloc::{Aborted, Extent};
 use crate::fs::ext4::csum::{Seed, DIR_TAIL_SIZE};
 use crate::fs::ext4::{Ext4, Inode};
 use crate::fs::FileType;
@@ -41,11 +41,14 @@ const EXTENT_MAGIC: u16 = 0xF30A;
 /// `i_block` area with no room left for a fifth.
 const MAX_INLINE_EXTENTS: usize = 4;
 
-fn now_unix() -> u32 {
-    std::time::SystemTime::now()
+fn now_unix() -> Result<u32> {
+    let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as u32)
-        .unwrap_or(0)
+        .map_err(|_| LuksError::UnsupportedFsFeature("the system clock is before 1970; refusing to stamp inodes".into()))?
+        .as_secs();
+    u32::try_from(secs).map_err(|_| {
+        LuksError::UnsupportedFsFeature("the system clock is past 2106; 32-bit inode timestamps cannot hold it".into())
+    })
 }
 
 fn put16(b: &mut [u8], o: usize, v: u16) {
@@ -61,6 +64,13 @@ fn u16le(b: &[u8], o: usize) -> u16 {
 
 fn u32le(b: &[u8], o: usize) -> u32 {
     u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
+}
+
+/// `alloc_inode` writes several times (record, bitmap, descriptor, superblock),
+/// so only the refusal it raises before the first write leaves the fs
+/// untouched; any other failure is partial completion.
+fn inode_alloc_aborted(err: LuksError) -> Aborted {
+    Aborted::nothing_written_if(err, |e| matches!(e, LuksError::NoFreeInodes))
 }
 
 /// One contiguous run: `len` logical blocks starting at `logical`, backed by
@@ -162,15 +172,24 @@ impl<D: WriteAt> Ext4<D> {
     /// Reserve an inode and blocks for a file of `size`, before its bytes are
     /// available. Call [`write_chunk`](Self::write_chunk), then either
     /// [`finish_file`](Self::finish_file) or [`abandon_file`](Self::abandon_file).
+    ///
+    /// # Deferred allocation (F2a)
+    ///
+    /// The reservation lives **in memory only**. No bitmap, descriptor,
+    /// superblock or inode byte changes on disk until `finish_file` publishes
+    /// the file, so a transfer that is abandoned, dropped, or interrupted by a
+    /// dead device leaves the disk exactly as it was. The reserved blocks are
+    /// free on disk; data written into them is garbage in free space until
+    /// publish.
     pub fn begin_file(&mut self, size: u64) -> Result<FileWriter> {
         let seed = Seed::for_writing(&self.sb)?;
         let bs = self.sb.block_size as u64;
         let blocks_needed = size.div_ceil(bs.max(1));
-        let ino = self.alloc_inode(false)?;
-        let mut extents = match self.alloc_blocks(0, blocks_needed) {
+        let ino = self.reserve_inode()?;
+        let mut extents = match self.reserve_blocks(0, blocks_needed) {
             Ok(extents) => extents,
             Err(e) => {
-                self.undo_new_file(ino, &[]);
+                self.release_inode(ino);
                 return Err(e);
             }
         };
@@ -178,19 +197,21 @@ impl<D: WriteAt> Ext4<D> {
         let runs = match runs_from(&extents, max_runs) {
             Ok(runs) => runs,
             Err(e) => {
-                self.undo_new_file(ino, &extents);
+                self.release_blocks(&extents);
+                self.release_inode(ino);
                 return Err(e);
             }
         };
         let mut leaf_block = None;
         if runs.len() > MAX_INLINE_EXTENTS {
-            match self.alloc_blocks(0, 1) {
+            match self.reserve_blocks(0, 1) {
                 Ok(mut e) => {
                     leaf_block = Some(e[0].physical);
                     extents.append(&mut e);
                 }
                 Err(e) => {
-                    self.undo_new_file(ino, &extents);
+                    self.release_blocks(&extents);
+                    self.release_inode(ino);
                     return Err(e);
                 }
             }
@@ -211,10 +232,11 @@ impl<D: WriteAt> Ext4<D> {
 
     /// Begin a streaming file transfer whose final size is not known up-front.
     ///
-    /// Extents are allocated incrementally as data arrives via [`write_chunk`](Self::write_chunk).
+    /// Blocks are reserved (memory only) as data arrives via
+    /// [`write_chunk`](Self::write_chunk).
     pub fn begin_file_streaming(&mut self) -> Result<FileWriter> {
         let seed = Seed::for_writing(&self.sb)?;
-        let ino = self.alloc_inode(false)?;
+        let ino = self.reserve_inode()?;
         Ok(FileWriter {
             ino,
             extents: Vec::new(),
@@ -246,7 +268,7 @@ impl<D: WriteAt> Ext4<D> {
             let current_data_blocks: u64 = writer.runs.iter().map(|r| r.len).sum();
             if blocks_needed > current_data_blocks {
                 let delta = blocks_needed - current_data_blocks;
-                // Refusal gate before block allocation: if we already have max_runs runs,
+                // Refusal gate before block reservation: if we already have max_runs runs,
                 // adding more cannot fit in depth <= 1
                 if writer.runs.len() >= max_runs {
                     return Err(LuksError::UnsupportedFsFeature(
@@ -260,39 +282,42 @@ impl<D: WriteAt> Ext4<D> {
                     .iter().rfind(|e| Some(e.physical) != writer.leaf_block)
                     .map(|e| e.physical + e.len)
                     .unwrap_or(0);
-                let new_extents = self.alloc_blocks(goal, delta)?;
-                writer.extents.extend_from_slice(&new_extents);
+                let new_extents = self.reserve_blocks(goal, delta)?;
 
                 let data_extents: Vec<Extent> = writer
                     .extents
                     .iter()
                     .copied()
                     .filter(|e| Some(e.physical) != writer.leaf_block)
+                    .chain(new_extents.iter().copied())
                     .collect();
                 let runs = match runs_from(&data_extents, max_runs) {
                     Ok(r) => r,
                     Err(e) => {
-                        let _ = self.free_blocks(&new_extents);
-                        writer
-                            .extents
-                            .truncate(writer.extents.len() - new_extents.len());
+                        self.release_blocks(&new_extents);
                         return Err(e);
                     }
                 };
-                writer.runs = runs;
-                writer.blocks_needed = blocks_needed;
 
-                if writer.runs.len() > MAX_INLINE_EXTENTS && writer.leaf_block.is_none() {
-                    match self.alloc_blocks(0, 1) {
-                        Ok(mut e) => {
-                            writer.leaf_block = Some(e[0].physical);
-                            writer.extents.append(&mut e);
-                        }
+                // The writer is only mutated once everything that can fail
+                // has succeeded: a refused growth leaves it exactly as it was.
+                let mut leaf = None;
+                if runs.len() > MAX_INLINE_EXTENTS && writer.leaf_block.is_none() {
+                    match self.reserve_blocks(0, 1) {
+                        Ok(e) => leaf = Some(e),
                         Err(e) => {
+                            self.release_blocks(&new_extents);
                             return Err(e);
                         }
                     }
                 }
+                writer.extents.extend_from_slice(&new_extents);
+                if let Some(mut e) = leaf {
+                    writer.leaf_block = Some(e[0].physical);
+                    writer.extents.append(&mut e);
+                }
+                writer.runs = runs;
+                writer.blocks_needed = blocks_needed;
             }
             writer.size = end;
         } else if end > writer.size {
@@ -323,6 +348,35 @@ impl<D: WriteAt> Ext4<D> {
     }
 
     /// Finish a complete stream, publish it in `dir_ino`, and return its inode.
+    ///
+    /// # Publish order (F2a)
+    ///
+    /// Everything up to the dirty mark is memory or free space, so a refusal
+    /// there writes no metadata at all:
+    ///
+    /// 0. validate the name and the directory, verify against the disk that
+    ///    every reserved bit is still clear (a set bit means someone else took
+    ///    it: `CorruptFs`, nothing written);
+    /// 1. tail/padding data and the extent leaf block, then **flush**: data
+    ///    reaches the medium before any metadata names it;
+    ///
+    /// then, inside the dirty bracket ([`Ext4::dirty_window`]), whose only
+    /// purpose is to make a crash here *visible* (the write gate refuses a fs
+    /// not marked clean):
+    ///
+    /// 2. superblock `VALID_FS` cleared, **flush**;
+    /// 3. each touched group: block bitmap, then descriptor;
+    /// 4. inode: record **zeroed**, then inode bitmap, then descriptor;
+    /// 5. superblock counters;
+    /// 6. the real inode record, **flush**;
+    /// 7. the directory entry, **flush**;
+    /// 8. superblock `VALID_FS` set, **flush**.
+    ///
+    /// Reservations are dropped on every exit path, success or failure.
+    ///
+    /// A failure after step 2 reloads the descriptors and superblock from disk
+    /// (memory must not run ahead of the medium) and leaves the filesystem
+    /// marked dirty on disk, as it truthfully is.
     pub fn finish_file(
         &mut self,
         mut writer: FileWriter,
@@ -330,31 +384,62 @@ impl<D: WriteAt> Ext4<D> {
         name: &str,
         file_type: crate::fs::FileType,
     ) -> Result<u64> {
-        if let Err(e) = super::dirent::validate_name(name.as_bytes()) {
-            self.abandon_file(writer);
-            return Err(e);
-        }
-        let ino = match self.finish_unlinked(&mut writer) {
-            Ok(ino) => ino,
+        let (block_claims, inode_claim) = match self.prepare_publish(&mut writer, dir_ino, name) {
+            Ok(p) => p,
             Err(e) => {
                 self.abandon_file(writer);
                 return Err(e);
             }
         };
-        if let Err(e) = self.link_file(dir_ino, name, ino, file_type) {
-            self.abandon_file(writer);
-            return Err(e);
-        }
-        Ok(ino)
+
+        let result = self.dirty_window(|fs| {
+            let seed = Seed::for_writing(&fs.sb)?;
+            fs.write_block_claim(&block_claims, &seed)?;
+            fs.write_inode_claim(&inode_claim, &seed)?;
+            fs.write_superblock_counters(&seed)?;
+            fs.write_inode_record(
+                writer.ino,
+                writer.size,
+                writer.blocks_needed,
+                &writer.runs,
+                writer.leaf_block,
+                &writer.seed,
+            )?;
+            fs.flush()?;
+            fs.link_file(dir_ino, name, writer.ino, file_type)?;
+            fs.flush()?;
+            Ok(writer.ino)
+        });
+        // Whatever happened, the writer is spent: its promises end here.
+        self.release_blocks(&writer.extents);
+        self.release_inode(writer.ino);
+        result
     }
 
-    /// Roll back a stream that will never be published. Safe to call after an
-    /// interrupted transfer; cleanup errors cannot replace its original cause.
+    /// Roll back a stream that will never be published.
+    ///
+    /// **Memory only.** The reservation was never on disk, so there is nothing
+    /// to undo and nothing that can fail: this is valid on a fenced, poisoned
+    /// or unplugged device. (Data already written into the reserved blocks is
+    /// garbage in free space and is left to be overwritten.)
     pub fn abandon_file(&mut self, writer: FileWriter) {
-        self.undo_new_file(writer.ino, &writer.extents);
+        self.release_blocks(&writer.extents);
+        self.release_inode(writer.ino);
     }
 
-    fn finish_unlinked(&mut self, writer: &mut FileWriter) -> Result<u64> {
+    /// Everything `finish_file` can check or write **before** the dirty mark:
+    /// size agreement, tail padding, the extent leaf, a flush, the name and
+    /// directory, and the assert-clear verification of every reservation.
+    /// Returns the claims to apply. Writes data into free space only.
+    fn prepare_publish(
+        &mut self,
+        writer: &mut FileWriter,
+        dir_ino: u64,
+        name: &str,
+    ) -> Result<(Vec<crate::fs::ext4::alloc::BlockClaim>, crate::fs::ext4::alloc::InodeClaim)> {
+        super::dirent::validate_name(name.as_bytes())?;
+        self.preflight_link(dir_ino, name)?;
+
         if writer.is_streaming {
             writer.size = writer.written;
             writer.blocks_needed = writer.written.div_ceil(self.sb.block_size as u64);
@@ -362,6 +447,12 @@ impl<D: WriteAt> Ext4<D> {
         if writer.written != writer.size {
             return Err(LuksError::OutOfBounds);
         }
+
+        // Proven against the disk before a single byte is written for this
+        // file, so a conflict costs nothing.
+        let block_claims = self.verify_block_claim(&writer.extents)?;
+        let inode_claim = self.verify_inode_claim(writer.ino)?;
+
         if !writer.tail.is_empty() {
             let block_size = self.sb.block_size as usize;
             let mut padded = vec![0u8; block_size];
@@ -373,16 +464,12 @@ impl<D: WriteAt> Ext4<D> {
         if let Some(lb) = writer.leaf_block {
             self.write_extent_leaf_block(lb, writer.ino, &writer.runs, &writer.seed)?;
         }
-        self.flush()?;
-        self.write_inode_record(
-            writer.ino,
-            writer.size,
-            writer.blocks_needed,
-            &writer.runs,
-            writer.leaf_block,
-            &writer.seed,
-        )?;
-        Ok(writer.ino)
+        // No flush here. Every data write above precedes `dirty_window`'s
+        // dirty-mark, and that mark ends in a flush before any bitmap,
+        // descriptor or inode byte is written. A flush orders everything
+        // issued before it ahead of everything issued after it, so data still
+        // reaches the medium before any metadata that names it.
+        Ok((block_claims, inode_claim))
     }
 
     /// Write whole filesystem blocks at a logical file offset, translating
@@ -419,7 +506,7 @@ impl<D: WriteAt> Ext4<D> {
     /// On any failure every block and the inode allocated so far are freed
     /// before returning, so a failed write cannot leak space.
     pub fn write_new_file(&mut self, data: &[u8]) -> Result<u64> {
-        self.write_new_file_runs(data).map(|(ino, _)| ino)
+        self.dirty_window(|fs| fs.write_new_file_runs(data).map(|(ino, _)| ino))
     }
 
     /// Create a file *and* give it a name, or leave the filesystem as it was.
@@ -453,8 +540,14 @@ impl<D: WriteAt> Ext4<D> {
     ///   cannot be read.
     ///
     /// Both cost a flush, which on USB is a `SYNCHRONIZE CACHE` round trip.
-    /// Three per file, counting the caller's final one. That is the price of
-    /// the guarantee and it is not adjustable from here.
+    ///
+    /// # Dirty bracket
+    ///
+    /// Everything that writes metadata runs between "marked not clean" and
+    /// "marked clean" ([`Ext4::dirty_window`]). Names and directories that
+    /// cannot work are refused **before** the bracket opens, so the common
+    /// failure (sending the same file twice) writes nothing and leaves the
+    /// filesystem clean.
     pub fn create_file(
         &mut self,
         dir_ino: u64,
@@ -468,16 +561,18 @@ impl<D: WriteAt> Ext4<D> {
         // instead of surfacing as "no space" when the transient allocation is
         // what ran out.
         super::dirent::validate_name(name.as_bytes())?;
+        self.preflight_link(dir_ino, name)?;
 
-        let (ino, extents) = self.write_new_file_runs(data)?;
-        self.flush()?;
-
-        if let Err(e) = self.link_file(dir_ino, name, ino, file_type) {
-            self.undo_new_file(ino, &extents);
-            return Err(e);
-        }
-
-        Ok(ino)
+        self.dirty_window(|fs| {
+            let (ino, extents) = fs.write_new_file_runs(data)?;
+            if let Err(e) = fs.flush() {
+                return Err(fs.rollback_file(e, ino, &extents));
+            }
+            if let Err(e) = fs.link_file(dir_ino, name, ino, file_type) {
+                return Err(fs.rollback_file(e, ino, &extents));
+            }
+            Ok(ino)
+        })
     }
 
     /// Undo a file that was written but never named.
@@ -491,81 +586,76 @@ impl<D: WriteAt> Ext4<D> {
     /// something.
     ///
     /// Flushed at the end because a rollback that only reaches the bridge's
-    /// write cache is not a rollback — and the failure that got us here is
-    /// disproportionately likely to be a link that is about to disappear.
-    /// Errors are swallowed deliberately: the caller is owed the reason the
-    /// write failed, not the reason the cleanup did.
+    /// write cache is not a rollback.
+    ///
+    /// **Errors propagate.** The first failing step stops the rollback and is
+    /// returned: stopping is what keeps the order above, and a rollback that
+    /// did not complete must not be mistaken for one that did (see
+    /// [`rollback_file`](Self::rollback_file)).
     ///
     /// The whole batch is freed in one call. Undoing a 50 MB file used to mean
-    /// three device writes per 4 KiB block — a rollback that cost more round
-    /// trips than the write it was undoing, on a path taken precisely when
-    /// something has already gone wrong.
-    fn undo_new_file(&mut self, ino: u64, extents: &[Extent]) {
-        let _ = self.free_inode(ino, false);
-        let _ = self.free_blocks(extents);
-        let _ = self.flush();
+    /// three device writes per 4 KiB block.
+    fn undo_new_file(&mut self, ino: u64, extents: &[Extent]) -> Result<()> {
+        self.free_inode(ino, false)?;
+        self.free_blocks(extents)?;
+        self.flush()
+    }
+
+    /// Turn "this step failed" into the right [`Aborted`] after undoing the
+    /// file. The primary error always stands; a rollback that fails is
+    /// attached, not substituted, and a transport primary skips the rollback
+    /// (see [`Aborted::after_undo`]).
+    fn rollback_file(&mut self, err: LuksError, ino: u64, extents: &[Extent]) -> Aborted {
+        Aborted::after_undo(err, || self.undo_new_file(ino, extents))
     }
 
     /// The body of [`write_new_file`], keeping the block runs so a caller that
     /// needs to undo the whole thing can free exactly what was allocated
-    /// without re-parsing the extent tree it just wrote.
-    fn write_new_file_runs(&mut self, data: &[u8]) -> Result<(u64, Vec<Extent>)> {
+    /// without re-parsing the extent tree it just wrote. Runs inside a dirty
+    /// window; every failure rolls back through [`rollback_file`].
+    fn write_new_file_runs(&mut self, data: &[u8]) -> std::result::Result<(u64, Vec<Extent>), Aborted> {
         let seed = Seed::for_writing(&self.sb)?;
         let bs = self.sb.block_size as u64;
         let blocks_needed = (data.len() as u64).div_ceil(bs.max(1));
 
-        let ino = self.alloc_inode(false)?;
+        let ino = self.alloc_inode(false).map_err(inode_alloc_aborted)?;
 
-        // Every failure below unwinds through `undo_new_file`, the same
-        // rollback `create_file` uses. This used to be a local closure with the
-        // opposite ordering — blocks freed first, the inode last with its
-        // result discarded, and no flush — which is exactly the shape
-        // `undo_new_file`'s comment argues against. Two implementations of one
-        // operation meant the fix landed on one of them; there is now one.
-        //
         // One call, not one per block. The allocator commits its bookkeeping
         // once per group it touches instead of once per block, which is the
         // difference between a 50 MB file costing ~85,000 SCSI commands and
         // costing a few hundred.
-        let mut extents = match self.alloc_blocks(0, blocks_needed) {
+        let mut extents = match self.alloc_blocks_tracked(0, blocks_needed) {
             Ok(e) => e,
-            Err(e) => {
-                self.undo_new_file(ino, &[]);
-                return Err(e);
-            }
+            // The runs whose bitmap write was attempted are freed too.
+            Err((e, committed)) => return Err(self.rollback_file(e, ino, &committed)),
         };
 
         let max_runs = (bs as usize - 12 - 4) / 12;
         let runs = match runs_from(&extents, max_runs) {
             Ok(r) => r,
-            Err(e) => {
-                self.undo_new_file(ino, &extents);
-                return Err(e);
-            }
+            Err(e) => return Err(self.rollback_file(e, ino, &extents)),
         };
 
         let mut leaf_block = None;
         if runs.len() > MAX_INLINE_EXTENTS {
-            match self.alloc_blocks(0, 1) {
+            match self.alloc_blocks_tracked(0, 1) {
                 Ok(mut e) => {
                     leaf_block = Some(e[0].physical);
                     extents.append(&mut e);
                 }
-                Err(e) => {
-                    self.undo_new_file(ino, &extents);
-                    return Err(e);
+                Err((e, committed)) => {
+                    extents.extend(committed);
+                    return Err(self.rollback_file(e, ino, &extents));
                 }
             }
         }
 
         if let Err(e) = self.write_file_data(&runs, data) {
-            self.undo_new_file(ino, &extents);
-            return Err(e);
+            return Err(self.rollback_file(e, ino, &extents));
         }
         if let Some(lb) = leaf_block {
             if let Err(e) = self.write_extent_leaf_block(lb, ino, &runs, &seed) {
-                self.undo_new_file(ino, &extents);
-                return Err(e);
+                return Err(self.rollback_file(e, ino, &extents));
             }
         }
 
@@ -573,14 +663,12 @@ impl<D: WriteAt> Ext4<D> {
         // else's deleted plaintext: the data must be on the medium before the
         // inode that names those blocks is. See `create_file`.
         if let Err(e) = self.flush() {
-            self.undo_new_file(ino, &extents);
-            return Err(e);
+            return Err(self.rollback_file(e, ino, &extents));
         }
 
         if let Err(e) = self.write_inode_record(ino, data.len() as u64, blocks_needed, &runs, leaf_block, &seed)
         {
-            self.undo_new_file(ino, &extents);
-            return Err(e);
+            return Err(self.rollback_file(e, ino, &extents));
         }
 
         Ok((ino, extents))
@@ -662,7 +750,7 @@ impl<D: WriteAt> Ext4<D> {
 
         put16(&mut raw, 0x00, MODE_REGULAR_0644); // i_mode
         put32(&mut raw, 0x04, size as u32); // i_size_lo
-        let now = now_unix();
+        let now = now_unix()?;
         put32(&mut raw, 0x08, now); // i_atime
         put32(&mut raw, 0x0C, now); // i_ctime
         put32(&mut raw, 0x10, now); // i_mtime
@@ -843,7 +931,7 @@ impl<D: WriteAt> Ext4<D> {
 
         put16(&mut raw, 0x00, MODE_DIR_0755); // i_mode
         put32(&mut raw, 0x04, self.sb.block_size); // i_size_lo
-        let now = now_unix();
+        let now = now_unix()?;
         put32(&mut raw, 0x08, now); // i_atime
         put32(&mut raw, 0x0C, now); // i_ctime
         put32(&mut raw, 0x10, now); // i_mtime
@@ -878,10 +966,27 @@ impl<D: WriteAt> Ext4<D> {
         Ok(())
     }
 
-    fn undo_new_dir(&mut self, ino: u64, extents: &[Extent]) {
-        let _ = self.free_inode(ino, true);
-        let _ = self.free_blocks(extents);
-        let _ = self.flush();
+    fn undo_new_dir(&mut self, ino: u64, extents: &[Extent]) -> Result<()> {
+        self.free_inode(ino, true)?;
+        self.free_blocks(extents)?;
+        self.flush()
+    }
+
+    /// The directory twin of [`rollback_file`](Self::rollback_file). `unlink`
+    /// names a directory entry to remove first, once the link has landed.
+    fn rollback_dir(
+        &mut self,
+        err: LuksError,
+        ino: u64,
+        extents: &[Extent],
+        unlink: Option<(u64, &str)>,
+    ) -> Aborted {
+        Aborted::after_undo(err, || {
+            if let Some((dir_ino, name)) = unlink {
+                self.unlink_file(dir_ino, name)?;
+            }
+            self.undo_new_dir(ino, extents)
+        })
     }
 
     /// Create a new directory `name` in parent directory `dir_ino`.
@@ -904,16 +1009,27 @@ impl<D: WriteAt> Ext4<D> {
             return Err(LuksError::NotADirectory(format!("inode {dir_ino}")));
         }
 
-        let ino = self.alloc_inode(true)?;
+        // A name or parent that cannot work is refused before the dirty
+        // bracket opens, so it writes nothing and leaves the fs clean.
+        self.preflight_link(dir_ino as u64, name)?;
+
+        self.dirty_window(|fs| fs.create_directory_body(&seed, dir_ino, name))
+    }
+
+    /// The writing half of [`create_directory`](Self::create_directory), run
+    /// inside the dirty bracket.
+    fn create_directory_body(
+        &mut self,
+        seed: &Seed,
+        dir_ino: u32,
+        name: &str,
+    ) -> std::result::Result<u32, Aborted> {
+        let ino = self.alloc_inode(true).map_err(inode_alloc_aborted)?;
         let ino_u32 = ino as u32;
 
-        let extents = match self.alloc_blocks(0, 1) {
+        let extents = match self.alloc_blocks_tracked(0, 1) {
             Ok(e) => e,
-            Err(e) => {
-                let _ = self.free_inode(ino, true);
-                let _ = self.flush();
-                return Err(e);
-            }
+            Err((e, committed)) => return Err(self.rollback_dir(e, ino, &committed, None)),
         };
         let block_phys = extents[0].physical;
 
@@ -956,35 +1072,28 @@ impl<D: WriteAt> Ext4<D> {
 
         let at = match self.metadata_block_offset(block_phys) {
             Ok(offset) => offset,
-            Err(e) => {
-                self.undo_new_dir(ino, &extents);
-                return Err(e);
-            }
+            Err(e) => return Err(self.rollback_dir(e, ino, &extents, None)),
         };
         if let Err(e) = self.device.write_at(at, &block) {
-            self.undo_new_dir(ino, &extents);
-            return Err(e);
+            return Err(self.rollback_dir(e, ino, &extents, None));
         }
 
-        if let Err(e) = self.write_directory_inode_record(ino, block_phys, &seed) {
-            self.undo_new_dir(ino, &extents);
-            return Err(e);
+        if let Err(e) = self.write_directory_inode_record(ino, block_phys, seed) {
+            return Err(self.rollback_dir(e, ino, &extents, None));
         }
 
         if let Err(e) = self.flush() {
-            self.undo_new_dir(ino, &extents);
-            return Err(e);
+            return Err(self.rollback_dir(e, ino, &extents, None));
         }
 
+        // A failed link wrote nothing a rollback must remove (`link_file`
+        // plans first and writes last), so no unlink here.
         if let Err(e) = self.link_file(dir_ino as u64, name, ino, FileType::Directory) {
-            self.undo_new_dir(ino, &extents);
-            return Err(e);
+            return Err(self.rollback_dir(e, ino, &extents, None));
         }
 
         if let Err(e) = self.patch_inode_links_count(dir_ino, 1) {
-            let _ = self.unlink_file(dir_ino as u64, name);
-            self.undo_new_dir(ino, &extents);
-            return Err(e);
+            return Err(self.rollback_dir(e, ino, &extents, Some((dir_ino as u64, name))));
         }
 
         Ok(ino_u32)
@@ -1042,6 +1151,9 @@ impl<D: WriteAt> Ext4<D> {
 
         // Check if destination exists
         let dest_entry = self.find_entry(&dir, new_name.as_bytes())?;
+        // Collected before the dirty bracket opens: reads only, and every
+        // refusal here writes nothing and leaves the fs clean.
+        let mut dest = None;
         if let Some(dest_ino) = dest_entry {
             let dest_inode = self.read_inode(dest_ino)?;
             if dest_inode.file_type().is_dir() {
@@ -1054,36 +1166,45 @@ impl<D: WriteAt> Ext4<D> {
                     "overwriting a hardlinked file is not supported".into(),
                 ));
             }
-            // Delete destination file completely
             let (data_extents, index_extents) = self.collect_extents(&dest_inode)?;
-            let removed_ino = self.unlink_file(dir_ino as u64, new_name)?;
-            if removed_ino != dest_ino {
-                return Err(LuksError::CorruptFs("unlinked dest inode number mismatch"));
+            dest = Some((dest_ino, data_extents, index_extents));
+        }
+
+        self.dirty_window(|fs| {
+            // Delete destination file completely
+            if let Some((dest_ino, data_extents, index_extents)) = &dest {
+                let removed_ino = fs.unlink_file(dir_ino as u64, new_name).map_err(Aborted::step)?;
+                if removed_ino != *dest_ino {
+                    return Err(Aborted::from(LuksError::CorruptFs(
+                        "unlinked dest inode number mismatch",
+                    )));
+                }
+                fs.free_inode(*dest_ino, false)?;
+                fs.free_blocks(data_extents)?;
+                if !index_extents.is_empty() {
+                    fs.free_blocks(index_extents)?;
+                }
+                fs.flush()?;
             }
-            self.free_inode(dest_ino, false)?;
-            self.free_blocks(&data_extents)?;
-            if !index_extents.is_empty() {
-                self.free_blocks(&index_extents)?;
+
+            // Unlink old name
+            let removed_ino = fs.unlink_file(dir_ino as u64, old_name).map_err(Aborted::step)?;
+            if removed_ino != old_ino {
+                return Err(Aborted::from(LuksError::CorruptFs(
+                    "unlinked old inode number mismatch",
+                )));
             }
-            self.flush()?;
-        }
 
-        // Unlink old name
-        let removed_ino = self.unlink_file(dir_ino as u64, old_name)?;
-        if removed_ino != old_ino {
-            return Err(LuksError::CorruptFs("unlinked old inode number mismatch"));
-        }
-
-        // Link new name
-        if let Err(e) = self.link_file(dir_ino as u64, new_name, old_ino, FileType::Regular) {
-            // Attempt rollback: re-link old name
-            let _ = self.link_file(dir_ino as u64, old_name, old_ino, FileType::Regular);
-            let _ = self.flush();
-            return Err(e);
-        }
-
-        self.flush()?;
-        Ok(())
+            // Link new name
+            if let Err(e) = fs.link_file(dir_ino as u64, new_name, old_ino, FileType::Regular) {
+                // Rollback: re-link old name. If that lands the directory is
+                // consistent again; if not, it is not, and stays marked so.
+                return Err(Aborted::after_undo(e, || {
+                    fs.link_file(dir_ino as u64, old_name, old_ino, FileType::Regular)
+                }));
+            }
+            Ok(())
+        })
     }
 
     /// Rename an item given old and new parent directory paths and names.

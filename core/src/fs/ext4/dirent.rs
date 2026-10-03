@@ -101,6 +101,12 @@ fn type_code(t: FileType) -> u8 {
     }
 }
 
+/// A directory block with the new entry already in it, and where it goes.
+struct LinkPlan {
+    at: u64,
+    block: Vec<u8>,
+}
+
 impl<D: WriteAt> Ext4<D> {
     /// Add `name` to directory `dir_ino`, pointing at `ino`.
     ///
@@ -116,6 +122,18 @@ impl<D: WriteAt> Ext4<D> {
         ino: u64,
         file_type: FileType,
     ) -> Result<()> {
+        let plan = self.plan_link(dir_ino, name, ino, file_type)?;
+        self.device.write_at(plan.at, &plan.block)?;
+        Ok(())
+    }
+
+    /// Every check [`link_file`](Self::link_file) makes, and the directory
+    /// block it would write, without writing anything.
+    ///
+    /// Split out so a caller can discover a *predictable* failure (duplicate
+    /// name, full directory, htree, inline data) before it has written any
+    /// metadata, instead of after.
+    fn plan_link(&self, dir_ino: u64, name: &str, ino: u64, file_type: FileType) -> Result<LinkPlan> {
         let seed = Seed::for_writing(&self.sb)?;
 
         let name_bytes = name.as_bytes();
@@ -179,13 +197,18 @@ impl<D: WriteAt> Ext4<D> {
             if let Some(csum) = seed.dir_block(dir_ino, dir.generation, &block) {
                 put32(&mut block, bs - 4, csum);
             }
-            self.device.write_at(at, &block)?;
-            return Ok(());
+            return Ok(LinkPlan { at, block });
         }
 
         Err(LuksError::UnsupportedFsFeature(
             "directory is full and extending a directory is not implemented".into(),
         ))
+    }
+
+    /// Refuse, with nothing written, any name `link_file` could not link into
+    /// `dir_ino` for a reason knowable up front.
+    pub(super) fn preflight_link(&self, dir_ino: u64, name: &str) -> Result<()> {
+        self.plan_link(dir_ino, name, 2, FileType::Regular).map(|_| ())
     }
 
     /// Remove directory entry `name` from directory `dir_ino`.

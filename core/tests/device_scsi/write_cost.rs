@@ -381,3 +381,78 @@ fn peak_write_pipeline_memory_does_not_scale_with_payload_size() {
         "write peak scales with payload: 1 MiB={one}, 2 MiB={two}"
     );
 }
+
+/// What one `begin_file -> write_chunk -> finish_file` transfer costs the
+/// transport, split at the point where `finish_file` is called.
+///
+/// F2a moves every metadata write from begin time to finish time, so the
+/// interesting numbers are where the writes land (`at begin`, `at finish`)
+/// and the total, including the barriers (`SYNCHRONIZE CACHE`). Reported, not
+/// tightly asserted; the assertion pins the F2a property that matters most:
+/// begin and the data chunks write no metadata (see `ext4_deferred_alloc` for
+/// the byte-exact version of that claim).
+#[test]
+fn a_streamed_ext4_transfer_reports_where_its_device_commands_land() {
+    let _serial = WRITE_COST_TESTS.lock().unwrap();
+    const BS: usize = 4096;
+    const BLOCKS: usize = 16;
+
+    let dev = ScsiBlockDevice::open(MockUsbDrive::new(fixture("disks/gpt-luks.img")))
+        .expect("open the mock drive");
+    let table = partition::scan(&dev, 512).expect("gpt");
+    let part = table.luks_partitions().next().expect("a LUKS partition");
+    let header = luks::read_from(&dev, part.offset_bytes()).expect("header");
+    let volume = LuksVolume::open(
+        &dev,
+        part.offset_bytes(),
+        Some(part.size_bytes()),
+        &header,
+        PASSWORD,
+    )
+    .expect("unlock");
+    let mut fs = Ext4::mount(&volume).expect("mount");
+
+    let reset = |dev: &ScsiBlockDevice<MockUsbDrive>| {
+        let mut s = dev.transport().stats.borrow_mut();
+        s.commands = 0;
+        s.write_commands = 0;
+        s.read_commands = 0;
+        s.sync_commands = 0;
+    };
+    reset(&dev);
+
+    let data = vec![0x5Au8; BLOCKS * BS];
+    let mut w = fs.begin_file(data.len() as u64).expect("begin_file");
+    let at_begin = *dev.transport().stats.borrow();
+    for chunk in data.chunks(4 * BS) {
+        fs.write_chunk(&mut w, chunk).expect("write_chunk");
+    }
+    let after_chunks = *dev.transport().stats.borrow();
+    fs.finish_file(w, 2, "cost.bin", luks_core::fs::FileType::Regular)
+        .expect("finish_file");
+    fs.flush().expect("final flush");
+    let total = *dev.transport().stats.borrow();
+
+    let data_writes = after_chunks.write_commands - at_begin.write_commands;
+    let finish_writes = total.write_commands - after_chunks.write_commands;
+    let finish_syncs = total.sync_commands - after_chunks.sync_commands;
+    println!(
+        "transfer cost: at begin = {} write cmds, {} sync cmds",
+        at_begin.write_commands, at_begin.sync_commands
+    );
+    println!("transfer cost: data chunks = {data_writes} write cmds");
+    println!(
+        "transfer cost: finish_file + flush = {finish_writes} write cmds, {finish_syncs} sync cmds"
+    );
+    println!(
+        "transfer cost: total = {} write cmds, {} sync cmds, {} read cmds",
+        total.write_commands, total.sync_commands, total.read_commands
+    );
+
+    assert!(data_writes > 0, "vacuity: the chunks must reach the device");
+    assert_eq!(
+        fs.read_file("/cost.bin").expect("read back"),
+        data,
+        "the transferred file must read back"
+    );
+}

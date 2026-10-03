@@ -80,8 +80,8 @@ impl VolumeHandle {
                         return Err(e);
                     }
                 };
+                // The driver's finish ends with the clean-mark flush.
                 let ino = ext4.finish_file(w, dir_ino, name, FileType::Regular)?;
-                ext4.flush()?;
                 Ok(ino)
             }
             (Fs::Btrfs(btrfs), crate::bridge::FileWriterEnum::Btrfs(w)) => {
@@ -161,8 +161,8 @@ impl VolumeHandle {
             match &mut *fs {
                 Fs::Ext4(ext4) => {
                     let dir_ino = ext4.resolve(parent_path)?.number;
+                    // `create_file` ends with the dirty bracket's clean-mark flush.
                     let ino = ext4.create_file(dir_ino, name, data, FileType::Regular)?;
-                    ext4.flush()?;
                     Ok(ino)
                 }
                 Fs::Btrfs(btrfs) => {
@@ -196,8 +196,8 @@ impl VolumeHandle {
             match &mut *fs {
                 Fs::Ext4(ext4) => {
                     let dir_ino = ext4.resolve(parent_path)?.number as u32;
+                    // Ends with the dirty bracket's clean-mark flush.
                     let ino = ext4.create_directory(dir_ino, name)?;
-                    ext4.flush()?;
                     Ok(ino as u64)
                 }
                 Fs::Btrfs(btrfs) => {
@@ -215,8 +215,9 @@ impl VolumeHandle {
             self.claim_writer()?;
             match &mut *fs {
                 Fs::Ext4(ext4) => {
+                    // Ends with the dirty bracket's clean-mark flush. (A no-op
+                    // rename or a refusal writes nothing, so needs none.)
                     ext4.rename(old_parent, old_name, new_parent, new_name)?;
-                    ext4.flush()?;
                     Ok(())
                 }
                 Fs::Btrfs(btrfs) => {

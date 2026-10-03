@@ -460,6 +460,11 @@ path = "tests/ext4/ext4_writer_leak.rs"
 required-features = ["dangerous-write-support"]
 
 [[test]]
+name = "ext4_deferred_alloc"
+path = "tests/ext4/ext4_deferred_alloc.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
 name = "btrfs_batch_ack_durability"
 path = "tests/txn_batch/btrfs_batch_ack_durability.rs"
 required-features = ["dangerous-write-support"]

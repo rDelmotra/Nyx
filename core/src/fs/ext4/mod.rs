@@ -466,6 +466,20 @@ pub struct Ext4<D: ReadAt> {
     sb: Superblock,
     /// Every block group descriptor, parsed at mount.
     groups: Vec<GroupDesc>,
+    /// Blocks promised to open file writers (F2a deferred allocation). Memory
+    /// only: nothing on disk says these are taken until `finish_file`
+    /// publishes them, so every allocator in this crate must treat them as
+    /// used. Absolute block numbers. See [`alloc`].
+    #[cfg(feature = "dangerous-write-support")]
+    reserved_blocks: crate::fs::btrfs::write::IntervalSet,
+    /// Inodes promised to open file writers. Memory only, like
+    /// `reserved_blocks`.
+    #[cfg(feature = "dangerous-write-support")]
+    reserved_inodes: std::collections::BTreeSet<u64>,
+    /// Secondary failure of the last rollback that failed. See
+    /// [`Ext4::take_cleanup_failure`].
+    #[cfg(feature = "dangerous-write-support")]
+    cleanup_failure: Option<LuksError>,
 }
 
 impl<D: ReadAt> Ext4<D> {
@@ -502,6 +516,12 @@ impl<D: ReadAt> Ext4<D> {
             device,
             sb,
             groups,
+            #[cfg(feature = "dangerous-write-support")]
+            reserved_blocks: crate::fs::btrfs::write::IntervalSet::new(),
+            #[cfg(feature = "dangerous-write-support")]
+            reserved_inodes: std::collections::BTreeSet::new(),
+            #[cfg(feature = "dangerous-write-support")]
+            cleanup_failure: None,
         })
     }
 
@@ -541,14 +561,34 @@ impl<D: ReadAt> Ext4<D> {
         self.sb.uuid
     }
 
+    /// Blocks and inodes currently promised to open writers (always 0 in a
+    /// read-only build, which has no writers).
+    fn reserved_counts(&self) -> (u64, u64) {
+        #[cfg(feature = "dangerous-write-support")]
+        {
+            (
+                self.reserved_blocks.covered_within(0, u64::MAX),
+                self.reserved_inodes.len() as u64,
+            )
+        }
+        #[cfg(not(feature = "dangerous-write-support"))]
+        {
+            (0, 0)
+        }
+    }
+
     pub fn statfs(&self) -> Result<crate::fs::StatFs> {
         let bs = self.sb.block_size as u64;
         let total_bytes = self.sb.blocks_count * bs;
-        let free_bytes = self.sb.free_blocks_count * bs;
-        let available_blocks = self.sb.free_blocks_count.saturating_sub(self.sb.s_r_blocks_count);
+        // Space promised to open file writers is not free, even though it is
+        // still free on disk until they publish.
+        let (reserved_blocks, reserved_inodes) = self.reserved_counts();
+        let free_blocks = self.sb.free_blocks_count.saturating_sub(reserved_blocks);
+        let free_bytes = free_blocks * bs;
+        let available_blocks = free_blocks.saturating_sub(self.sb.s_r_blocks_count);
         let available_bytes = available_blocks * bs;
         let total_inodes = self.sb.inodes_count as u64;
-        let free_inodes = self.sb.free_inodes_count as u64;
+        let free_inodes = (self.sb.free_inodes_count as u64).saturating_sub(reserved_inodes);
         let block_size = self.sb.block_size;
 
         Ok(crate::fs::StatFs {
@@ -1209,30 +1249,38 @@ impl<D: WriteAt> Ext4<D> {
         // Phase 0: Collect extents (read-only)
         let (data_extents, index_extents) = self.collect_extents(&target_inode)?;
 
-        // Phase 1: Sever the name (1 disk write)
-        let removed_ino = self.unlink_file(parent_dir.number, name)?;
-        if removed_ino != target_inode.number {
-            return Err(LuksError::CorruptFs("unlinked inode number mismatch"));
-        }
+        // Phases 1-4 write, so they run inside the dirty bracket: a crash
+        // between "name severed" and "blocks freed" is a leak, and the fs says
+        // so instead of looking clean.
+        self.dirty_window(|fs| {
+            // Phase 1: Sever the name (1 disk write)
+            let removed_ino = fs
+                .unlink_file(parent_dir.number, name)
+                .map_err(alloc::Aborted::step)?;
+            if removed_ino != target_inode.number {
+                return Err(LuksError::CorruptFs("unlinked inode number mismatch").into());
+            }
 
-        // Phase 1b: a subdirectory's own ".." is what gave its parent the
-        // extra link `create_directory` bumped on the way in — removing the
-        // subdirectory has to give it back, or the parent's i_links_count
-        // only ever grows.
-        if target_is_dir {
-            self.patch_inode_links_count(parent_dir.number as u32, -1)?;
-        }
+            // Phase 1b: a subdirectory's own ".." is what gave its parent the
+            // extra link `create_directory` bumped on the way in — removing the
+            // subdirectory has to give it back, or the parent's i_links_count
+            // only ever grows.
+            if target_is_dir {
+                fs.patch_inode_links_count(parent_dir.number as u32, -1)?;
+            }
 
-        // Phase 2: Invalidate the Inode (1 disk write inside free_inode)
-        self.free_inode(target_inode.number, target_is_dir)?;
+            // Phase 2: Invalidate the Inode (1 disk write inside free_inode)
+            fs.free_inode(target_inode.number, target_is_dir)?;
 
-        // Phase 3: Return Blocks to the Free Pool
-        self.free_blocks(&data_extents)?;
-        if !index_extents.is_empty() {
-            self.free_blocks(&index_extents)?;
-        }
+            // Phase 3: Return Blocks to the Free Pool
+            fs.free_blocks(&data_extents)?;
+            if !index_extents.is_empty() {
+                fs.free_blocks(&index_extents)?;
+            }
 
-        // Phase 4: Flush
-        self.flush()
+            // Phase 4: Flush
+            fs.flush()?;
+            Ok(())
+        })
     }
 }

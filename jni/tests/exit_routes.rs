@@ -4,8 +4,9 @@
 //! cargo test -p luks_jni --features dangerous-write-support --test exit_routes -- --ignored
 //! ```
 //!
-//! Every test asserts the CORRECT behaviour and is `KNOWN-RED` on current
-//! code. Disk state is graded by the kernel oracle (`tools/verify-image.sh`,
+//! Every test asserts the CORRECT behaviour; those still `#[ignore]`d are
+//! `KNOWN-RED` on current code (see `tools/known-red.sh`). Disk state is
+//! graded by the kernel oracle (`tools/verify-image.sh`,
 //! real `e2fsck` / `btrfs check` in colima) after the volume is dropped and
 //! the image is re-opened from scratch, never by our own reader.
 #![cfg(feature = "dangerous-write-support")]
@@ -68,17 +69,17 @@ fn assert_kernel_clean(path: &str, what: &str) {
 }
 
 /// Sized ext4 writer with a partial chunk written: the inode and every data
-/// block are already marked used on disk.
+/// block are reserved in memory only (F2a), so nothing is marked used on disk.
 fn open_partial_writer(vol: &VolumeHandle) -> luks_jni::bridge::FileWriterEnum {
     let mut w = vol.begin_file(1 << 20).expect("begin");
     vol.write_file_chunk(&mut w, b"halfway there").expect("chunk");
     w
 }
 
-/// W3: abandon on a fenced session is refused before reaching the driver, so
-/// the inode and blocks allocated at begin time leak.
+/// W3: abandon on a fenced session is refused before reaching the driver. Green
+/// since F2a: the reservation is memory-only, so the refusal leaks nothing on
+/// disk. (F4 still owns making the bridge release it.)
 #[test]
-#[ignore = "KNOWN-RED W3: fixed by F4 (abandon must reach the driver when fenced)"]
 fn w3_abandon_after_fence_leaves_ext4_clean() {
     let path = scratch("gpt-luks.img", "w3");
     {
@@ -93,8 +94,8 @@ fn w3_abandon_after_fence_leaves_ext4_clean() {
 }
 
 /// W4: finish on a fenced session drops the writer without abandoning it.
+/// Green since F2a: the dropped reservation never reached the disk.
 #[test]
-#[ignore = "KNOWN-RED W4: fixed by F4 (finish error must abandon the writer)"]
 fn w4_finish_after_fence_leaves_ext4_clean() {
     let path = scratch("gpt-luks.img", "w4");
     {
@@ -108,9 +109,9 @@ fn w4_finish_after_fence_leaves_ext4_clean() {
     assert_kernel_clean(&path, "finish after fence");
 }
 
-/// W2: closing the volume with a writer still open abandons nothing.
+/// W2: closing the volume with a writer still open abandons nothing. Green
+/// since F2a: the reservation dies with the in-memory volume.
 #[test]
-#[ignore = "KNOWN-RED W2: fixed by F4 (volume close must own open writers)"]
 fn w2_drop_volume_with_open_writer_leaves_ext4_clean() {
     let path = scratch("gpt-luks.img", "w2");
     {

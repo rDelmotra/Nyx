@@ -58,6 +58,10 @@
 //! restructuring the existing, already-proven one-shot crash-safety suite.
 #![cfg(feature = "dangerous-write-support")]
 
+#[path = "../common/temp_guard.rs"]
+mod temp_guard;
+use temp_guard::{TempPath};
+
 #[path = "../common/mod.rs"]
 mod common;
 
@@ -86,7 +90,7 @@ fn fixture(name: &str) -> PathBuf {
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-fn copy_to_temp(src_name: &str, tag: &str) -> PathBuf {
+fn copy_to_temp(src_name: &str, tag: &str) -> TempPath {
     let src = fixture(src_name);
     let temp_dir = std::env::temp_dir();
     let count = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -100,7 +104,7 @@ fn copy_to_temp(src_name: &str, tag: &str) -> PathBuf {
             .as_nanos()
     ));
     fs::copy(&src, &dst).expect("copy fixture to temp");
-    dst
+    TempPath::new(dst)
 }
 
 fn run_verify_script(image_path: &Path) -> bool {
@@ -303,7 +307,7 @@ fn probe_streaming_write_counts(fixture_name: &str) -> (usize, usize) {
 // ---------------------------------------------------------------------
 
 struct InterruptedStreamingRun {
-    image_path: PathBuf,
+    image_path: TempPath,
     /// `true` only if every `write_chunk` call *and* `finish_file` returned
     /// `Ok`.
     commit_ok: bool,

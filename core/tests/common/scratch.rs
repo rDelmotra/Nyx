@@ -67,7 +67,7 @@ impl ScratchFixture {
             panic!("failed to copy fixture {:?} to {:?}: {}", src, dst, e)
         });
 
-        let keep_env = std::env::var("LUKS_KEEP_FAILED_SCRATCH")
+        let keep_env = std::env::var("LUKS_KEEP_SCRATCH").or_else(|_| std::env::var("LUKS_KEEP_FAILED_SCRATCH"))
             .map(|v| v == "1")
             .unwrap_or(false);
 
@@ -101,7 +101,7 @@ impl ScratchFixture {
         file.set_len(size_bytes)
             .unwrap_or_else(|e| panic!("failed to set empty scratch file length {:?}: {}", dst, e));
 
-        let keep_env = std::env::var("LUKS_KEEP_FAILED_SCRATCH")
+        let keep_env = std::env::var("LUKS_KEEP_SCRATCH").or_else(|_| std::env::var("LUKS_KEEP_FAILED_SCRATCH"))
             .map(|v| v == "1")
             .unwrap_or(false);
 

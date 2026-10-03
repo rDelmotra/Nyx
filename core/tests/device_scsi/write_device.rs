@@ -14,20 +14,24 @@
 //! at risk now that a writer exists.
 #![cfg(feature = "dangerous-write-support")]
 
+#[path = "../common/temp_guard.rs"]
+mod temp_guard;
+use temp_guard::{TempStr};
+
 use luks_core::device::{FileDevice, ReadAt, WriteAt};
 
 /// A private copy of a fixture, so a failing test cannot damage the original.
 ///
 /// Named after the test rather than randomly: a leftover file from a crashed
 /// run should be recognisable and overwritten by the next one, not accumulate.
-fn scratch(name: &str) -> String {
+fn scratch(name: &str) -> TempStr {
     let src = format!(
         "{}/../fixtures/disks/gpt-luks-btrfs.img",
         env!("CARGO_MANIFEST_DIR")
     );
     let dst = std::env::temp_dir().join(format!("luks-write-test-{name}.img"));
     std::fs::copy(&src, &dst).expect("copy the fixture to scratch");
-    dst.to_string_lossy().into_owned()
+    TempStr::new(dst.to_string_lossy().into_owned())
 }
 
 fn read(dev: &FileDevice, offset: u64, len: usize) -> Vec<u8> {

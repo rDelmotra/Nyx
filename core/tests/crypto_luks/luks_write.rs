@@ -21,6 +21,10 @@
 //! If it matches, the drive we write is a drive Linux can read.
 #![cfg(feature = "dangerous-write-support")]
 
+#[path = "../common/temp_guard.rs"]
+mod temp_guard;
+use temp_guard::{TempStr};
+
 use luks_core::device::{FileDevice, ReadAt};
 use luks_core::fs::MountedFs;
 use luks_core::luks::{self, LuksVolume};
@@ -35,10 +39,10 @@ fn fixture(name: &str) -> String {
 }
 
 /// A private copy, so a failing test cannot damage a committed fixture.
-fn scratch(name: &str, test: &str) -> String {
+fn scratch(name: &str, test: &str) -> TempStr {
     let dst = std::env::temp_dir().join(format!("luks-write-{test}-{name}"));
     std::fs::copy(fixture(name), &dst).expect("copy fixture to scratch");
-    dst.to_string_lossy().into_owned()
+    TempStr::new(dst.to_string_lossy().into_owned())
 }
 
 fn open(path: &str) -> (FileDevice, luks::Luks2Header) {

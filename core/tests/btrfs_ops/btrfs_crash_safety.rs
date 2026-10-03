@@ -31,6 +31,10 @@
 //! agree the interrupted image is fine.
 #![cfg(feature = "dangerous-write-support")]
 
+#[path = "../common/temp_guard.rs"]
+mod temp_guard;
+use temp_guard::{TempPath};
+
 #[path = "../common/mod.rs"]
 mod common;
 
@@ -61,7 +65,7 @@ fn fixture(name: &str) -> PathBuf {
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-fn copy_to_temp(src_name: &str, tag: &str) -> PathBuf {
+fn copy_to_temp(src_name: &str, tag: &str) -> TempPath {
     let src = fixture(src_name);
     let temp_dir = std::env::temp_dir();
     let count = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -75,7 +79,7 @@ fn copy_to_temp(src_name: &str, tag: &str) -> PathBuf {
             .as_nanos()
     ));
     fs::copy(&src, &dst).expect("copy fixture to temp");
-    dst
+    TempPath::new(dst)
 }
 
 fn run_verify_script(image_path: &Path) -> bool {
@@ -171,7 +175,7 @@ fn total_writes_for_commit(fixture_name: &str) -> usize {
 // ---------------------------------------------------------------------
 
 struct InterruptedRun {
-    image_path: PathBuf,
+    image_path: TempPath,
     /// What `create_file_with_data` returned.
     commit_ok: bool,
 }

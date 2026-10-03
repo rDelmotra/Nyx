@@ -12,6 +12,10 @@
 //! ```
 #![cfg(feature = "dangerous-write-support")]
 
+#[path = "../common/temp_guard.rs"]
+mod temp_guard;
+use temp_guard::{TempPath};
+
 #[path = "../common/mod.rs"]
 mod common;
 
@@ -32,11 +36,11 @@ const FIXTURES: [&str; 2] = ["big-4k.img", "csum-uuid-4k.img"];
 const STATE_OFFSET: u64 = 1024 + 0x3A;
 const VALID_FS: u16 = 0x0001;
 
-fn scratch(fixture: &str, tag: &str) -> PathBuf {
+fn scratch(fixture: &str, tag: &str) -> TempPath {
     let src = format!("{}/../fixtures/ext4/{fixture}", env!("CARGO_MANIFEST_DIR"));
     let dst = std::env::temp_dir().join(format!("ext4-f2a-{tag}-{}-{fixture}", std::process::id()));
     std::fs::copy(src, &dst).expect("copy fixture");
-    dst
+    TempPath::new(dst)
 }
 
 fn dev(path: &PathBuf) -> FileDevice {

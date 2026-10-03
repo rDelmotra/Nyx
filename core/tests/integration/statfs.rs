@@ -5,6 +5,10 @@
 //! ```
 #![cfg(feature = "dangerous-write-support")]
 
+#[path = "../common/temp_guard.rs"]
+mod temp_guard;
+use temp_guard::{TempStr};
+
 use luks_core::device::FileDevice;
 use luks_core::fs::btrfs::Btrfs;
 use luks_core::fs::ext4::Ext4;
@@ -18,16 +22,16 @@ fn btrfs_fixture(name: &str) -> String {
     format!("{}/../fixtures/btrfs/{name}", env!("CARGO_MANIFEST_DIR"))
 }
 
-fn ext4_scratch(name: &str, test: &str) -> String {
+fn ext4_scratch(name: &str, test: &str) -> TempStr {
     let dst = std::env::temp_dir().join(format!("ext4-statfs-{test}-{name}"));
     std::fs::copy(ext4_fixture(name), &dst).expect("copy ext4 fixture");
-    dst.to_string_lossy().into_owned()
+    TempStr::new(dst.to_string_lossy().into_owned())
 }
 
-fn btrfs_scratch(name: &str, test: &str) -> String {
+fn btrfs_scratch(name: &str, test: &str) -> TempStr {
     let dst = std::env::temp_dir().join(format!("btrfs-statfs-{test}-{name}"));
     std::fs::copy(btrfs_fixture(name), &dst).expect("copy btrfs fixture");
-    dst.to_string_lossy().into_owned()
+    TempStr::new(dst.to_string_lossy().into_owned())
 }
 
 fn open_ext4(path: &str) -> Ext4<FileDevice> {

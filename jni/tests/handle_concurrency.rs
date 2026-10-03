@@ -4,6 +4,11 @@
 //! `drop_device`, `drop_writer`) are thread-safe and never cause use-after-free,
 //! double-free, segfaults, or unhandled panics.
 
+#[path = "../../core/tests/common/temp_guard.rs"]
+mod temp_guard;
+#[cfg(feature = "dangerous-write-support")]
+use temp_guard::TempPath;
+
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -266,7 +271,9 @@ fn test_stress_heavy_registry_churn() {
 #[cfg(feature = "dangerous-write-support")]
 #[test]
 fn test_concurrent_writer_and_drop_volume_or_writer() {
-    let dst = std::env::temp_dir().join("luks-jni-concurrency-write.img");
+    let dst = TempPath::new(
+        std::env::temp_dir().join(format!("luks-jni-concurrency-write-{}.img", std::process::id())),
+    );
     std::fs::copy(fixture("disks/gpt-luks.img"), &dst).expect("copy fixture");
     let len = std::fs::metadata(&dst).expect("stat").len();
     let dev = FileDevice::open_writable(&dst, len).expect("open writable");

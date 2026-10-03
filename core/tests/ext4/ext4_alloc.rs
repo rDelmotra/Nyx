@@ -28,6 +28,10 @@
 //! run everywhere and are the ones that catch a mis-seeded checksum.
 #![cfg(feature = "dangerous-write-support")]
 
+#[path = "../common/temp_guard.rs"]
+mod temp_guard;
+use temp_guard::{TempStr};
+
 #[path = "../common/mod.rs"]
 mod common;
 
@@ -40,10 +44,10 @@ fn fixture(name: &str) -> String {
 }
 
 /// A private copy, so a failing test cannot damage a committed fixture.
-fn scratch(name: &str, test: &str) -> String {
+fn scratch(name: &str, test: &str) -> TempStr {
     let dst = std::env::temp_dir().join(format!("ext4-alloc-{test}-{name}"));
     std::fs::copy(fixture(name), &dst).expect("copy fixture");
-    dst.to_string_lossy().into_owned()
+    TempStr::new(dst.to_string_lossy().into_owned())
 }
 
 fn open(path: &str) -> Ext4<FileDevice> {

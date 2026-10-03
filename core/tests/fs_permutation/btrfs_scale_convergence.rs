@@ -5,6 +5,10 @@
 
 #![cfg(feature = "dangerous-write-support")]
 
+#[path = "../common/temp_guard.rs"]
+mod temp_guard;
+use temp_guard::TempPath;
+
 #[path = "../common/mod.rs"]
 mod common;
 
@@ -101,10 +105,10 @@ fn reset_61g_sparse_image(path: &Path) {
 
 #[test]
 fn test_scale_61g_medium_accounting_and_convergence_headroom() {
-    let img_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let img_path = TempPath::new(PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("target")
-        .join("test_sparse_61g.img");
+        .join("test_sparse_61g.img"));
 
     reset_61g_sparse_image(&img_path);
 
@@ -288,10 +292,10 @@ umount "$MNT"
 
 #[test]
 fn test_scale_4tb_metadata_massive_convergence() {
-    let img_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let img_path = TempPath::new(PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("target")
-        .join("test_sparse_4tb.img");
+        .join("test_sparse_4tb.img"));
 
     reset_4tb_sparse_image_aged(&img_path);
 
@@ -426,10 +430,10 @@ mkfs.btrfs -q -f "$IMG"
 
 #[test]
 fn test_scale_4tb_scalar_64bit_width() {
-    let img_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let img_path = TempPath::new(PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("target")
-        .join("test_sparse_4tb_scalars.img");
+        .join("test_sparse_4tb_scalars.img"));
 
     reset_4tb_sparse_image_fresh(&img_path);
 
@@ -499,10 +503,10 @@ fn test_scale_4tb_scalar_64bit_width() {
 
 #[test]
 fn test_scale_sys_chunk_array_threshold_refusal() {
-    let img_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let img_path = TempPath::new(PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("target")
-        .join("test_sparse_4tb_chunk_array.img");
+        .join("test_sparse_4tb_chunk_array.img"));
 
     reset_4tb_sparse_image_fresh(&img_path);
 

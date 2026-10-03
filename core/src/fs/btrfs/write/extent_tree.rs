@@ -1319,5 +1319,6 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
         pending_data,
         final_allocator: Some(allocator),
         new_chunks: Vec::new(),
+        final_dev_bytes_used: None,
     })
 }

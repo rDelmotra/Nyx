@@ -116,6 +116,12 @@ pub struct Btrfs<D: ReadAt> {
     pub(crate) active_batch: Option<write::Batch>,
     #[cfg(feature = "dangerous-write-support")]
     pub(crate) has_open_writer: bool,
+    /// Set when a commit failed after its first superblock write was attempted:
+    /// the disk may already hold that generation. Until a retry of the same
+    /// (unchanged) batch succeeds, or the batch is discarded, no new write may
+    /// begin (see `write::commit`, M1).
+    #[cfg(feature = "dangerous-write-support")]
+    pub(crate) commit_pending: bool,
     #[cfg(feature = "dangerous-write-support")]
     pub(crate) statfs_cache: std::sync::Mutex<Option<crate::fs::StatFs>>,
 }
@@ -165,6 +171,8 @@ impl<D: ReadAt> Btrfs<D> {
             active_batch: None,
             #[cfg(feature = "dangerous-write-support")]
             has_open_writer: false,
+            #[cfg(feature = "dangerous-write-support")]
+            commit_pending: false,
             #[cfg(feature = "dangerous-write-support")]
             statfs_cache: std::sync::Mutex::new(None),
         };

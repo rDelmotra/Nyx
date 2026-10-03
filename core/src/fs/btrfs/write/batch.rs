@@ -30,15 +30,25 @@ use crate::fs::btrfs::{Btrfs, Node};
 /// extent cap, `BTRFS_MAX_EXTENT_SIZE`).
 const MAX_MERGED_EXTENT: u64 = 128 * 1024 * 1024;
 
-/// Merge runs that are consecutive in file order and contiguous on disk.
-pub(crate) fn merge_adjacent_runs(runs: &[(u64, u64)]) -> Vec<(u64, u64)> {
+/// Merge runs that are consecutive in file order and contiguous on disk, but
+/// never across a block-group boundary: `data_groups` is the `(start, end)` of
+/// every block group. Data groups are logically adjacent (`next_logical`
+/// appends each new chunk), so a run ending at one group's end can touch the
+/// next group's first run. An extent spanning two groups cannot be freed
+/// (`free_data` needs one containing group) and is accounted to only one (H1).
+pub(crate) fn merge_adjacent_runs(runs: &[(u64, u64)], groups: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let group_of = |b: u64| groups.iter().position(|&(s, e)| b >= s && b < e);
     let mut out: Vec<(u64, u64)> = Vec::with_capacity(runs.len());
     for &(bytenr, len) in runs {
         if len == 0 {
             continue;
         }
         if let Some(last) = out.last_mut() {
-            if last.0.checked_add(last.1) == Some(bytenr) && last.1 + len <= MAX_MERGED_EXTENT {
+            if last.0.checked_add(last.1) == Some(bytenr)
+                && last.1 + len <= MAX_MERGED_EXTENT
+                && group_of(last.0).is_some()
+                && group_of(last.0) == group_of(bytenr)
+            {
                 last.1 += len;
                 continue;
             }
@@ -646,7 +656,13 @@ impl Batch {
         // extent-tree item. The reservation ledger and allocator above were
         // updated per original run, so releasing the writer's `data_runs`
         // still matches what was recorded.
-        let merged_runs = merge_adjacent_runs(data_runs);
+        let groups: Vec<(u64, u64)> = self
+            .allocator
+            .block_groups
+            .iter()
+            .map(|bg| (bg.block_group.start, bg.block_group.start + bg.block_group.length))
+            .collect();
+        let merged_runs = merge_adjacent_runs(data_runs, &groups);
         for &(bytenr, run_len) in &merged_runs {
             if run_len > 0 {
                 let extent_data_key = Key::new(new_ino, EXTENT_DATA_KEY, file_offset);
@@ -848,5 +864,20 @@ impl Batch {
             self.data_extents_to_add,
             Vec::new(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_adjacent_runs;
+
+    #[test]
+    fn merge_stops_at_block_group_boundary() {
+        let groups = [(0, 1000), (1000, 2000)];
+        // Adjacent inside group 0: merged. Adjacent across 1000: not.
+        let runs = [(0, 300), (300, 700), (1000, 200), (1200, 100)];
+        assert_eq!(merge_adjacent_runs(&runs, &groups), vec![(0, 1000), (1000, 300)]);
+        // Run outside every group is never merged.
+        assert_eq!(merge_adjacent_runs(&[(5000, 10), (5010, 10)], &groups), vec![(5000, 10), (5010, 10)]);
     }
 }

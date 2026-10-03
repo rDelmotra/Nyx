@@ -12,6 +12,10 @@
 //! 3. `btrfs scrub start -Bdr` (verifying all data sector checksums and DUP mirrors)
 #![cfg(feature = "dangerous-write-support")]
 
+#[path = "../common/temp_guard.rs"]
+mod temp_guard;
+use temp_guard::{TempPath};
+
 #[path = "../common/mod.rs"]
 mod common;
 
@@ -35,7 +39,7 @@ fn fixture(name: &str) -> PathBuf {
 
 static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn copy_to_temp(src_name: &str) -> PathBuf {
+fn copy_to_temp(src_name: &str) -> TempPath {
     let src = fixture(src_name);
     let temp_dir = std::env::temp_dir();
     let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -49,7 +53,7 @@ fn copy_to_temp(src_name: &str) -> PathBuf {
             .as_nanos()
     ));
     fs::copy(&src, &dst).expect("copy fixture to temp");
-    dst
+    TempPath::new(dst)
 }
 
 fn run_verify_script(image_path: &PathBuf) -> bool {

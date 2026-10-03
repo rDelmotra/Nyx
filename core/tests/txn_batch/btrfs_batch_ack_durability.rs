@@ -9,6 +9,10 @@
 //! same `commit_and_rearm` path a >2 s tree import hits.
 #![cfg(feature = "dangerous-write-support")]
 
+#[path = "../common/temp_guard.rs"]
+mod temp_guard;
+use temp_guard::{TempPath};
+
 #[path = "../common/mod.rs"]
 mod common;
 
@@ -22,11 +26,11 @@ use std::sync::atomic::Ordering;
 const SB_MIRROR0: u64 = 0x1_0000;
 const SB_GENERATION_OFF: u64 = 72;
 
-fn scratch(tag: &str) -> PathBuf {
+fn scratch(tag: &str) -> TempPath {
     let src = format!("{}/../fixtures/btrfs/plain.img", env!("CARGO_MANIFEST_DIR"));
     let dst = std::env::temp_dir().join(format!("btrfs-ack-{tag}-{}.img", std::process::id()));
     std::fs::copy(src, &dst).expect("copy fixture");
-    dst
+    TempPath::new(dst)
 }
 
 fn dev(path: &PathBuf) -> FileDevice {

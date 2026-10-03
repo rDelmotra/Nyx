@@ -25,6 +25,10 @@
 // The oracle gate is a single implementation shared with `core/tests/`, not a
 // second copy of the same logic — see `core/tests/common/oracle.rs` for why
 // that duplication was the bug in the first place.
+#[path = "../../core/tests/common/temp_guard.rs"]
+mod temp_guard;
+use temp_guard::{TempStr};
+
 #[path = "../../core/tests/common/oracle.rs"]
 mod oracle;
 
@@ -43,10 +47,10 @@ fn fixture(rel: &str) -> String {
 }
 
 /// A private copy, so one test's writes cannot be another's starting state.
-fn scratch(test: &str) -> String {
+fn scratch(test: &str) -> TempStr {
     let dst = std::env::temp_dir().join(format!("luks-jni-write-{test}.img"));
     std::fs::copy(fixture("disks/gpt-luks.img"), &dst).expect("copy fixture");
-    dst.to_string_lossy().into_owned()
+    TempStr::new(dst.to_string_lossy().into_owned())
 }
 
 /// The colima VM holds the only real kernel here. By default a down oracle
@@ -766,10 +770,10 @@ fn a_file_deleted_through_the_bridge_is_gone_and_e2fsck_clean() {
 // --- btrfs through the same bridge (Pass G) ---------------------------------
 
 /// A private btrfs copy, mirroring `scratch` for the ext4 fixture above.
-fn scratch_btrfs(test: &str) -> String {
+fn scratch_btrfs(test: &str) -> TempStr {
     let dst = std::env::temp_dir().join(format!("luks-jni-write-btrfs-{test}.img"));
     std::fs::copy(fixture("disks/gpt-luks-btrfs.img"), &dst).expect("copy fixture");
-    dst.to_string_lossy().into_owned()
+    TempStr::new(dst.to_string_lossy().into_owned())
 }
 
 #[test]

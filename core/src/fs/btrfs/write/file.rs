@@ -67,6 +67,10 @@ impl BtrfsFileWriter {
 
 impl<D: ReadAt + WriteAt> Btrfs<D> {
     pub fn begin_file(&mut self, size: u64) -> Result<BtrfsFileWriter> {
+        if self.commit_pending {
+            // M1: a commit is in doubt; only its retry (or a discard) is allowed.
+            return Err(LuksError::WriterBusy);
+        }
         gate::check_writeable_fs(self.superblock())?;
         gate::check_writeable_subvolume(&self.fs_tree())?;
 
@@ -179,6 +183,10 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
     /// from existing free space. If free space is exhausted, `write_chunk`
     /// returns `FilesystemFull` (Valve A).
     pub fn begin_file_streaming(&mut self) -> Result<BtrfsFileWriter> {
+        if self.commit_pending {
+            // M1: a commit is in doubt; only its retry (or a discard) is allowed.
+            return Err(LuksError::WriterBusy);
+        }
         gate::check_writeable_fs(self.superblock())?;
         gate::check_writeable_subvolume(&self.fs_tree())?;
 

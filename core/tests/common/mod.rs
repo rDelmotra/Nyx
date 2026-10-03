@@ -14,6 +14,7 @@ pub mod oracle;
 pub mod btree_validator;
 pub mod mem_device;
 pub mod scratch;
+pub mod temp_guard;
 #[cfg(feature = "dangerous-write-support")]
 pub mod fail_after;
 #[cfg(feature = "dangerous-write-support")]

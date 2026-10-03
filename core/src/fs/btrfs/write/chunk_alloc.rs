@@ -298,6 +298,7 @@ pub fn allocate_data_chunk_transaction_excluding<D: ReadAt>(
 
     // 4a. Update DEV_ITEM in CHUNK_TREE: bytes_used += alloc_len
     let dev_item_key = Key::new(DEV_ITEMS_OBJECTID, DEV_ITEM_KEY, devid);
+    let mut chunk_tree_dev_used = 0u64;
     let chunk_res1 = cow_tree_mutate(
         fs,
         &pending_blocks,
@@ -320,6 +321,7 @@ pub fn allocate_data_chunk_transaction_excluding<D: ReadAt>(
                 .checked_add(alloc_len)
                 .ok_or(LuksError::CorruptFs("dev item bytes_used overflow"))?;
             data[0x10..0x18].copy_from_slice(&new_used.to_le_bytes());
+            chunk_tree_dev_used = new_used;
             Ok(())
         },
     )?;
@@ -441,6 +443,7 @@ pub fn allocate_data_chunk_transaction_excluding<D: ReadAt>(
     )?;
 
     txn.new_chunks = vec![new_chunk.clone()];
+    txn.final_dev_bytes_used = Some(chunk_tree_dev_used);
     Ok((txn, new_chunk))
 }
 

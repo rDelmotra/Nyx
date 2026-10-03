@@ -64,6 +64,26 @@ pub fn commit_transaction_ref<D: WriteAt>(
     fs: &mut Btrfs<D>,
     txn: &Transaction,
 ) -> std::result::Result<(), CommitError> {
+    match commit_transaction_inner(fs, txn) {
+        Ok(()) => {
+            fs.commit_pending = false;
+            Ok(())
+        }
+        Err(e) => {
+            // M1: the disk may hold this generation. Refuse new writes until the
+            // identical commit is retried (or the batch discarded).
+            if e.superblock_write_started {
+                fs.commit_pending = true;
+            }
+            Err(e)
+        }
+    }
+}
+
+fn commit_transaction_inner<D: WriteAt>(
+    fs: &mut Btrfs<D>,
+    txn: &Transaction,
+) -> std::result::Result<(), CommitError> {
     // Read raw superblock copy #0 as a template.
     let mut template = vec![0u8; SUPER_SIZE];
     fs.device().read_at(SUPER_OFFSETS[0], &mut template)?;
@@ -128,15 +148,13 @@ pub fn commit_transaction_ref<D: WriteAt>(
         new_sb.chunk_root_generation = txn.new_generation;
     }
     new_sb.bytes_used = txn.final_bytes_used;
-    // B5: the superblock's embedded dev_item.bytes_used follows the chunk
-    // tree's DEV_ITEM, which a chunk allocation grows by the stripe length on
-    // this device (btrfs-progs `check_super_dev_item` compares the two).
-    let new_dev_bytes: u64 = txn
-        .new_chunks
-        .iter()
-        .flat_map(|c| c.stripes.iter().filter(|st| st.devid == new_sb.dev_id).map(move |_| c.length))
-        .sum();
-    new_sb.dev_bytes_used = new_sb.dev_bytes_used.saturating_add(new_dev_bytes);
+    // B5/M2: the superblock's embedded dev_item.bytes_used is made equal to the
+    // chunk tree's DEV_ITEM value this transaction wrote (absolute, so a skew
+    // left by an older build is healed); btrfs-progs `check_super_dev_item`
+    // compares the two.
+    if let Some(used) = txn.final_dev_bytes_used {
+        new_sb.dev_bytes_used = used;
+    }
     // Keep compat_ro_flags consistent with the emitted Free Space Tree.
 
     // Write superblock mirrors.

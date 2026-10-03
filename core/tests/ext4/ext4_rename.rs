@@ -5,6 +5,10 @@
 //! ```
 #![cfg(feature = "dangerous-write-support")]
 
+#[path = "../common/temp_guard.rs"]
+mod temp_guard;
+use temp_guard::{TempStr};
+
 #[path = "../common/mod.rs"]
 mod common;
 
@@ -23,10 +27,10 @@ fn fixture(name: &str) -> String {
     format!("{}/../fixtures/ext4/{name}", env!("CARGO_MANIFEST_DIR"))
 }
 
-fn scratch(name: &str, test: &str) -> String {
+fn scratch(name: &str, test: &str) -> TempStr {
     let dst = std::env::temp_dir().join(format!("ext4-rename-{test}-{name}"));
     std::fs::copy(fixture(name), &dst).expect("copy fixture");
-    dst.to_string_lossy().into_owned()
+    TempStr::new(dst.to_string_lossy().into_owned())
 }
 
 fn open(path: &str) -> Ext4<FileDevice> {
@@ -284,4 +288,63 @@ fn w15_rename_over_existing_never_loses_the_destination_name() {
             violations.join("\n")
         );
     }
+}
+
+/// Logs every write and flush in order, passing them through.
+struct OpLog {
+    inner: FileDevice,
+    ops: std::sync::Mutex<Vec<(char, u64)>>,
+}
+
+impl luks_core::device::ReadAt for OpLog {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> luks_core::error::Result<()> {
+        self.inner.read_at(offset, buf)
+    }
+    fn len(&self) -> Option<u64> {
+        self.inner.len()
+    }
+}
+
+impl luks_core::device::WriteAt for OpLog {
+    fn write_at(&self, offset: u64, buf: &[u8]) -> luks_core::error::Result<()> {
+        self.ops.lock().expect("log").push(('W', offset));
+        self.inner.write_at(offset, buf)
+    }
+    fn flush(&self) -> luks_core::error::Result<()> {
+        self.ops.lock().expect("log").push(('F', 0));
+        self.inner.flush()
+    }
+}
+
+/// W15 barriers (reordering-cache sensitivity): a flush must separate the
+/// destination retarget, the old-name unlink, and the first write that frees
+/// the replaced inode. Without them a reordering cache can land the frees (or
+/// the unlink) ahead of the link, and a crash loses a file the sweep above
+/// (which models in-order writes only) cannot see. Verified to FAIL with the
+/// flushes removed.
+#[test]
+fn w15_rename_flushes_between_link_unlink_and_free() {
+    let base = scratch("big-4k.img", "w15-order");
+    let (dst_ino_off, len) = {
+        let mut fs = open(&base);
+        fs.create_file(2, "src.bin", &[1u8; 5000], FileType::Regular).expect("src");
+        fs.create_file(2, "dst.bin", &[2u8; 5000], FileType::Regular).expect("dst");
+        fs.flush().expect("flush");
+        let ino = fs.resolve("/dst.bin").expect("dst").number;
+        (fs.test_inode_offset(ino).expect("offset"), std::fs::metadata(&*base).expect("stat").len())
+    };
+    let dev = OpLog { inner: FileDevice::open_writable(&*base, len).expect("open"), ops: Default::default() };
+    let mut fs = Ext4::mount(dev).expect("mount");
+    fs.rename_file(2, "src.bin", "dst.bin").expect("rename");
+    let ops = fs.device_mut().ops.lock().expect("log").clone();
+
+    let zero = ops.iter().position(|&(k, o)| k == 'W' && o == dst_ino_off).expect("the replaced inode record is zeroed");
+    // The two directory-block writes are the writes just before the zeroing.
+    let writes: Vec<usize> = (0..zero).filter(|&i| ops[i].0 == 'W').collect();
+    assert!(writes.len() >= 2, "vacuity: expected retarget and unlink writes before the free");
+    let (retarget, unlink) = (writes[writes.len() - 2], writes[writes.len() - 1]);
+    assert_eq!(ops[retarget].1, ops[unlink].1, "retarget and unlink both rewrite the same directory block");
+    let flush_between = |a: usize, b: usize| ops[a + 1..b].iter().any(|&(k, _)| k == 'F');
+    assert!(flush_between(retarget, unlink), "no flush between the retarget and the old-name unlink: {ops:?}");
+    assert!(flush_between(unlink, zero), "no flush between the old-name unlink and freeing the replaced inode: {ops:?}");
 }

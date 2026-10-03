@@ -16,6 +16,10 @@
 //!    all four fixture images.
 #![cfg(feature = "dangerous-write-support")]
 
+#[path = "../common/temp_guard.rs"]
+mod temp_guard;
+use temp_guard::TempPath;
+
 use luks_core::device::FileDevice;
 use luks_core::fs::btrfs::crc32c::crc32c;
 use luks_core::fs::btrfs::write::alloc::{read_free_space_tree, FreeSpaceMap};
@@ -53,7 +57,9 @@ fn mount_patched(test: &str, patch: impl Fn(&mut [u8])) -> Btrfs<FileDevice> {
     sb[0..4].copy_from_slice(&csum.to_le_bytes());
 
     let dst = std::env::temp_dir().join(format!("luks-btrfs-gate-{test}.img"));
+    let dst = TempPath::new(dst);
     std::fs::write(&dst, &img).expect("write scratch");
+    // The device holds an open fd; unlinking on guard drop is safe.
     Btrfs::mount(FileDevice::open(&dst).expect("open")).expect("mount")
 }
 

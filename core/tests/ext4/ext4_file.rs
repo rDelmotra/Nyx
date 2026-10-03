@@ -23,6 +23,10 @@
 //! the inode fields themselves.
 #![cfg(feature = "dangerous-write-support")]
 
+#[path = "../common/temp_guard.rs"]
+mod temp_guard;
+use temp_guard::{TempStr};
+
 #[path = "../common/mod.rs"]
 mod common;
 
@@ -35,10 +39,10 @@ fn fixture(name: &str) -> String {
     format!("{}/../fixtures/ext4/{name}", env!("CARGO_MANIFEST_DIR"))
 }
 
-fn scratch(name: &str, test: &str) -> String {
+fn scratch(name: &str, test: &str) -> TempStr {
     let dst = std::env::temp_dir().join(format!("ext4-file-{test}-{name}"));
     std::fs::copy(fixture(name), &dst).expect("copy fixture");
-    dst.to_string_lossy().into_owned()
+    TempStr::new(dst.to_string_lossy().into_owned())
 }
 
 fn open(path: &str) -> Ext4<FileDevice> {

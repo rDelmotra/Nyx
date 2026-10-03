@@ -107,35 +107,42 @@ impl IntervalSet {
             None => return,
         };
 
-        let mut new_intervals = Vec::new();
-        for (s, e) in self.intervals.drain(..) {
-            if e <= start || s >= end {
-                new_intervals.push((s, e));
-            } else {
-                if s < start {
-                    new_intervals.push((s, start));
-                }
-                if e > end {
-                    new_intervals.push((end, e));
-                }
+        // O(log n + k) in both structures: binary-search the affected window
+        // and splice, never rebuild (a rebuild per release made releasing N
+        // runs O(N^2): 375 s for 32k runs, measured 2026-10-04).
+        let lo = self.intervals.partition_point(|&(_, e)| e <= start);
+        let hi = self.intervals.partition_point(|&(s, _)| s < end);
+        if lo < hi {
+            let mut pieces = Vec::with_capacity(2);
+            let (first_s, _) = self.intervals[lo];
+            let (_, last_e) = self.intervals[hi - 1];
+            if first_s < start {
+                pieces.push((first_s, start));
             }
+            if last_e > end {
+                pieces.push((end, last_e));
+            }
+            self.intervals.splice(lo..hi, pieces);
         }
-        self.intervals = new_intervals;
 
-        let mut new_parts = std::collections::BTreeMap::new();
-        for (&s, &e) in &self.parts {
-            if e <= start || s >= end {
-                new_parts.insert(s, e);
-            } else {
-                if s < start {
-                    new_parts.insert(s, start);
-                }
-                if e > end {
-                    new_parts.insert(end, e);
-                }
+        // `parts` is disjoint and sorted, so ends are sorted too: walk back from
+        // the last part starting before `end` while it still reaches past `start`.
+        let hit: Vec<(u64, u64)> = self
+            .parts
+            .range(..end)
+            .rev()
+            .take_while(|&(_, &e)| e > start)
+            .map(|(&s, &e)| (s, e))
+            .collect();
+        for (s, e) in hit {
+            self.parts.remove(&s);
+            if s < start {
+                self.parts.insert(s, start);
+            }
+            if e > end {
+                self.parts.insert(end, e);
             }
         }
-        self.parts = new_parts;
     }
 
     /// Check if `[start, start + length)` is wholly enclosed within a single interval in the set.
@@ -336,6 +343,39 @@ mod tests {
         assert!(!set.remove_exact(100, 50), "double release of the first range");
         assert_eq!(set.intervals(), &[(150, 200)]);
         assert!(set.remove_exact(150, 50));
+        assert!(set.is_empty());
+    }
+
+    /// H2: releasing N runs one by one must not be O(N^2). 32k adjacent runs is
+    /// a 4 GiB stream written in 128 KiB steps; `abandon_file` releases each.
+    #[test]
+    fn test_interval_set_release_32k_runs_is_fast() {
+        const N: u64 = 32 * 1024;
+        const LEN: u64 = 128 * 1024;
+        let mut set = IntervalSet::new();
+        for i in 0..N {
+            assert!(set.insert(i * LEN, LEN));
+        }
+        assert_eq!(set.intervals(), &[(0, N * LEN)], "adjacent inserts merge");
+        let t = std::time::Instant::now();
+        for i in 0..N {
+            assert!(set.remove_exact(i * LEN, LEN), "run {i}");
+        }
+        let el = t.elapsed();
+        eprintln!("release of {N} runs took {el:?}");
+        assert!(set.is_empty());
+        assert!(el < std::time::Duration::from_millis(500), "release took {el:?}");
+    }
+
+    #[test]
+    fn test_interval_set_remove_splits_parts_and_intervals() {
+        let mut set = IntervalSet::new();
+        set.insert(100, 100);
+        set.insert(200, 100); // merged [100,300), parts [100,200) [200,300)
+        set.remove(150, 100); // [150,250) out
+        assert_eq!(set.intervals(), &[(100, 150), (250, 300)]);
+        assert!(set.remove_exact(100, 50), "left remainder is now exactly [100,150)");
+        assert!(set.remove_exact(250, 50));
         assert!(set.is_empty());
     }
 }

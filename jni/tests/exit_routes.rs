@@ -11,6 +11,10 @@
 //! the image is re-opened from scratch, never by our own reader.
 #![cfg(feature = "dangerous-write-support")]
 
+#[path = "../../core/tests/common/temp_guard.rs"]
+mod temp_guard;
+use temp_guard::{TempStr};
+
 #[path = "../../core/tests/common/oracle.rs"]
 mod oracle;
 
@@ -23,11 +27,11 @@ use std::process::Command;
 
 const PASSWORD: &[u8] = b"test";
 
-fn scratch(fixture: &str, test: &str) -> String {
+fn scratch(fixture: &str, test: &str) -> TempStr {
     let src = format!("{}/../fixtures/disks/{fixture}", env!("CARGO_MANIFEST_DIR"));
     let dst = std::env::temp_dir().join(format!("luks-jni-exit-{test}.img"));
     std::fs::copy(src, &dst).expect("copy fixture");
-    dst.to_string_lossy().into_owned()
+    TempStr::new(dst.to_string_lossy().into_owned())
 }
 
 fn unlock(path: &str) -> VolumeHandle {

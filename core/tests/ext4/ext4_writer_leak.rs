@@ -15,6 +15,10 @@
 //! ```
 #![cfg(feature = "dangerous-write-support")]
 
+#[path = "../common/temp_guard.rs"]
+mod temp_guard;
+use temp_guard::{TempPath};
+
 #[path = "../common/mod.rs"]
 mod common;
 
@@ -33,11 +37,11 @@ const FIXTURE: &str = "big-4k.img";
 const BLOCKS: usize = 64;
 const BS: usize = 4096;
 
-fn scratch(tag: &str) -> PathBuf {
+fn scratch(tag: &str) -> TempPath {
     let src = format!("{}/../fixtures/ext4/{FIXTURE}", env!("CARGO_MANIFEST_DIR"));
     let dst = std::env::temp_dir().join(format!("ext4-leak-{tag}-{}.img", std::process::id()));
     std::fs::copy(src, &dst).expect("copy fixture");
-    dst
+    TempPath::new(dst)
 }
 
 fn dev(path: &PathBuf) -> FileDevice {

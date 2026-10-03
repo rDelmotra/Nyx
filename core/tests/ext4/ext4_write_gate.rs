@@ -12,6 +12,10 @@
 //! these tests will fail loudly here rather than silently weaken.
 #![cfg(feature = "dangerous-write-support")]
 
+#[path = "../common/temp_guard.rs"]
+mod temp_guard;
+use temp_guard::TempPath;
+
 use luks_core::device::FileDevice;
 use luks_core::fs::ext4::Ext4;
 use luks_core::fs::FileType;
@@ -28,6 +32,7 @@ fn mount_patched(test: &str, patch: impl Fn(&mut Vec<u8>)) -> Ext4<FileDevice> {
     patch(&mut img);
 
     let dst = std::env::temp_dir().join(format!("luks-write-gate-{test}.img"));
+    let dst = TempPath::new(dst);
     std::fs::write(&dst, &img).expect("write scratch");
     let len = img.len() as u64;
     Ext4::mount(FileDevice::open_writable(&dst, len).expect("open writable")).expect("mount")

@@ -52,4 +52,7 @@ pub struct Transaction {
     /// through them, but the live chunk map only learns them after the commit
     /// succeeded (B4).
     pub new_chunks: Vec<crate::fs::btrfs::chunk::Chunk>,
+    /// The chunk tree's DEV_ITEM `bytes_used` as written by this transaction
+    /// (absolute). The commit stores it in the superblock's embedded dev_item.
+    pub final_dev_bytes_used: Option<u64>,
 }

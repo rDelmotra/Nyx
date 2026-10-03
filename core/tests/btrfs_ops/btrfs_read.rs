@@ -21,6 +21,10 @@
 //! Regenerate with `tools/gen-btrfs-fixtures.sh` (needs Linux — see the header
 //! of that script).
 
+#[path = "../common/temp_guard.rs"]
+mod temp_guard;
+use temp_guard::TempPath;
+
 use luks_core::device::{FileDevice, ReadAt};
 use luks_core::error::LuksError;
 use luks_core::fs::btrfs::{crc32c::crc32c, superblock::Superblock, CsumType, ExtentKind, Key, Node};
@@ -1851,6 +1855,7 @@ fn a_single_corrupted_byte_of_file_data_is_caught() {
     // one path, and this test deletes it on the way out.
     let corrupt = std::env::temp_dir()
         .join(format!("luks-btrfs-corrupt-{}.img", std::process::id()));
+    let corrupt = TempPath::new(corrupt);
     std::fs::write(&corrupt, &image).unwrap();
 
     let fs = Btrfs::mount(FileDevice::open(&corrupt).unwrap()).expect("still mounts");

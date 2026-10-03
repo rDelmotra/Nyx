@@ -1198,6 +1198,12 @@ impl<D: WriteAt> Ext4<D> {
                     ));
                 }
 
+                // Barrier: the retarget must be durable BEFORE the old name is
+                // removed. Under a reordering write cache the unlink could
+                // land alone, and a crash would leave the old destination
+                // under the destination name with the source unreachable.
+                fs.flush()?;
+
                 // Remove the old name. Now both names point at the source
                 // (its link count is 1, so a crash here is an e2fsck
                 // ref-count fix, and the replaced inode a leak).
@@ -1214,6 +1220,13 @@ impl<D: WriteAt> Ext4<D> {
                         "unlinked old inode number mismatch",
                     )));
                 }
+
+                // Barrier: the new link (and the removal of the old name) must
+                // be durable BEFORE the replaced file's inode and blocks are
+                // freed. Under a reordering cache the frees could land first,
+                // and a crash would leave the destination name pointing at a
+                // freed inode whose blocks another file may then claim.
+                fs.flush()?;
 
                 // Only now release the replaced file: inode first (zeroed,
                 // then cleared), then its blocks, so an interruption leaves

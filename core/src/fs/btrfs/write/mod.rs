@@ -53,6 +53,11 @@ impl<D: WriteAt> Btrfs<D> {
                 "attempted to commit active batch while a file writer is open",
             ));
         }
+        if self.commit_pending && self.active_batch.is_none() {
+            // A non-batch commit is in doubt and cannot be replayed from here;
+            // only `discard_active_batch` (fence/teardown) clears it.
+            return Err(LuksError::WriterBusy);
+        }
         if let Some(mut batch) = self.active_batch.take() {
             if batch.has_uncommitted_files() {
                 // Non-destructive (D2/N7/N14): on failure the batch, with
@@ -88,6 +93,7 @@ impl<D: WriteAt> Btrfs<D> {
     /// filesystem `btrfs check` rejects.
     pub fn discard_active_batch(&mut self) -> bool {
         self.has_open_writer = false;
+        self.commit_pending = false;
         self.active_batch.take().is_some()
     }
 

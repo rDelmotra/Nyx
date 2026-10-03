@@ -754,6 +754,29 @@ impl<D: WriteAt> Ext4<D> {
             return Ok(());
         }
         let seed = Seed::for_writing(&self.sb)?;
+        let plan = self.plan_free_blocks(extents)?;
+        for (g, bm, freed) in &plan {
+            self.groups[*g].free_blocks_count += *freed;
+            self.groups[*g].flags &= !crate::fs::ext4::BG_BLOCK_UNINIT;
+            self.sb.free_blocks_count += *freed as u64;
+            self.write_bitmap(*g, Bitmap::Block, bm, &seed)?;
+            self.write_group_desc(*g, &seed)?;
+        }
+        self.write_superblock(&seed)
+    }
+
+    /// Everything [`free_blocks`](Self::free_blocks) can refuse, with nothing
+    /// written: the write gate, every bound, every double free (also across
+    /// the batch), and every bitmap read. A caller that is about to do
+    /// something irreversible first (delete removes the name) runs this, so a
+    /// refusal costs nothing.
+    pub(super) fn check_free_blocks(&self, extents: &[Extent]) -> Result<()> {
+        Seed::for_writing(&self.sb)?;
+        self.plan_free_blocks(extents).map(|_| ())
+    }
+
+    /// The dirty bitmaps (group, bitmap, bits cleared) a free would write.
+    fn plan_free_blocks(&self, extents: &[Extent]) -> Result<Vec<(usize, Vec<u8>, u32)>> {
         let per = self.sb.blocks_per_group as u64;
         let first = self.sb.first_data_block as u64;
 
@@ -784,15 +807,7 @@ impl<D: WriteAt> Ext4<D> {
                 plan[slot].2 += 1;
             }
         }
-
-        for (g, bm, freed) in &plan {
-            self.groups[*g].free_blocks_count += *freed;
-            self.groups[*g].flags &= !crate::fs::ext4::BG_BLOCK_UNINIT;
-            self.sb.free_blocks_count += *freed as u64;
-            self.write_bitmap(*g, Bitmap::Block, bm, &seed)?;
-            self.write_group_desc(*g, &seed)?;
-        }
-        self.write_superblock(&seed)
+        Ok(plan)
     }
 
     /// Release a single block previously allocated.
@@ -1082,15 +1097,10 @@ impl<D: WriteAt> Ext4<D> {
         }
     }
 
-    /// Release an inode. `was_dir` must match what it was allocated as, or the
-    /// directory count drifts.
-    ///
-    /// `itable_unused` is intentionally *not* restored. It is a lower bound on
-    /// how much of the inode table has ever been touched, and growing it again
-    /// would tell `e2fsck` to skip inodes beyond this one that may still be in
-    /// use. The kernel leaves it alone for the same reason.
-    pub fn free_inode(&mut self, ino: u64, was_dir: bool) -> Result<()> {
-        let seed = Seed::for_writing(&self.sb)?;
+    /// Everything [`free_inode`](Self::free_inode) can refuse before it
+    /// writes: range, group, uninit, double free, record offset. Returns the
+    /// group, the bit and the bitmap as read.
+    fn plan_free_inode(&self, ino: u64) -> Result<(usize, usize, Vec<u8>)> {
         let per = self.sb.inodes_per_group as u64;
 
         if ino < self.sb.first_ino as u64 || ino > self.sb.inodes_count as u64 {
@@ -1121,10 +1131,33 @@ impl<D: WriteAt> Ext4<D> {
             ));
         }
 
-        let mut bm = self.read_bitmap(g, Bitmap::Inode)?;
+        let bm = self.read_bitmap(g, Bitmap::Inode)?;
         if !test_bit(&bm, bit) {
             return Err(LuksError::CorruptFs("double free of an inode"));
         }
+        // The record write below needs a valid offset; find out now.
+        self.inode_offset(ino)?;
+        Ok((g, bit, bm))
+
+    }
+
+    /// [`plan_free_inode`](Self::plan_free_inode) for callers that only want
+    /// the verdict, with nothing written (see [`check_free_blocks`](Self::check_free_blocks)).
+    pub(super) fn check_free_inode(&self, ino: u64) -> Result<()> {
+        Seed::for_writing(&self.sb)?;
+        self.plan_free_inode(ino).map(|_| ())
+    }
+
+    /// Release an inode. `was_dir` must match what it was allocated as, or the
+    /// directory count drifts.
+    ///
+    /// `itable_unused` is intentionally *not* restored. It is a lower bound on
+    /// how much of the inode table has ever been touched, and growing it again
+    /// would tell `e2fsck` to skip inodes beyond this one that may still be in
+    /// use. The kernel leaves it alone for the same reason.
+    pub fn free_inode(&mut self, ino: u64, was_dir: bool) -> Result<()> {
+        let seed = Seed::for_writing(&self.sb)?;
+        let (g, bit, mut bm) = self.plan_free_inode(ino)?;
 
         // Clearing the bitmap bit does not, on its own, make an inode free.
         // `e2fsck` walks the inode *table* independently of the bitmap, and a

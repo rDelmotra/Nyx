@@ -1104,8 +1104,10 @@ impl<D: WriteAt> Ext4<D> {
     /// Refuses directory renames (`UnsupportedFsFeature`), cross-directory renames
     /// (`UnsupportedFsFeature`), and non-regular file renames.
     ///
-    /// If `new_name` exists and is a regular file, unlinks and frees the destination
-    /// before linking `old_name` under `new_name`.
+    /// If `new_name` exists and is a regular file, its directory entry is
+    /// retargeted in place to the source inode (one write, the name never
+    /// absent), then the old name is removed, and only then is the replaced
+    /// file's inode and blocks freed.
     pub fn rename_file(&mut self, dir_ino: u32, old_name: &str, new_name: &str) -> Result<()> {
         let _seed = Seed::for_writing(&self.sb)?;
 
@@ -1170,24 +1172,59 @@ impl<D: WriteAt> Ext4<D> {
             dest = Some((dest_ino, data_extents, index_extents));
         }
 
+        // Validate everything that can fail on the replaced destination while
+        // nothing has been written (W15): its extents, every block bound and
+        // double free, and the inode's own free.
+        if let Some((dest_ino, data_extents, index_extents)) = &mut dest {
+            data_extents.extend(index_extents.drain(..));
+            self.check_free_blocks(data_extents)?;
+            self.check_free_inode(*dest_ino)?;
+        }
+
         self.dirty_window(|fs| {
-            // Delete destination file completely
-            if let Some((dest_ino, data_extents, index_extents)) = &dest {
-                let removed_ino = fs.unlink_file(dir_ino as u64, new_name).map_err(Aborted::step)?;
-                if removed_ino != *dest_ino {
+            if let Some((dest_ino, all_extents, _)) = &dest {
+                // The destination name flips to the source inode in ONE
+                // directory-block write, as Linux does. It is never absent:
+                // before the write it reads the old file, after it the new.
+                let was = fs
+                    .retarget_entry(dir_ino as u64, new_name, old_ino, FileType::Regular)
+                    .map_err(Aborted::step)?;
+                if was != *dest_ino {
+                    // Nothing is written yet that matters, but the entry is
+                    // not what we planned for: put it back.
+                    return Err(Aborted::after_undo(
+                        LuksError::CorruptFs("retargeted dest inode number mismatch"),
+                        || fs.retarget_entry(dir_ino as u64, new_name, was, FileType::Regular).map(|_| ()),
+                    ));
+                }
+
+                // Remove the old name. Now both names point at the source
+                // (its link count is 1, so a crash here is an e2fsck
+                // ref-count fix, and the replaced inode a leak).
+                let removed_ino = match fs.unlink_file(dir_ino as u64, old_name) {
+                    Ok(i) => i,
+                    Err(e) => {
+                        return Err(Aborted::after_undo(e, || {
+                            fs.retarget_entry(dir_ino as u64, new_name, *dest_ino, FileType::Regular).map(|_| ())
+                        }))
+                    }
+                };
+                if removed_ino != old_ino {
                     return Err(Aborted::from(LuksError::CorruptFs(
-                        "unlinked dest inode number mismatch",
+                        "unlinked old inode number mismatch",
                     )));
                 }
+
+                // Only now release the replaced file: inode first (zeroed,
+                // then cleared), then its blocks, so an interruption leaves
+                // a leak and never a live inode over free blocks.
                 fs.free_inode(*dest_ino, false)?;
-                fs.free_blocks(data_extents)?;
-                if !index_extents.is_empty() {
-                    fs.free_blocks(index_extents)?;
-                }
+                fs.free_blocks(all_extents)?;
                 fs.flush()?;
+                return Ok(());
             }
 
-            // Unlink old name
+            // No destination: unlink the old name, then link the new one.
             let removed_ino = fs.unlink_file(dir_ino as u64, old_name).map_err(Aborted::step)?;
             if removed_ino != old_ino {
                 return Err(Aborted::from(LuksError::CorruptFs(

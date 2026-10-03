@@ -90,6 +90,14 @@ impl Seed {
     ///   into is the high half of a 16-bit `name_len` there.
     /// * missing `extents`: the extent-mapped inodes this crate writes are
     ///   invalid on an indirect-block filesystem (ext2/ext3).
+    /// * `mmp`, `casefold`, `orphan_present`, `project` quota,
+    ///   the read-only compat flag, `shared_blocks` and a non-zero
+    ///   `s_last_orphan`: state or semantics this crate neither honours nor
+    ///   maintains (bit values: see the constants in `mod.rs`). The
+    ///   `orphan_file` feature on its own is **not** refused: mke2fs 1.47 sets
+    ///   it by default (the `big-4k`/`small-1k` fixtures carry it), and with
+    ///   `orphan_present` clear the orphan file is empty, so a writer that
+    ///   never creates orphans leaves it consistent.
     /// * `quota`: hidden quota inodes must be updated in step with every
     ///   allocation, which this crate does not do.
     /// * a dirty or errored `s_state`: the metadata being patched cannot be
@@ -121,6 +129,27 @@ impl Seed {
         }
         if sb.feature_ro_compat & super::RO_COMPAT_QUOTA != 0 {
             return refuse("quota tracking");
+        }
+        if sb.feature_incompat & super::INCOMPAT_MMP != 0 {
+            return refuse("multi-mount protection (mmp)");
+        }
+        if sb.feature_incompat & super::INCOMPAT_CASEFOLD != 0 {
+            return refuse("casefold (case-insensitive names)");
+        }
+        if sb.feature_ro_compat & super::RO_COMPAT_ORPHAN_PRESENT != 0 {
+            return refuse("orphan_present (orphan file in use)");
+        }
+        if sb.feature_ro_compat & super::RO_COMPAT_PROJECT != 0 {
+            return refuse("project quota");
+        }
+        if sb.feature_ro_compat & super::RO_COMPAT_READONLY != 0 {
+            return refuse("a filesystem carrying the read-only compat flag");
+        }
+        if sb.feature_ro_compat & super::RO_COMPAT_SHARED_BLOCKS != 0 {
+            return refuse("shared_blocks");
+        }
+        if sb.last_orphan != 0 {
+            return refuse("a pending orphan inode list (s_last_orphan) — run e2fsck");
         }
         if sb.state & super::STATE_CLEANLY_UNMOUNTED == 0 {
             return refuse("a filesystem that was not cleanly unmounted");

@@ -263,6 +263,62 @@ impl<D: WriteAt> Ext4<D> {
         Err(LuksError::NotFound(name.to_string()))
     }
 
+    /// Point the existing entry `name` in `dir_ino` at `new_ino`, in place:
+    /// one directory-block write, the name never absent. This is how rename
+    /// replaces a destination (as Linux does): the name flips from the old
+    /// inode to the new one in a single write, so no crash can leave it
+    /// pointing at nothing. Returns the inode it pointed at before.
+    ///
+    /// Same refusals as [`unlink_file`](Self::unlink_file) (htree, inline).
+    pub(super) fn retarget_entry(
+        &mut self,
+        dir_ino: u64,
+        name: &str,
+        new_ino: u64,
+        file_type: FileType,
+    ) -> Result<u64> {
+        let seed = Seed::for_writing(&self.sb)?;
+        let name_bytes = name.as_bytes();
+        validate_name(name_bytes)?;
+
+        let dir = self.read_inode(dir_ino)?;
+        if !dir.file_type().is_dir() {
+            return Err(LuksError::NotADirectory(format!("inode {dir_ino}")));
+        }
+        if dir.flags & INODE_FL_INDEX != 0 {
+            return Err(LuksError::UnsupportedFsFeature(
+                "modifying a hash-indexed (htree) directory".into(),
+            ));
+        }
+        if dir.is_inline() {
+            return Err(LuksError::UnsupportedFsFeature(
+                "modifying an inline_data directory".into(),
+            ));
+        }
+
+        let bs = self.sb.block_size as usize;
+        let usable = if seed.enabled() { bs - DIR_TAIL_SIZE } else { bs };
+
+        let blocks = dir.size.div_ceil(bs as u64);
+        for lblock in 0..blocks {
+            let Some(phys) = self.map_block(&dir, lblock)? else {
+                continue;
+            };
+            let at = self.metadata_block_offset(phys)?;
+            let mut block = vec![0u8; bs];
+            self.device.read_at(at, &mut block)?;
+
+            if let Some(old_ino) = retarget_in_block(&mut block, usable, name_bytes, new_ino, file_type) {
+                if let Some(csum) = seed.dir_block(dir_ino, dir.generation, &block) {
+                    put32(&mut block, bs - 4, csum);
+                }
+                self.device.write_at(at, &block)?;
+                return Ok(old_ino);
+            }
+        }
+        Err(LuksError::NotFound(name.to_string()))
+    }
+
     /// Whether `name` already exists in `dir`. Creating a duplicate would give
     /// the directory two records with one name, and which one a lookup finds
     /// depends on scan order.
@@ -389,6 +445,36 @@ fn insert_into_block(
         pos += rec_len;
     }
     Ok(false)
+}
+
+/// Rewrite the inode and type of the live record called `name`. Nothing else
+/// about the record (length, name, padding) changes.
+fn retarget_in_block(
+    block: &mut [u8],
+    usable: usize,
+    name: &[u8],
+    new_ino: u64,
+    file_type: FileType,
+) -> Option<u64> {
+    let mut pos = 0usize;
+    while pos + DIRENT_HEADER <= usable {
+        let cur_ino = u32le(block, pos);
+        let rec_len = u16le(block, pos + 4) as usize;
+        if rec_len < DIRENT_HEADER || !rec_len.is_multiple_of(4) || pos + rec_len > usable {
+            break;
+        }
+        let name_len = block[pos + 6] as usize;
+        if cur_ino != 0
+            && pos + DIRENT_HEADER + name_len <= usable
+            && &block[pos + DIRENT_HEADER..pos + DIRENT_HEADER + name_len] == name
+        {
+            put32(block, pos, new_ino as u32);
+            block[pos + 7] = type_code(file_type);
+            return Some(cur_ino as u64);
+        }
+        pos += rec_len;
+    }
+    None
 }
 
 fn remove_from_block(

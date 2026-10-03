@@ -71,6 +71,32 @@ const STATE_CLEANLY_UNMOUNTED: u16 = 0x0001;
 /// The kernel saw errors on this filesystem. `e2fsck` gets it first.
 const STATE_ERRORS_SEEN: u16 = 0x0002;
 
+// Write-gate bits. Values are from the kernel's ext4.h as mirrored by
+// e2fsprogs 1.47.4 `ext2fs/ext2_fs.h` (checked with offsetof/#define on this
+// machine; the kernel header itself is not present).
+// (`EXT4_FEATURE_COMPAT_ORPHAN_FILE` = 0x1000 is deliberately NOT a gate bit:
+// it is on by default in mke2fs 1.47; only a non-empty orphan file,
+// `ORPHAN_PRESENT` below, matters.)
+/// `EXT4_FEATURE_INCOMPAT_MMP`: multi-mount protection; another host may have
+/// the filesystem mounted.
+const INCOMPAT_MMP: u32 = 0x0100;
+/// `EXT4_FEATURE_INCOMPAT_CASEFOLD`: case-insensitive names, so `find_entry`'s
+/// byte compare disagrees with the kernel's duplicate rules.
+const INCOMPAT_CASEFOLD: u32 = 0x2_0000;
+/// `EXT4_FEATURE_RO_COMPAT_READONLY`: the filesystem asks not to be written.
+const RO_COMPAT_READONLY: u32 = 0x1000;
+/// `EXT4_FEATURE_RO_COMPAT_PROJECT`: project quota, same hazard as `QUOTA`.
+const RO_COMPAT_PROJECT: u32 = 0x2000;
+/// `EXT4_FEATURE_RO_COMPAT_SHARED_BLOCKS`: blocks shared between inodes;
+/// freeing one would free it for the others.
+const RO_COMPAT_SHARED_BLOCKS: u32 = 0x4000;
+/// `EXT4_FEATURE_RO_COMPAT_ORPHAN_PRESENT`: the orphan file is non-empty;
+/// inodes are pending cleanup that a writer would stomp on.
+const RO_COMPAT_ORPHAN_PRESENT: u32 = 0x1_0000;
+/// `s_last_orphan` offset in the superblock (`offsetof(struct ext2_super_block,
+/// s_last_orphan)` = 0xE8).
+const SB_LAST_ORPHAN: usize = 0xE8;
+
 // s_feature_ro_compat bits
 /// Group descriptors carry a crc16 and bitmaps may be lazily initialised.
 const RO_COMPAT_GDT_CSUM: u32 = 0x0010;
@@ -107,6 +133,14 @@ pub const BG_BLOCK_UNINIT: u16 = 0x0002;
 const INODE_FL_EXTENTS: u32 = 0x0008_0000;
 const INODE_FL_INLINE_DATA: u32 = 0x1000_0000;
 
+/// A directory entry whose inode could not be read during a listing.
+#[derive(Debug)]
+pub struct UnreadableEntry {
+    pub name: String,
+    pub inode: u64,
+    pub error: LuksError,
+}
+
 fn u16le(b: &[u8], o: usize) -> u16 {
     u16::from_le_bytes([b[o], b[o + 1]])
 }
@@ -125,8 +159,12 @@ pub struct Superblock {
     pub blocks_per_group: u32,
     pub inodes_per_group: u32,
     pub inode_size: u16,
+    pub feature_compat: u32,
     pub feature_incompat: u32,
     pub feature_ro_compat: u32,
+    /// `s_last_orphan` (0xE8): head of the orphan inode list. Non-zero means
+    /// inodes are pending truncate/delete that a writer would stomp on.
+    pub last_orphan: u32,
     pub desc_size: u16,
     pub uuid: [u8; 16],
     pub volume_name: String,
@@ -246,8 +284,10 @@ impl Superblock {
             blocks_per_group,
             inodes_per_group,
             inode_size,
+            feature_compat,
             feature_incompat,
             feature_ro_compat,
+            last_orphan: u32le(b, SB_LAST_ORPHAN),
             desc_size,
             uuid,
             volume_name,
@@ -463,6 +503,9 @@ impl Inode {
 /// [`crate::luks::LuksVolume`].
 pub struct Ext4<D: ReadAt> {
     device: D,
+    /// Listing entries whose inode could not be read, over the life of this
+    /// mount. See [`Ext4::listing_read_errors`].
+    listing_read_errors: std::sync::atomic::AtomicU64,
     sb: Superblock,
     /// Every block group descriptor, parsed at mount.
     groups: Vec<GroupDesc>,
@@ -514,6 +557,7 @@ impl<D: ReadAt> Ext4<D> {
         let groups = Self::read_group_descriptors(&device, &sb)?;
         Ok(Ext4 {
             device,
+            listing_read_errors: std::sync::atomic::AtomicU64::new(0),
             sb,
             groups,
             #[cfg(feature = "dangerous-write-support")]
@@ -962,15 +1006,36 @@ impl<D: ReadAt> Ext4<D> {
 
     /// List a directory. `.` and `..` are omitted; callers browsing a tree
     /// never want them, and navigation uses paths rather than those entries.
+    ///
+    /// An entry whose inode cannot be read is still listed (size and mtime 0),
+    /// but never silently: it is counted in [`listing_read_errors`](Self::listing_read_errors).
+    /// [`list_dir_checked`](Self::list_dir_checked) returns the details.
     pub fn list_dir(&self, path: &str) -> Result<Vec<DirEntry>> {
+        let (entries, _unreadable) = self.list_dir_checked(path)?;
+        Ok(entries)
+    }
+
+    /// [`list_dir`](Self::list_dir) plus the entries whose inode read failed
+    /// (a dangling or corrupt entry), with the error for each.
+    pub fn list_dir_checked(&self, path: &str) -> Result<(Vec<DirEntry>, Vec<UnreadableEntry>)> {
         let inode = self.resolve(path)?;
         if !inode.file_type().is_dir() {
             return Err(LuksError::NotADirectory(path.to_string()));
         }
-        self.list_inode(&inode)
+        let mut unreadable = Vec::new();
+        let entries = self.list_inode(&inode, &mut unreadable)?;
+        self.listing_read_errors
+            .fetch_add(unreadable.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok((entries, unreadable))
     }
 
-    fn list_inode(&self, inode: &Inode) -> Result<Vec<DirEntry>> {
+    /// How many directory entries, across every listing on this mount, could
+    /// not have their inode read and so showed size 0 and mtime 0.
+    pub fn listing_read_errors(&self) -> u64 {
+        self.listing_read_errors.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn list_inode(&self, inode: &Inode, unreadable: &mut Vec<UnreadableEntry>) -> Result<Vec<DirEntry>> {
         let has_filetype = self.sb.feature_incompat & INCOMPAT_FILETYPE != 0;
         let bs = self.sb.block_size as usize;
         let mut out = Vec::new();
@@ -1001,8 +1066,19 @@ impl<D: ReadAt> Ext4<D> {
                     // feature, since the size/mtime read doubles as the type
                     // fallback below. A read failure (a dangling or corrupt
                     // entry) degrades to zero/Unknown rather than failing the
-                    // whole listing.
-                    let full = self.read_inode(ino).ok();
+                    // whole listing, and is reported in `unreadable`.
+                    let full = match self.read_inode(ino) {
+                        Ok(i) => Some(i),
+                        Err(error) => {
+                            let end = (pos + 8 + block_buf[pos + 6] as usize).min(bs);
+                            unreadable.push(UnreadableEntry {
+                                name: String::from_utf8_lossy(&block_buf[(pos + 8).min(end)..end]).into_owned(),
+                                inode: ino,
+                                error,
+                            });
+                            None
+                        }
+                    };
                     let file_type = if has_filetype {
                         match block_buf[pos + 7] {
                             1 => FileType::Regular,
@@ -1109,7 +1185,9 @@ impl<D: ReadAt> Ext4<D> {
                 return Err(LuksError::NotADirectory(format!("/{}", walked.join("/"))));
             }
 
-            let entries = self.list_inode(&current)?;
+            // Path resolution needs names and inode numbers only; size/mtime
+            // decoration failures are irrelevant here and reported by listings.
+            let entries = self.list_inode(&current, &mut Vec::new())?;
             let found = entries
                 .iter()
                 .find(|e| e.name == *component)
@@ -1159,7 +1237,7 @@ impl<D: WriteAt> Ext4<D> {
     /// same shape as deleting each child by hand, so a mid-tree failure (a
     /// hardlinked file, an indirect-block-mapped file our writer refuses)
     /// leaves exactly what it would if a caller had stopped there themselves.
-    /// Follows the Phase 0–4 ordering: collect -> sever name -> zero inode -> free blocks -> flush.
+    /// Follows the Phase 0–4 ordering: collect and validate everything -> sever name -> zero inode -> free blocks -> flush.
     pub fn delete_file(&mut self, path: &str) -> Result<()> {
         // `.` and `..` are never real stored entries (`list_inode` filters
         // both), but `resolve`/`resolve_no_follow` silently collapse them
@@ -1246,8 +1324,19 @@ impl<D: WriteAt> Ext4<D> {
             ));
         }
 
-        // Phase 0: Collect extents (read-only)
+        // Phase 0: collect the extents and validate EVERYTHING that can fail
+        // (read-only, so every refusal here writes nothing and leaves the fs
+        // clean, W14): the extent tree, every block bound and double free,
+        // the inode's own free, and the parent's link count. Only then does
+        // anything destructive start.
         let (data_extents, index_extents) = self.collect_extents(&target_inode)?;
+        let mut all_extents = data_extents;
+        all_extents.extend(index_extents);
+        self.check_free_blocks(&all_extents)?;
+        self.check_free_inode(target_inode.number)?;
+        if target_is_dir && self.read_inode(parent_dir.number)?.links == 0 {
+            return Err(LuksError::CorruptFs("inode links count underflow/overflow"));
+        }
 
         // Phases 1-4 write, so they run inside the dirty bracket: a crash
         // between "name severed" and "blocks freed" is a leak, and the fs says
@@ -1269,14 +1358,16 @@ impl<D: WriteAt> Ext4<D> {
                 fs.patch_inode_links_count(parent_dir.number as u32, -1)?;
             }
 
-            // Phase 2: Invalidate the Inode (1 disk write inside free_inode)
+            // Phase 2: zero the inode record, then clear its bitmap bit. The
+            // inode goes BEFORE its blocks on purpose: interrupted between
+            // the two, the blocks are merely marked used with no owner (a
+            // leak, the only state e2fsck calls leak-class). The other order
+            // leaves a live, unattached inode pointing at blocks the bitmap
+            // calls free, which e2fsck reports as a `+` difference.
             fs.free_inode(target_inode.number, target_is_dir)?;
 
-            // Phase 3: Return Blocks to the Free Pool
-            fs.free_blocks(&data_extents)?;
-            if !index_extents.is_empty() {
-                fs.free_blocks(&index_extents)?;
-            }
+            // Phase 3: Return Blocks to the Free Pool (already validated)
+            fs.free_blocks(&all_extents)?;
 
             // Phase 4: Flush
             fs.flush()?;

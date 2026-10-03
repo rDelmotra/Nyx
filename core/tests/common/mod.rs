@@ -446,3 +446,78 @@ pub fn fixture(rel: &str) -> Vec<u8> {
     let path = format!("{}/../fixtures/{rel}", env!("CARGO_MANIFEST_DIR"));
     std::fs::read(&path).unwrap_or_else(|e| panic!("missing fixture {path}: {e}"))
 }
+
+/// One way a bridge can hand back a wrapper that BOT section 6.5 calls
+/// invalid or not meaningful, armed on [`TamperTransport`].
+#[derive(Clone, Copy, Debug)]
+pub enum Tamper {
+    /// The next 13-byte CSW read comes back with a corrupted signature.
+    BadCswSignature,
+    /// ... with a tag that is not the command's.
+    CswTagMismatch,
+    /// ... with a reserved bCSWStatus value.
+    ReservedCswStatus,
+    /// The next 31-byte CBW write reports one byte fewer than it was given.
+    ShortCbwWrite,
+}
+
+/// Wraps a transport, corrupts exactly one wrapper when armed, and counts how
+/// many BOT resets the layer above issued. Everything else passes through.
+pub struct TamperTransport<T> {
+    pub inner: T,
+    armed: std::cell::Cell<Option<Tamper>>,
+    pub resets: std::cell::Cell<usize>,
+}
+
+impl<T> TamperTransport<T> {
+    pub fn new(inner: T) -> Self {
+        Self {
+            inner,
+            armed: std::cell::Cell::new(None),
+            resets: std::cell::Cell::new(0),
+        }
+    }
+
+    pub fn arm(&self, t: Tamper) {
+        self.armed.set(Some(t));
+    }
+}
+
+impl<T: BulkTransport> BulkTransport for TamperTransport<T> {
+    fn write(&self, data: &[u8]) -> Result<usize> {
+        if data.len() == CBW_LEN && matches!(self.armed.get(), Some(Tamper::ShortCbwWrite)) {
+            // The device never saw a complete CBW, so it starts no command;
+            // the inner drive is not told at all.
+            self.armed.set(None);
+            return Ok(CBW_LEN - 1);
+        }
+        self.inner.write(data)
+    }
+
+    fn read(&self, buf: &mut [u8]) -> Result<usize> {
+        let n = self.inner.read(buf)?;
+        if buf.len() == CSW_LEN && n == CSW_LEN {
+            match self.armed.get() {
+                Some(Tamper::BadCswSignature) => buf[0] ^= 0xFF,
+                Some(Tamper::CswTagMismatch) => buf[4] ^= 0xFF,
+                Some(Tamper::ReservedCswStatus) => buf[12] = 0x7F,
+                _ => return Ok(n),
+            }
+            self.armed.set(None);
+        }
+        Ok(n)
+    }
+
+    fn max_transfer(&self) -> usize {
+        self.inner.max_transfer()
+    }
+
+    fn clear_halt(&self, endpoint_in: bool) -> Result<()> {
+        self.inner.clear_halt(endpoint_in)
+    }
+
+    fn reset(&self) -> Result<()> {
+        self.resets.set(self.resets.get() + 1);
+        self.inner.reset()
+    }
+}

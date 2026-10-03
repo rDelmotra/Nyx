@@ -388,6 +388,97 @@ fn a_clean_transfer_never_touches_reset() {
     assert_eq!(dev.transport().reset_count.get(), 0);
 }
 
+/// F1.3 (register T2): BOT 6.3 / 6.5 says a CSW that is not valid (bad
+/// signature, wrong tag) or not meaningful (reserved status), and a CBW the
+/// device did not take in full, put the pipe in an unknown phase; only reset
+/// recovery makes the next command safe. Each case must reset exactly once and
+/// still report the original failure.
+#[test]
+fn invalid_csw_or_short_cbw_triggers_reset_recovery() {
+    use common::{Tamper, TamperTransport};
+    let cases = [
+        (Tamper::BadCswSignature, "bad CSW signature"),
+        (Tamper::CswTagMismatch, "CSW tag mismatch"),
+        (Tamper::ReservedCswStatus, "reserved CSW status"),
+        (Tamper::ShortCbwWrite, "short CBW write"),
+    ];
+    assert!(!cases.is_empty(), "vacuity: no cases");
+    for (tamper, why) in cases {
+        let dev = ScsiBlockDevice::open(TamperTransport::new(MockUsbDrive::new(vec![0u8; 1024 * 1024])))
+            .unwrap();
+        assert_eq!(dev.transport().resets.get(), 0, "open must not reset");
+
+        dev.transport().arm(tamper);
+        let err = dev.test_unit_ready().expect_err("the tampered wrapper is an error");
+        assert!(
+            matches!(err, LuksError::ScsiProtocol(m) if m == why),
+            "{tamper:?}: wrong error: {err}"
+        );
+        assert_eq!(dev.transport().resets.get(), 1, "{tamper:?}: must reset exactly once");
+
+        // Control: the next, untampered command works and does not reset again.
+        dev.test_unit_ready().expect("pipe usable after recovery");
+        assert_eq!(dev.transport().resets.get(), 1, "{tamper:?}: clean command reset again");
+    }
+}
+
+/// Fails the next CBW write with a given errno, and optionally makes the BOT
+/// reset that follows fail as well.
+struct ErrnoTransport<T> {
+    inner: T,
+    fail_next_write_with: std::cell::Cell<Option<i32>>,
+    /// If set, the BOT reset fails with this errno.
+    reset_errno: Option<i32>,
+}
+
+impl<T: luks_core::usb::BulkTransport> luks_core::usb::BulkTransport for ErrnoTransport<T> {
+    fn write(&self, data: &[u8]) -> Result<usize, LuksError> {
+        if let Some(errno) = self.fail_next_write_with.take() {
+            return Err(LuksError::usb_errno(errno, "injected"));
+        }
+        self.inner.write(data)
+    }
+    fn read(&self, buf: &mut [u8]) -> Result<usize, LuksError> {
+        self.inner.read(buf)
+    }
+    fn max_transfer(&self) -> usize {
+        self.inner.max_transfer()
+    }
+    fn reset(&self) -> Result<(), LuksError> {
+        if let Some(errno) = self.reset_errno {
+            return Err(LuksError::usb_errno(errno, "reset failed"));
+        }
+        self.inner.reset()
+    }
+}
+
+/// F1.2 / R3: how the BOT reset's own outcome classifies the failure.
+#[test]
+fn the_reset_outcome_decides_disconnect_and_the_original_error_stays_primary() {
+    // (injected errno, errno the reset fails with, expected is_disconnected)
+    let cases = [
+        (71, None, false),      // EPROTO, reset fine: a glitch
+        (71, Some(110), true),  // EPROTO, reset also fails: gone
+        (110, Some(110), false), // timeout, reset times out: not provably gone
+        (110, Some(19), true),  // timeout, reset says ENODEV: gone
+    ];
+    for (errno, reset_errno, expect_gone) in cases {
+        let dev = ScsiBlockDevice::open(ErrnoTransport {
+            inner: MockUsbDrive::new(vec![0u8; 1024 * 1024]),
+            fail_next_write_with: std::cell::Cell::new(None),
+            reset_errno,
+        })
+        .unwrap();
+        dev.transport().fail_next_write_with.set(Some(errno));
+        let err = dev.test_unit_ready().expect_err("injected failure");
+        assert!(
+            matches!(err, LuksError::UsbErrno { errno: e, .. } if e == errno),
+            "the original error must be what the caller sees: {err}"
+        );
+        assert_eq!(err.is_disconnected(), expect_gone, "errno {errno} reset {reset_errno:?}: {err:?}");
+    }
+}
+
 #[test]
 fn guid_formatting_uses_mixed_endian_order() {
     // GPT stores the first three fields little-endian; printing must undo that.

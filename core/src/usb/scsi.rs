@@ -256,6 +256,26 @@ fn parse_caching_page_wce(mode_sense_6: bool, data: &[u8]) -> Option<bool> {
     Some(page[2] & 0x04 != 0)
 }
 
+/// The LBA and block count of a READ/WRITE(10/16) CDB, for the forensic ring.
+/// `(None, None)` for every other command, and for a CDB too short to hold the
+/// fields (the CBW encoder is what rejects that; this must not panic first).
+fn cdb_extent(cdb: &[u8]) -> (Option<u64>, Option<u32>) {
+    match cdb.first() {
+        // WRITE(10)/(16) are 0x2A/0x8A; their constants exist only in write builds.
+        Some(&(OP_READ_10 | 0x2A)) if cdb.len() >= 9 => (
+            Some(u32::from_be_bytes([cdb[2], cdb[3], cdb[4], cdb[5]]) as u64),
+            Some(u16::from_be_bytes([cdb[7], cdb[8]]) as u32),
+        ),
+        Some(&(OP_READ_16 | 0x8A)) if cdb.len() >= 14 => (
+            Some(u64::from_be_bytes([
+                cdb[2], cdb[3], cdb[4], cdb[5], cdb[6], cdb[7], cdb[8], cdb[9],
+            ])),
+            Some(u32::from_be_bytes([cdb[10], cdb[11], cdb[12], cdb[13]])),
+        ),
+        _ => (None, None),
+    }
+}
+
 /// A USB mass storage device presented as random-access bytes.
 pub struct ScsiBlockDevice<T: BulkTransport> {
     transport: T,
@@ -265,6 +285,10 @@ pub struct ScsiBlockDevice<T: BulkTransport> {
     /// SYNCHRONIZE CACHE. See [`ScsiBlockDevice::synchronize_cache`].
     #[cfg(feature = "dangerous-write-support")]
     no_flush_command: std::sync::atomic::AtomicBool,
+    /// Set once a SYNCHRONIZE CACHE was accepted, so "supported" is something
+    /// the drive said rather than the absence of a rejection.
+    #[cfg(feature = "dangerous-write-support")]
+    flush_accepted: std::sync::atomic::AtomicBool,
 }
 
 impl<T: BulkTransport> ScsiBlockDevice<T> {
@@ -279,6 +303,8 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
             tag: AtomicU32::new(1),
             #[cfg(feature = "dangerous-write-support")]
             no_flush_command: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "dangerous-write-support")]
+            flush_accepted: std::sync::atomic::AtomicBool::new(false),
         };
 
         let inquiry = dev.inquiry()?;
@@ -338,16 +364,49 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
     /// Recovery procedure — clean up, then still fail the command that
     /// triggered it — not a retry of that command (#14).
     ///
-    /// Reset's own failure is discarded rather than propagated: the
-    /// original error is the diagnosis, and losing it to a follow-up
-    /// failure would be the same mistake `RULES.md` already names — an
-    /// error that does not name what actually went wrong.
+    /// Reset's own failure is not propagated as the error: the original
+    /// error is the diagnosis. It is recorded on that error instead
+    /// (`LuksError::note_reset_failed`), so a reset that fails because the
+    /// device is gone still classifies the failure as a disconnect.
     fn recover<R>(&self, result: Result<R>) -> Result<R> {
-        if result.is_err() {
-            crate::forensic::record_scsi(crate::forensic::ScsiEvent::Reset);
-            let _ = self.transport.reset();
+        result.map_err(|e| self.reset_after(e))
+    }
+
+    /// The reset half of [`recover`](Self::recover), for failures that are
+    /// already an `Err` in hand. Returns `e`, marked if the reset failed too
+    /// (`LuksError::note_reset_failed`), so `is_disconnected` can tell a
+    /// glitch from a device that answers nothing.
+    fn reset_after(&self, e: LuksError) -> LuksError {
+        crate::forensic::record_scsi(crate::forensic::ScsiEvent::Reset);
+        match self.transport.reset() {
+            Ok(()) => e,
+            Err(reset_err) => e.note_reset_failed(reset_err),
         }
-        result
+    }
+
+    /// `reset_after` unless `e` already says the device is gone, when there is
+    /// nothing left to reset.
+    fn reset_unless_gone(&self, e: LuksError) -> LuksError {
+        if e.is_disconnected() {
+            e
+        } else {
+            self.reset_after(e)
+        }
+    }
+
+    /// Reset recovery for an invalid CSW (BOT 6.3: bad length, signature or
+    /// tag) or one that is not meaningful (reserved status). The pipe is in an
+    /// unknown phase after any of these, so the next command is only safe
+    /// after a reset.
+    fn validated_csw(&self, buf: &[u8], tag: u32) -> Result<CommandStatusWrapper> {
+        let csw = CommandStatusWrapper::decode(buf).and_then(|csw| {
+            if csw.tag == tag {
+                Ok(csw)
+            } else {
+                Err(LuksError::ScsiProtocol("CSW tag mismatch"))
+            }
+        });
+        csw.map_err(|e| self.reset_after(e))
     }
 
     /// Run one CBW / data / CSW exchange, asking the drive why on a failure.
@@ -364,18 +423,21 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
     fn command_out_inner(&self, cdb: Vec<u8>, data: &[u8], ask_why: bool) -> Result<usize> {
         let opcode = cdb[0];
         let tag = self.next_tag();
+        let (lba, blocks) = cdb_extent(&cdb);
         crate::forensic::record_scsi(crate::forensic::ScsiEvent::Command {
             opcode,
             tag,
             data_len: data.len() as u32,
             dir: "OUT",
+            lba,
+            blocks,
         });
         let cbw = CommandBlockWrapper::new(tag, data.len() as u32, Direction::Out, cdb);
         let encoded = cbw.encode()?;
 
         let sent = self.recover(self.transport.write(&encoded))?;
         if sent != encoded.len() {
-            return Err(LuksError::ScsiProtocol("short CBW write"));
+            return Err(self.reset_after(LuksError::ScsiProtocol("short CBW write")));
         }
 
         let mut transferred = 0usize;
@@ -403,33 +465,23 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
                     // endpoint before/during CSW is standard; clear halt and retry once.
                     cleared_halt = true;
                     if let Err(e) = self.transport.clear_halt(true) {
-                        if !e.is_disconnected() {
-                            let _ = self.transport.reset();
-                        }
-                        return Err(e);
+                        return Err(self.reset_unless_gone(e));
                     }
                     continue;
                 }
                 Ok(0) => {
-                    let _ = self.transport.reset();
-                    return Err(LuksError::ScsiProtocol("no CSW"));
+                    return Err(self.reset_after(LuksError::ScsiProtocol("no CSW")));
                 }
                 Ok(n) => {
                     got += n;
                 }
                 Err(e) => {
-                    if !e.is_disconnected() {
-                        let _ = self.transport.reset();
-                    }
-                    return Err(e);
+                    return Err(self.reset_unless_gone(e));
                 }
             }
         }
 
-        let csw = CommandStatusWrapper::decode(&csw_buf)?;
-        if csw.tag != tag {
-            return Err(LuksError::ScsiProtocol("CSW tag mismatch"));
-        }
+        let csw = self.validated_csw(&csw_buf, tag)?;
         match csw.status {
             CswStatus::Passed => {
                 if csw.data_residue != 0 {
@@ -473,8 +525,7 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
                     transferred,
                     sense_key: None,
                 });
-                let _ = self.transport.reset();
-                Err(LuksError::ScsiProtocol("CSW phase error"))
+                Err(self.reset_after(LuksError::ScsiProtocol("CSW phase error")))
             }
         }
     }
@@ -496,18 +547,21 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
             Direction::Out => "OUT",
             Direction::None => "NONE",
         };
+        let (lba, blocks) = cdb_extent(&cdb);
         crate::forensic::record_scsi(crate::forensic::ScsiEvent::Command {
             opcode,
             tag,
             data_len: data.len() as u32,
             dir: dir_str,
+            lba,
+            blocks,
         });
         let cbw = CommandBlockWrapper::new(tag, data.len() as u32, direction, cdb);
         let encoded = cbw.encode()?;
 
         let sent = self.recover(self.transport.write(&encoded))?;
         if sent != encoded.len() {
-            return Err(LuksError::ScsiProtocol("short CBW write"));
+            return Err(self.reset_after(LuksError::ScsiProtocol("short CBW write")));
         }
 
         let mut transferred = 0usize;
@@ -549,33 +603,23 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
                     // endpoint before/during CSW is standard; clear halt and retry once.
                     cleared_halt = true;
                     if let Err(e) = self.transport.clear_halt(true) {
-                        if !e.is_disconnected() {
-                            let _ = self.transport.reset();
-                        }
-                        return Err(e);
+                        return Err(self.reset_unless_gone(e));
                     }
                     continue;
                 }
                 Ok(0) => {
-                    let _ = self.transport.reset();
-                    return Err(LuksError::ScsiProtocol("no CSW"));
+                    return Err(self.reset_after(LuksError::ScsiProtocol("no CSW")));
                 }
                 Ok(n) => {
                     got += n;
                 }
                 Err(e) => {
-                    if !e.is_disconnected() {
-                        let _ = self.transport.reset();
-                    }
-                    return Err(e);
+                    return Err(self.reset_unless_gone(e));
                 }
             }
         }
 
-        let csw = CommandStatusWrapper::decode(&csw_buf)?;
-        if csw.tag != tag {
-            return Err(LuksError::ScsiProtocol("CSW tag mismatch"));
-        }
+        let csw = self.validated_csw(&csw_buf, tag)?;
         match csw.status {
             CswStatus::Passed => {
                 // The residue is the *drive's* statement of how much of the
@@ -637,8 +681,7 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
                     transferred,
                     sense_key: None,
                 });
-                let _ = self.transport.reset();
-                Err(LuksError::ScsiProtocol("phase error"))
+                Err(self.reset_after(LuksError::ScsiProtocol("phase error")))
             }
         }
     }
@@ -968,7 +1011,10 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
         cdb[0] = OP_SYNCHRONIZE_CACHE_10;
         // LBA 0, count 0 means "everything", which is what a flush wants.
         match self.command(cdb, Direction::None, &mut []) {
-            Ok(_) => return Ok(()),
+            Ok(_) => {
+                self.flush_accepted.store(true, O::Release);
+                return Ok(());
+            }
             Err(e) if !unsupported(&e) => return Err(e),
             Err(_) => {}
         }
@@ -976,7 +1022,10 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
         let mut cdb = vec![0u8; 16];
         cdb[0] = OP_SYNCHRONIZE_CACHE_16;
         match self.command(cdb, Direction::None, &mut []) {
-            Ok(_) => return Ok(()),
+            Ok(_) => {
+                self.flush_accepted.store(true, O::Release);
+                return Ok(());
+            }
             Err(e) if !unsupported(&e) => return Err(e),
             Err(_) => {}
         }
@@ -993,6 +1042,21 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
     #[cfg(feature = "dangerous-write-support")]
     pub fn flush_is_a_no_op(&self) -> bool {
         self.no_flush_command.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Tri-state form of [`flush_is_a_no_op`](Self::flush_is_a_no_op) for the
+    /// layers that show it to a user: `Some(false)` = rejected both forms,
+    /// `Some(true)` = a flush command was accepted, `None` = never asked.
+    #[cfg(feature = "dangerous-write-support")]
+    pub fn flush_support(&self) -> Option<bool> {
+        use std::sync::atomic::Ordering as O;
+        if self.no_flush_command.load(O::Acquire) {
+            Some(false)
+        } else if self.flush_accepted.load(O::Acquire) {
+            Some(true)
+        } else {
+            None
+        }
     }
 }
 
@@ -1112,5 +1176,9 @@ impl<T: BulkTransport> crate::device::WriteAt for ScsiBlockDevice<T> {
 
     fn flush(&self) -> Result<()> {
         self.synchronize_cache()
+    }
+
+    fn flush_support(&self) -> Option<bool> {
+        ScsiBlockDevice::flush_support(self)
     }
 }

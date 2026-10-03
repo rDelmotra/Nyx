@@ -56,7 +56,9 @@ pub enum UsbEvent {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub enum ScsiEvent {
-    Command { opcode: u8, tag: u32, data_len: u32, dir: &'static str },
+    /// `lba`/`blocks` are set for READ/WRITE(10/16) only. Raw numbers, no
+    /// names or content, so the privacy invariant is unchanged.
+    Command { opcode: u8, tag: u32, data_len: u32, dir: &'static str, lba: Option<u64>, blocks: Option<u32> },
     Result { opcode: u8, status: &'static str, transferred: usize, sense_key: Option<u8> },
     Reset,
 }
@@ -609,8 +611,12 @@ pub fn dump_text() -> String {
                 }
             },
             ForensicEvent::Scsi(ref s) => match s {
-                ScsiEvent::Command { opcode, tag, data_len, dir } => {
-                    out.push_str(&format!("SCSI cmd op=0x{opcode:02X} tag=0x{tag:08X} len={data_len} dir={dir}\n"));
+                ScsiEvent::Command { opcode, tag, data_len, dir, lba, blocks } => {
+                    out.push_str(&format!("SCSI cmd op=0x{opcode:02X} tag=0x{tag:08X} len={data_len} dir={dir}"));
+                    if let (Some(lba), Some(blocks)) = (lba, blocks) {
+                        out.push_str(&format!(" lba={lba} blocks={blocks}"));
+                    }
+                    out.push('\n');
                 }
                 ScsiEvent::Result { opcode, status, transferred, sense_key } => {
                     out.push_str(&format!(

@@ -163,7 +163,9 @@ pub fn error_code(e: &LuksError) -> i32 {
         Cancelled => code::CANCELLED,
         NotFound(_) | NotADirectory(_) | IsADirectory(_) | BadInode(_) => code::NOT_FOUND,
         DirectoryNotEmpty(_) => code::DIRECTORY_NOT_EMPTY,
-        ScsiProtocol(_) | ScsiCommandFailed { .. } | UsbTransfer(_) => code::TRANSPORT,
+        ScsiProtocol(_) | ScsiCommandFailed { .. } | UsbTransfer(_) | UsbErrno { .. } => {
+            code::TRANSPORT
+        }
         Io { .. } => code::IO,
         ChecksumMismatch
         | Truncated { .. }
@@ -217,6 +219,14 @@ pub struct SharedDevice {
     /// rather than "this handle". See [`VolumeHandle::write_file`] for why a
     /// device may have only one writer.
     writer: Arc<std::sync::atomic::AtomicBool>,
+    /// What the drive has said about flushing, mirrored here after each flush
+    /// so `info_json` never waits behind device I/O: 0 unknown, 1 supported,
+    /// 2 rejected. Shared by every clone, like `writer`.
+    #[cfg_attr(
+        not(feature = "dangerous-write-support"),
+        allow(dead_code, reason = "only the write path flushes")
+    )]
+    flush_state: Arc<std::sync::atomic::AtomicU8>,
 }
 
 /// What a device must be able to do for this build: read only by default,
@@ -236,6 +246,7 @@ impl SharedDevice {
         SharedDevice {
             inner: Arc::new(Mutex::new(device)),
             writer: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            flush_state: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         }
     }
 
@@ -273,7 +284,26 @@ impl luks_core::device::WriteAt for SharedDevice {
     }
 
     fn flush(&self) -> Result<()> {
-        self.lock().flush()
+        let dev = self.lock();
+        let result = dev.flush();
+        // Mirror what the drive said while still holding the lock, so a
+        // reader of the atomic never sees a state older than this flush.
+        let state = match dev.flush_support() {
+            None => 0,
+            Some(true) => 1,
+            Some(false) => 2,
+        };
+        self.flush_state.store(state, std::sync::atomic::Ordering::Release);
+        result
+    }
+
+    /// Lock-free: reads the mirror written by `flush`.
+    fn flush_support(&self) -> Option<bool> {
+        match self.flush_state.load(std::sync::atomic::Ordering::Acquire) {
+            1 => Some(true),
+            2 => Some(false),
+            _ => None,
+        }
     }
 }
 
@@ -403,6 +433,13 @@ pub struct VolumeHandle {
         allow(dead_code, reason = "only the write path claims it")
     )]
     device_writer: Arc<std::sync::atomic::AtomicBool>,
+    /// The shared device, kept so `info_json` can report what the drive said
+    /// about flushing (`flushSupported`).
+    #[cfg_attr(
+        not(feature = "dangerous-write-support"),
+        allow(dead_code, reason = "only the write path reports flush support")
+    )]
+    dev: SharedDevice,
     /// Why this volume's write session was fenced, if it was.
     ///
     /// `None` means writes are allowed. `Some(reason)` means an earlier write
@@ -853,7 +890,11 @@ impl DeviceHandle {
             })
             .collect();
 
-        json!({
+        #[cfg_attr(
+            not(feature = "dangerous-write-support"),
+            allow(unused_mut, reason = "only write builds add flushSupported")
+        )]
+        let mut info = json!({
             "vendor": self.vendor,
             "product": self.product,
             "blockSize": self.block_size,
@@ -861,8 +902,12 @@ impl DeviceHandle {
             "sizeBytes": self.block_count * self.block_size as u64,
             "tableKind": match self.table.kind { TableKind::Gpt => "GPT", TableKind::Mbr => "MBR" },
             "partitions": parts,
-        })
-        .to_string()
+        });
+        #[cfg(feature = "dangerous-write-support")]
+        {
+            info["flushSupported"] = json!(luks_core::device::WriteAt::flush_support(&self.dev));
+        }
+        info.to_string()
     }
 
     /// Derive the master key and mount the filesystem inside.
@@ -901,6 +946,7 @@ impl DeviceHandle {
             partition_offset,
             encrypted: true,
             device_writer: Arc::clone(&self.dev.writer),
+            dev: self.dev.clone(),
             write_fence: Mutex::new(None),
             holds_writer: std::sync::atomic::AtomicBool::new(false),
             // Irrelevant when encrypted; armed so the gate is a no-op here.
@@ -938,6 +984,7 @@ impl DeviceHandle {
             partition_offset,
             encrypted: false,
             device_writer: Arc::clone(&self.dev.writer),
+            dev: self.dev.clone(),
             write_fence: Mutex::new(None),
             holds_writer: std::sync::atomic::AtomicBool::new(false),
             // Default-closed: a plain volume mounts read-only until the user
@@ -998,7 +1045,11 @@ impl VolumeHandle {
     /// empty string".
     pub fn info_json(&self) -> String {
         let fs = self.fs_for_reading();
-        json!({
+        #[cfg_attr(
+            not(feature = "dangerous-write-support"),
+            allow(unused_mut, reason = "only write builds add flushSupported")
+        )]
+        let mut info = json!({
             "partitionOffset": self.partition_offset,
             "fsType": fs.kind().name(),
             "label": fs.label(),
@@ -1011,8 +1062,15 @@ impl VolumeHandle {
             // find out what this library can do by asking it, not by assuming
             // its own build flavour matches.
             "canWrite": cfg!(feature = "dangerous-write-support"),
-        })
-        .to_string()
+        });
+        // `true`/`false` once the drive has answered a SYNCHRONIZE CACHE,
+        // `null` until the first flush. `false` means a flush is a silent
+        // no-op and "committed" is not known to be on the medium (D3).
+        #[cfg(feature = "dangerous-write-support")]
+        {
+            info["flushSupported"] = json!(luks_core::device::WriteAt::flush_support(&self.dev));
+        }
+        info.to_string()
     }
 
     pub fn list_dir_json(&self, path: &str) -> Result<String> {
@@ -2014,6 +2072,15 @@ mod tests {
             code::TRANSPORT
         );
         assert_eq!(error_code(&LuksError::FsNeedsRecovery), code::NEEDS_FSCK);
+        // UsbErrno (a kernel transfer failure with its errno) is a transport
+        // failure whatever the errno, including a disconnect and the Dead state.
+        for errno in [110, 19, 108, 71] {
+            assert_eq!(
+                error_code(&LuksError::usb_errno(errno, "x")),
+                code::TRANSPORT,
+                "errno {errno}"
+            );
+        }
         assert_eq!(
             error_code(&LuksError::BadMagic { found: [0; 6] }),
             code::NOT_LUKS

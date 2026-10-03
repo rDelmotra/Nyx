@@ -361,15 +361,29 @@ fn errno() -> i32 {
 /// place: an error that does not name what it was doing gets the gap filled
 /// in by whoever reads it.
 fn bulk_err(len: usize, limit: usize, e: i32) -> LuksError {
-    match transfer_err("USBDEVFS_BULK", e) {
-        LuksError::UsbTransfer(m) => LuksError::UsbTransfer(format!(
-            "{m} while moving {len} bytes (max_transfer is {limit})"
-        )),
-        other => other,
-    }
+    LuksError::usb_errno(
+        e,
+        format!(
+            "{} while moving {len} bytes (max_transfer is {limit})",
+            transfer_detail("USBDEVFS_BULK", e)
+        ),
+    )
 }
 
+/// The Dead state (un-drained URBs after a failed transfer) is terminal, and
+/// the remedy is the same as for an unplug, so it is typed as ESHUTDOWN
+/// (Linux 108, the endpoint-shut-down errno) and classified as disconnected.
+fn transport_dead(why: &str) -> LuksError {
+    LuksError::usb_errno(LINUX_ESHUTDOWN, why)
+}
+
+const LINUX_ESHUTDOWN: i32 = 108;
+
 fn transfer_err(what: &str, e: i32) -> LuksError {
+    LuksError::usb_errno(e, transfer_detail(what, e))
+}
+
+fn transfer_detail(what: &str, e: i32) -> String {
     let hint = match e {
         libc::EPIPE => " (endpoint stalled — clear_halt required before the next command)",
         libc::ETIMEDOUT => " (timed out)",
@@ -381,10 +395,10 @@ fn transfer_err(what: &str, e: i32) -> LuksError {
         libc::EAGAIN => " (would block)",
         _ => "",
     };
-    LuksError::UsbTransfer(format!(
+    format!(
         "{what}: errno {e} ({}){hint}",
         std::io::Error::from_raw_os_error(e)
-    ))
+    )
 }
 
 // ------------------------------------------------------------------ transport
@@ -439,6 +453,14 @@ impl UsbFsTransport {
     /// Maximum transfer ceiling. With MAX_URB_SLOTS = 32 and CHUNK_SIZE = 128 KiB,
     /// a transfer above 4 MiB exceeds the arena slot capacity and must be clamped (B-5).
     pub const MAX_MAX_TRANSFER: usize = MAX_URB_SLOTS * (128 * 1024);
+
+    /// Transfers smaller than this are never a *data phase* that the limit
+    /// governs. 512 is the smallest SCSI block, so every block data phase is at
+    /// least this; the 31-byte CBW, the 13-byte CSW and the short replies
+    /// (INQUIRY 36, REQUEST SENSE 18, READ CAPACITY 8/32) are all below it. A
+    /// timeout on one of those says nothing about transfer size and must not
+    /// shrink the limit (T5/P-5).
+    pub const DATA_PHASE_MIN_BYTES: usize = 512;
 
     /// Wrap a usbfs file descriptor.
     ///
@@ -510,7 +532,7 @@ impl UsbFsTransport {
     /// will fail with `EBUSY` unless the kernel driver is detached first.
     pub fn claim_interface(&mut self) -> Result<()> {
         if self.state() == TransportState::Dead {
-            return Err(LuksError::UsbTransfer("USB transport is dead".into()));
+            return Err(transport_dead("USB transport is dead"));
         }
         let n = self.interface as c_uint;
         let rc = self.raw.ioctl(
@@ -568,6 +590,32 @@ impl UsbFsTransport {
         }
     }
 
+    /// Score a failed transfer of `attempted` bytes under `limit`. Returns
+    /// `true` if the kernel refused the size (`EINVAL`/`ENOMEM`) and the limit
+    /// was lowered, meaning a zero-byte attempt may be redone smaller.
+    ///
+    /// Only a data-phase-sized transfer (>= [`DATA_PHASE_MIN_BYTES`]) can
+    /// shrink the limit, and it shrinks it to half of what was attempted,
+    /// because that is the size that failed. A CBW/CSW-sized failure is not
+    /// about size at all. The limit only ever goes down within a session: a
+    /// restore probe would be a user write, and a failed probe fails and
+    /// fences that write. A fresh transport starts at the original limit.
+    ///
+    /// [`DATA_PHASE_MIN_BYTES`]: Self::DATA_PHASE_MIN_BYTES
+    fn on_bulk_error(&self, e: i32, attempted: usize, limit: usize) -> bool {
+        let size_error = e == libc::EINVAL || e == libc::ENOMEM;
+        let data_timeout = e == libc::ETIMEDOUT;
+        if !(size_error || data_timeout)
+            || attempted < Self::DATA_PHASE_MIN_BYTES
+            || limit <= Self::MIN_MAX_TRANSFER
+        {
+            return false;
+        }
+        let smaller = (attempted / 2).max(Self::MIN_MAX_TRANSFER);
+        self.max_transfer.fetch_min(smaller, Ordering::Relaxed);
+        size_error
+    }
+
     /// One asynchronous bulk transfer split into smaller URBs. Returns the number of
     /// bytes moved, which may be less than requested — short reads are normal on the
     /// IN endpoint.
@@ -577,9 +625,7 @@ impl UsbFsTransport {
         }
 
         if self.state() == TransportState::Dead {
-            return Err(LuksError::UsbTransfer(
-                "USB transport dead: un-drained URBs pending from earlier failure".into(),
-            ));
+            return Err(transport_dead("USB transport dead: un-drained URBs pending from earlier failure"));
         }
 
         const CHUNK_SIZE: usize = 128 * 1024;
@@ -745,16 +791,11 @@ impl UsbFsTransport {
             match err {
                 None => return Ok(prefix),
                 Some(e) => {
-                    let is_shrinkable_error = e == libc::EINVAL || e == libc::ENOMEM;
-                    if (is_shrinkable_error || e == libc::ETIMEDOUT) && limit > Self::MIN_MAX_TRANSFER {
-                        let smaller = (limit / 2).max(Self::MIN_MAX_TRANSFER);
-                        self.max_transfer.fetch_min(smaller, Ordering::Relaxed);
-                        if is_shrinkable_error && prefix == 0 {
-                            // Nothing reached the wire this round — safe to
-                            // redo the whole thing at the smaller size rather
-                            // than reporting a zero-byte failure.
-                            continue;
-                        }
+                    if self.on_bulk_error(e, attempted, limit) && prefix == 0 {
+                        // Nothing reached the wire this round — safe to
+                        // redo the whole thing at the smaller size rather
+                        // than reporting a zero-byte failure.
+                        continue;
                     }
                     if prefix > 0 {
                         // Bytes are safely on the wire. Report them as a
@@ -777,9 +818,7 @@ impl UsbFsTransport {
         }
 
         if self.state() == TransportState::Dead {
-            return Err(LuksError::UsbTransfer(
-                "USB transport dead: un-drained URBs pending from earlier failure".into(),
-            ));
+            return Err(transport_dead("USB transport dead: un-drained URBs pending from earlier failure"));
         }
 
         const CHUNK_SIZE: usize = 128 * 1024;
@@ -961,16 +1000,11 @@ impl UsbFsTransport {
             match err {
                 None => return Ok(prefix),
                 Some(e) => {
-                    let is_shrinkable_error = e == libc::EINVAL || e == libc::ENOMEM;
-                    if (is_shrinkable_error || e == libc::ETIMEDOUT) && limit > Self::MIN_MAX_TRANSFER {
-                        let smaller = (limit / 2).max(Self::MIN_MAX_TRANSFER);
-                        self.max_transfer.fetch_min(smaller, Ordering::Relaxed);
-                        if is_shrinkable_error && prefix == 0 {
-                            // Nothing reached the wire this round — safe to
-                            // redo the whole thing at the smaller size rather
-                            // than reporting a zero-byte failure.
-                            continue;
-                        }
+                    if self.on_bulk_error(e, attempted, limit) && prefix == 0 {
+                        // Nothing reached the wire this round — safe to
+                        // redo the whole thing at the smaller size rather
+                        // than reporting a zero-byte failure.
+                        continue;
                     }
                     if prefix > 0 {
                         // Bytes are safely in hand. Report them as a short
@@ -1117,7 +1151,7 @@ impl BulkTransport for UsbFsTransport {
 
     fn clear_halt(&self, endpoint_in: bool) -> Result<()> {
         if self.state() == TransportState::Dead {
-            return Err(LuksError::UsbTransfer("USB transport is dead".into()));
+            return Err(transport_dead("USB transport is dead"));
         }
         let ep = if endpoint_in { self.ep_in } else { self.ep_out } as c_uint;
         let rc = self.raw.ioctl(
@@ -1137,7 +1171,7 @@ impl BulkTransport for UsbFsTransport {
 
     fn reset(&self) -> Result<()> {
         if self.state() == TransportState::Dead {
-            return Err(LuksError::UsbTransfer("USB transport is dead".into()));
+            return Err(transport_dead("USB transport is dead"));
         }
         // Bulk-Only Mass Storage Reset: a *class* request on the interface.
         //
@@ -1295,7 +1329,8 @@ mod tests {
         let mut buf = [0u8; 64];
         let err = t.read(&mut buf).unwrap_err();
         assert!(
-            matches!(err, LuksError::UsbTransfer(ref m) if m.contains("errno") || m.contains("dead")),
+            matches!(err, LuksError::UsbErrno { errno, .. } if errno == libc::EBADF)
+                || matches!(err, LuksError::UsbErrno { errno: LINUX_ESHUTDOWN, .. }),
             "unexpected error: {err}"
         );
     }
@@ -1321,6 +1356,39 @@ mod tests {
         // 1 MiB timeout read as a dead device.
         let plain = transfer_err("USBDEVFS_BULK", libc::ETIMEDOUT).to_string();
         assert!(!plain.contains("1048576"), "control is not a control: {plain}");
+    }
+
+    /// F1.2 (T6): disconnect is decided by the errno the kernel returned, not
+    /// by words in a message. The table is the whole claim; every row is a
+    /// negative control for the others.
+    #[test]
+    fn disconnect_is_classified_by_errno_not_by_message() {
+        // Linux errno numbers as literals: `LuksError` classifies Linux
+        // kernel values, and `libc::ESHUTDOWN`/`EPROTO` differ on a macOS host.
+        let rows: &[(i32, bool)] = &[
+            // The device is gone, or the fd/endpoint no longer exists.
+            (19, true),  // ENODEV
+            (108, true), // ESHUTDOWN
+            (2, true),   // ENOENT
+            (9, true),   // EBADF
+            // Alive but unhappy: none of these may read as an unplug.
+            (110, false), // ETIMEDOUT
+            (32, false),  // EPIPE
+            (71, false),  // EPROTO
+            (22, false),  // EINVAL
+            (12, false),  // ENOMEM
+            (5, false),   // EIO
+        ];
+        assert!(!rows.is_empty(), "vacuity: no rows");
+        for &(errno, gone) in rows {
+            for e in [transfer_err("USBDEVFS_BULK", errno), bulk_err(4096, 65536, errno)] {
+                assert_eq!(
+                    e.is_disconnected(),
+                    gone,
+                    "errno {errno} should be disconnected={gone}: {e}"
+                );
+            }
+        }
     }
 
     #[test]

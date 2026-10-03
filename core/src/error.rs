@@ -245,6 +245,23 @@ pub enum LuksError {
     #[error("USB transfer failed: {0}")]
     UsbTransfer(String),
 
+    /// A transfer or control request the kernel failed with `errno`.
+    ///
+    /// The errno is data, not prose: disconnect classification
+    /// ([`LuksError::is_disconnected`]) used to be a substring match on the
+    /// message, which depends on the C library's `strerror` wording and breaks
+    /// the moment a message is reworded. `errno` is the Linux/Android value,
+    /// the only kernel usbfs exists on. `reset_failed` records that the BOT
+    /// reset that followed this error also failed, and `reset_gone` that the
+    /// reset's own error said the device is gone (see `is_disconnected`).
+    #[error("USB transfer failed: {detail}")]
+    UsbErrno {
+        errno: i32,
+        reset_failed: bool,
+        reset_gone: bool,
+        detail: String,
+    },
+
     // --- partition tables ---
     #[error("no MBR or GPT partition table found")]
     NoPartitionTable,
@@ -315,6 +332,7 @@ impl LuksError {
             Self::ScsiProtocol(_)
                 | Self::ScsiCommandFailed { .. }
                 | Self::UsbTransfer(_)
+                | Self::UsbErrno { .. }
                 | Self::Io { .. }
                 // A panic already happened under the volume lock.
                 | Self::SessionPoisoned
@@ -323,22 +341,83 @@ impl LuksError {
         )
     }
 
-    /// Returns true if this error indicates the physical USB device was disconnected
-    /// or its usbfs file descriptor was closed (e.g. ENODEV, EBADF, ESHUTDOWN, or Dead transport).
-    pub fn is_disconnected(&self) -> bool {
+    /// A kernel transfer failure that kept its errno. See [`LuksError::UsbErrno`].
+    pub fn usb_errno(errno: i32, detail: impl Into<String>) -> Self {
+        Self::UsbErrno {
+            errno,
+            reset_failed: false,
+            reset_gone: false,
+            detail: detail.into(),
+        }
+    }
+
+    /// Record that the Bulk-Only reset issued after this error failed with
+    /// `reset_err`. The original error stays the primary; a
+    /// [`UsbErrno`](Self::UsbErrno) carries the facts, so a timeout whose reset
+    /// then fails with ENODEV is still reported as the timeout, and still
+    /// classified as a disconnect. A variant that cannot carry them is
+    /// returned unchanged unless the reset error shows the device is gone, in
+    /// which case that error is returned instead (the more useful fact).
+    pub fn note_reset_failed(self, reset_err: LuksError) -> Self {
         match self {
-            Self::UsbTransfer(msg) => {
-                msg.contains("No such device")
-                    || msg.contains("Bad file descriptor")
-                    || msg.contains("endpoint shutdown")
-                    || msg.contains("errno 108")
-                    || msg.contains("ESHUTDOWN")
-                    || msg.contains("dead")
+            Self::UsbErrno { errno, detail, .. } => Self::UsbErrno {
+                errno,
+                reset_failed: true,
+                reset_gone: reset_err.is_disconnected(),
+                detail,
+            },
+            _ if reset_err.is_disconnected() => reset_err,
+            other => other,
+        }
+    }
+
+    /// Returns true if this error means the physical USB device is gone, or its
+    /// usbfs file descriptor was closed. Decided from the errno, never from
+    /// message text.
+    ///
+    /// Linux errno values, each with the reason it counts:
+    /// * `ENODEV` (19): usbfs fails every ioctl with it once the device is no
+    ///   longer connected, and it is the URB status for a removed device.
+    /// * `ESHUTDOWN` (108): URB completion status when the endpoint or host
+    ///   controller was shut down underneath the transfer, i.e. an unplug.
+    /// * `ENOENT` (2): as an *ioctl* result, the endpoint or interface is no
+    ///   longer in the active configuration (usbfs endpoint lookup). The other
+    ///   meaning of URB status ENOENT is our own DISCARDURB; usbfs filters
+    ///   those out before they become an error, so one reaching here is not it.
+    /// * `EBADF` (9): the fd was closed (Java's `UsbDeviceConnection.close()`
+    ///   after an unplug).
+    /// * `EPROTO` (71): **not** a disconnect on its own; it is also what a bad
+    ///   cable or a glitching bridge produces and the next command can work.
+    ///   It counts only when the Bulk-Only reset that followed it failed too
+    ///   (`reset_failed`): the device then answers neither data nor control.
+    ///
+    /// Any error whose BOT reset failed with one of the disconnect errnos
+    /// above (`reset_gone`) is also a disconnect.
+    ///
+    /// `ETIMEDOUT`, `EPIPE`, `EINVAL`, `EIO` and the rest are deliberately not
+    /// disconnects: the device may be alive and the caller should reset, not
+    /// give up.
+    pub fn is_disconnected(&self) -> bool {
+        const ENOENT: i32 = 2;
+        const EBADF: i32 = 9;
+        const ENODEV: i32 = 19;
+        const EPROTO: i32 = 71;
+        const ESHUTDOWN: i32 = 108;
+        match self {
+            Self::UsbErrno {
+                errno,
+                reset_failed,
+                reset_gone,
+                ..
+            } => {
+                matches!(*errno, ENOENT | EBADF | ENODEV | ESHUTDOWN)
+                    || *reset_gone
+                    || (*errno == EPROTO && *reset_failed)
             }
             Self::Io { source, .. } => {
-                source.raw_os_error() == Some(19) // ENODEV
-                    || source.raw_os_error() == Some(9) // EBADF
-                    || source.raw_os_error() == Some(108) // ESHUTDOWN
+                // File I/O, where ENOENT means a missing path, so it is not
+                // in this list.
+                matches!(source.raw_os_error(), Some(ENODEV | EBADF | ESHUTDOWN))
             }
             _ => false,
         }
@@ -363,6 +442,8 @@ mod fence_classification {
             LuksError::ScsiProtocol("no CSW"),
             LuksError::ScsiCommandFailed { opcode: 0x2A, sense: None },
             LuksError::UsbTransfer("timed out".into()),
+            LuksError::usb_errno(110, "timed out"),
+            LuksError::usb_errno(19, "gone"),
             LuksError::Io {
                 path: "/dev/sda".into(),
                 source: std::io::Error::new(std::io::ErrorKind::TimedOut, "etimedout"),
@@ -411,5 +492,58 @@ mod fence_classification {
     #[test]
     fn cancellation_never_fences() {
         assert!(!LuksError::Cancelled.fences_write_session());
+    }
+}
+
+#[cfg(test)]
+mod disconnect_classification {
+    use super::LuksError;
+
+    #[test]
+    fn errno_decides_and_message_text_is_irrelevant() {
+        // Message deliberately says "disconnected" for a live-device errno and
+        // nothing useful for a gone one: only the errno may matter.
+        for (errno, gone) in [(19, true), (108, true), (2, true), (9, true), (110, false), (32, false), (71, false), (22, false)] {
+            let misleading = if gone { "all fine" } else { "device disconnected, No such device, dead" };
+            let e = LuksError::usb_errno(errno, misleading);
+            assert_eq!(e.is_disconnected(), gone, "errno {errno}");
+        }
+    }
+
+    #[test]
+    fn eproto_is_a_disconnect_only_after_the_reset_also_failed() {
+        let e = LuksError::usb_errno(71, "bus error");
+        assert!(!e.is_disconnected(), "EPROTO alone is a glitch, not an unplug");
+        let reset_timeout = || LuksError::usb_errno(110, "reset timed out");
+        assert!(e.note_reset_failed(reset_timeout()).is_disconnected());
+        // The flag must not turn other errnos into disconnects.
+        assert!(!LuksError::usb_errno(110, "t").note_reset_failed(reset_timeout()).is_disconnected());
+        // And it is a no-op on variants that cannot carry it.
+        assert!(!LuksError::UsbTransfer("x".into()).note_reset_failed(reset_timeout()).is_disconnected());
+    }
+
+    /// R3: a reset that fails because the device is gone makes the failure a
+    /// disconnect, while the original error stays the primary one.
+    #[test]
+    fn a_reset_that_fails_with_a_disconnect_errno_marks_the_error_disconnected() {
+        let gone = || LuksError::usb_errno(19, "reset: no such device");
+        let timed_out = LuksError::usb_errno(110, "bulk timed out").note_reset_failed(gone());
+        assert!(timed_out.is_disconnected());
+        assert!(
+            matches!(timed_out, LuksError::UsbErrno { errno: 110, .. }),
+            "the original error must stay primary: {timed_out:?}"
+        );
+        // A variant that cannot carry the fact yields the reset error itself.
+        let proto = LuksError::ScsiProtocol("no CSW").note_reset_failed(gone());
+        assert!(proto.is_disconnected(), "{proto:?}");
+    }
+
+    #[test]
+    fn a_missing_file_is_not_a_disconnect() {
+        let e = LuksError::Io {
+            path: "/nope".into(),
+            source: std::io::Error::from_raw_os_error(2),
+        };
+        assert!(!e.is_disconnected(), "Io ENOENT is a missing path");
     }
 }

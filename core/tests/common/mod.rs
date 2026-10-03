@@ -15,6 +15,8 @@ pub mod btree_validator;
 pub mod mem_device;
 pub mod scratch;
 #[cfg(feature = "dangerous-write-support")]
+pub mod fail_after;
+#[cfg(feature = "dangerous-write-support")]
 pub mod accounting;
 #[cfg(feature = "dangerous-write-support")]
 pub mod fs_model;

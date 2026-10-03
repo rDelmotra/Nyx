@@ -115,6 +115,8 @@ android {
     }
     testOptions {
         unitTests.isReturnDefaultValues = true
+        // KNOWN-RED tests run only under -PknownRed=1 (tools/known-red.sh).
+        unitTests.all { it.systemProperty("knownRed", project.findProperty("knownRed") ?: "0") }
     }
 }
 

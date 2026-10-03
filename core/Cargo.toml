@@ -452,3 +452,14 @@ path = "tests/integration/forensic_log.rs"
 name = "oracle_ledger"
 path = "tests/integration/oracle_ledger.rs"
 
+
+# --- transfer-integrity red tests (F0) ---
+[[test]]
+name = "ext4_writer_leak"
+path = "tests/ext4/ext4_writer_leak.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_batch_ack_durability"
+path = "tests/txn_batch/btrfs_batch_ack_durability.rs"
+required-features = ["dangerous-write-support"]

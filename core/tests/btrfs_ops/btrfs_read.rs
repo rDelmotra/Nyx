@@ -178,7 +178,9 @@ fn crc32c_agrees_with_the_stored_superblock_checksum() {
     device("plain.img").read_at(0x1_0000, &mut raw).unwrap();
     let stored = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
     assert_eq!(crc32c(&raw[32..]), stored);
-    assert_eq!(stored, 0xf7b4_210d);
+    // Value of plain.img as regenerated 2026-10-04 (btrfs-progs v6.6.3); mkfs
+    // stamps a time, so a regenerated image changes it.
+    assert_eq!(stored, 0xfd2a_b5f3);
 }
 
 // --- mirror selection ------------------------------------------------------

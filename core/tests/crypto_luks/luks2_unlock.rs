@@ -253,3 +253,20 @@ fn content_past_the_first_sector_agrees_across_sector_sizes() {
     // Sanity: a plausible early block, not noise.
     assert!(descriptors[0] > 0 && descriptors[0] < 1000, "{descriptors:?}");
 }
+
+/// The key length the volume actually opened with, in bits, is derived from
+/// the unlocked master key (published fixture keys above are 64 bytes), and
+/// the accessor exposes only the number.
+#[test]
+fn key_bits_is_the_opened_master_key_length() {
+    for (name, hex) in [
+        ("unlock-argon2id-512.img", MK_ARGON2ID_512),
+        ("unlock-pbkdf2-512.img", MK_PBKDF2_512),
+        ("unlock-argon2id-4096.img", MK_ARGON2ID_4096),
+    ] {
+        let data = container(name);
+        let header = luks::parse(&data).expect("header parses");
+        let vol = LuksVolume::open(&data, 0, None, &header, PASSWORD).expect("volume opens");
+        assert_eq!(vol.key_bits() as usize, unhex(hex).len() * 8, "{name}");
+    }
+}

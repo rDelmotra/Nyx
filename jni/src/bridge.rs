@@ -1067,10 +1067,11 @@ impl DeviceHandle {
         // Header shape for the debug log. Logging must never fail an unlock
         // that already succeeded, so a missing piece is left out, not an error
         // (LuksVolume::open above already required the segment and a keyslot).
-        let luks_params = header.primary_segment().ok().map(|seg| {
-            let key_bits = header.metadata.keyslots.values().next().map(|k| k.key_size as u32 * 8);
-            (seg.encryption.clone(), key_bits, seg.sector_size)
-        });
+        let key_bits = volume.key_bits();
+        let luks_params = header
+            .primary_segment()
+            .ok()
+            .map(|seg| (seg.encryption.clone(), Some(key_bits), seg.sector_size));
         let fs = MountedFs::mount(luks_core::volume::VolumeSource::Luks(volume))?;
         let id = NEXT_VOLUME_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(VolumeHandle {

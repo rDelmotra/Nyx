@@ -1,0 +1,343 @@
+{
+  "dropped": 3,
+  "events": [
+    {
+      "bytes": 3,
+      "count": 2,
+      "ep": 1,
+      "ev": "usb_submit",
+      "gen": 4,
+      "nseq": 1,
+      "t": 1700000000000
+    },
+    {
+      "bytes": 3,
+      "ep": 1,
+      "ev": "usb_reap",
+      "gen": 4,
+      "nseq": 2,
+      "status": -2,
+      "t": 1700000000001
+    },
+    {
+      "active_urbs": 3,
+      "elapsed_ms": 2,
+      "ep": 1,
+      "ev": "usb_timeout",
+      "gen": 4,
+      "nseq": 3,
+      "t": 1700000000002
+    },
+    {
+      "ev": "usb_state_transition",
+      "from": "healthy",
+      "nseq": 4,
+      "t": 1700000000003,
+      "to": "dead"
+    },
+    {
+      "ev": "usb_reset",
+      "nseq": 5,
+      "reset_kind": "bot_mass_storage_reset",
+      "status": 0,
+      "t": 1700000000004
+    },
+    {
+      "discarded_count": 1,
+      "ev": "usb_drain",
+      "nseq": 6,
+      "remaining": 2,
+      "t": 1700000000005
+    },
+    {
+      "errno": 110,
+      "ev": "usb_drain_aborted",
+      "nseq": 7,
+      "t": 1700000000006
+    },
+    {
+      "ev": "usb_unrecognized_reap",
+      "nseq": 8,
+      "t": 1700000000007
+    },
+    {
+      "blocks": 1,
+      "data_len": 512,
+      "direction": "out",
+      "ev": "scsi_command",
+      "lba": 9,
+      "nseq": 9,
+      "opcode": 42,
+      "t": 1700000000008,
+      "tag": 7
+    },
+    {
+      "data_len": 0,
+      "direction": "none",
+      "ev": "scsi_command",
+      "nseq": 10,
+      "opcode": 0,
+      "t": 1700000000009,
+      "tag": 7
+    },
+    {
+      "ev": "scsi_result",
+      "nseq": 11,
+      "opcode": 42,
+      "status": "passed",
+      "t": 1700000000010,
+      "transferred": 512
+    },
+    {
+      "ev": "scsi_result",
+      "nseq": 12,
+      "opcode": 42,
+      "sense_key": 3,
+      "status": "failed",
+      "t": 1700000000011,
+      "transferred": 0
+    },
+    {
+      "ev": "scsi_reset",
+      "nseq": 13,
+      "t": 1700000000012
+    },
+    {
+      "ev": "btrfs_mount",
+      "generation": 1,
+      "nseq": 14,
+      "root_bytenr": 2,
+      "t": 1700000000013
+    },
+    {
+      "ev": "btrfs_begin_file",
+      "len_bytes": 1,
+      "nseq": 15,
+      "t": 1700000000014
+    },
+    {
+      "bytenr": 2,
+      "ev": "btrfs_write_chunk",
+      "len": 1,
+      "nseq": 16,
+      "t": 1700000000015
+    },
+    {
+      "ev": "btrfs_finish_file",
+      "ino": 1,
+      "nseq": 17,
+      "t": 1700000000016,
+      "total_bytes": 2
+    },
+    {
+      "ev": "btrfs_abandon_file",
+      "nseq": 18,
+      "runs_count": 1,
+      "t": 1700000000017,
+      "total_bytes": 2
+    },
+    {
+      "ev": "btrfs_create_file",
+      "new_ino": 2,
+      "nseq": 19,
+      "parent_ino": 1,
+      "t": 1700000000018
+    },
+    {
+      "ev": "btrfs_delete_file",
+      "ino": 2,
+      "nseq": 20,
+      "parent_ino": 1,
+      "t": 1700000000019
+    },
+    {
+      "ev": "btrfs_mkdir",
+      "new_ino": 2,
+      "nseq": 21,
+      "parent_ino": 1,
+      "t": 1700000000020
+    },
+    {
+      "ev": "btrfs_rename",
+      "from_parent": 1,
+      "ino": 3,
+      "nseq": 22,
+      "t": 1700000000021,
+      "to_parent": 2
+    },
+    {
+      "dev_offset": 3,
+      "ev": "btrfs_chunk_alloc",
+      "length": 2,
+      "logical": 1,
+      "nseq": 23,
+      "t": 1700000000022
+    },
+    {
+      "ev": "btrfs_commit",
+      "generation": 2,
+      "nodes_written": 4,
+      "nseq": 24,
+      "t": 1700000000023,
+      "transid": 3,
+      "tree": 1
+    },
+    {
+      "code": 9,
+      "ev": "btrfs_error",
+      "nseq": 25,
+      "stage": "commit",
+      "t": 1700000000024
+    },
+    {
+      "ev": "btrfs_leaf_split",
+      "groups": 3,
+      "nseq": 26,
+      "pos_class": 0,
+      "shape": 2,
+      "t": 1700000000025,
+      "tree": 1
+    },
+    {
+      "ev": "btrfs_interior_split",
+      "level": 1,
+      "nseq": 27,
+      "t": 1700000000026,
+      "tree": 1
+    },
+    {
+      "ev": "btrfs_height_grew",
+      "from": 0,
+      "nseq": 28,
+      "t": 1700000000027,
+      "to": 1,
+      "tree": 1
+    },
+    {
+      "ev": "btrfs_root_collapsed",
+      "from": 1,
+      "nseq": 29,
+      "t": 1700000000028,
+      "to": 0,
+      "tree": 1
+    },
+    {
+      "ev": "btrfs_node_removed",
+      "level": 0,
+      "nseq": 30,
+      "t": 1700000000029,
+      "tree": 1
+    },
+    {
+      "ev": "btrfs_block_reused",
+      "level": 0,
+      "nseq": 31,
+      "t": 1700000000030,
+      "tree": 1
+    },
+    {
+      "ev": "btrfs_block_cowed",
+      "level": 0,
+      "nseq": 32,
+      "t": 1700000000031,
+      "tree": 1
+    },
+    {
+      "ev": "btrfs_converge_rounds",
+      "nseq": 33,
+      "rounds": 2,
+      "t": 1700000000032
+    },
+    {
+      "ev": "ext4_begin_file",
+      "nseq": 34,
+      "size": 1,
+      "t": 1700000000033
+    },
+    {
+      "bytes": 2,
+      "ev": "ext4_finish_file",
+      "ino": 12,
+      "nseq": 35,
+      "t": 1700000000034
+    },
+    {
+      "bytes": 2,
+      "ev": "ext4_abandon_file",
+      "nseq": 36,
+      "t": 1700000000035
+    },
+    {
+      "ev": "ext4_create_file",
+      "ino": 12,
+      "nseq": 37,
+      "parent": 2,
+      "t": 1700000000036
+    },
+    {
+      "ev": "ext4_delete_file",
+      "ino": 12,
+      "nseq": 38,
+      "parent": 2,
+      "t": 1700000000037
+    },
+    {
+      "ev": "ext4_mkdir",
+      "ino": 13,
+      "nseq": 39,
+      "parent": 2,
+      "t": 1700000000038
+    },
+    {
+      "ev": "ext4_rename",
+      "from_parent": 2,
+      "ino": 12,
+      "nseq": 40,
+      "t": 1700000000039,
+      "to_parent": 2
+    },
+    {
+      "ev": "ext4_mark_dirty",
+      "nseq": 41,
+      "t": 1700000000040
+    },
+    {
+      "ev": "ext4_mark_clean",
+      "nseq": 42,
+      "t": 1700000000041
+    },
+    {
+      "ev": "ext4_flush",
+      "nseq": 43,
+      "ok": false,
+      "t": 1700000000042
+    },
+    {
+      "cleanup_code": 9,
+      "ev": "ext4_left_dirty",
+      "nseq": 44,
+      "resync_ok": false,
+      "t": 1700000000043
+    },
+    {
+      "ev": "ext4_left_dirty",
+      "nseq": 45,
+      "resync_ok": true,
+      "t": 1700000000044
+    },
+    {
+      "code": 5,
+      "ev": "ext4_error",
+      "nseq": 46,
+      "stage": "finish_file",
+      "t": 1700000000045
+    },
+    {
+      "at": "src.fs.ext4.file.rs",
+      "ev": "panic",
+      "line": 10,
+      "nseq": 47,
+      "t": 1700000000046
+    }
+  ]
+}

@@ -1256,13 +1256,32 @@ mod tests {
         }
     }
 
-    /// The two F9 entry points exist with the exact exported names Kotlin
-    /// binds to (a rename here would be an UnsatisfiedLinkError at runtime).
+    /// Every `Java_dev_luksandroid_LuksNative_*` export in this crate has a
+    /// matching `external fun` in `LuksNative.kt`, and the reverse. A rename or
+    /// a forgotten declaration on either side is an UnsatisfiedLinkError at
+    /// runtime, so it is checked from the two source files.
     #[test]
-    fn event_export_symbols_exist() {
-        let drain: *const () = Java_dev_luksandroid_LuksNative_nativeDrainEvents as *const ();
-        let ring: *const () = Java_dev_luksandroid_LuksNative_nativeRingJson as *const ();
-        assert!(!drain.is_null() && !ring.is_null() && drain != ring);
+    fn jni_exports_match_the_kotlin_external_funs() {
+        const PREFIX: &str = "Java_dev_luksandroid_LuksNative_";
+        let rust: std::collections::BTreeSet<String> = include_str!("lib.rs")
+            .lines()
+            .filter_map(|l| l.strip_prefix("pub extern \"system\" fn "))
+            .filter_map(|l| l.strip_prefix(PREFIX))
+            .map(|l| l.split(|c: char| !c.is_alphanumeric() && c != '_').next().unwrap_or("").to_string())
+            .collect();
+        let kt_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../android/app/src/main/java/dev/luksandroid/LuksNative.kt");
+        let kt = std::fs::read_to_string(kt_path).unwrap_or_else(|e| panic!("cannot read {kt_path}: {e}"));
+        let kotlin: std::collections::BTreeSet<String> = kt
+            .lines()
+            .filter_map(|l| l.trim_start().strip_prefix("external fun "))
+            .map(|l| l.split('(').next().unwrap_or("").trim().to_string())
+            .collect();
+        assert!(rust.contains("nativeDrainEvents") && rust.contains("nativeRingJson"), "scan found {rust:?}");
+        assert!(kotlin.len() > 10, "Kotlin scan found too little: {kotlin:?}");
+        let only_rust: Vec<_> = rust.difference(&kotlin).collect();
+        let only_kotlin: Vec<_> = kotlin.difference(&rust).collect();
+        assert!(only_rust.is_empty(), "exported but not declared in LuksNative.kt: {only_rust:?}");
+        assert!(only_kotlin.is_empty(), "declared in LuksNative.kt but not exported: {only_kotlin:?}");
     }
 
     /// A panic whose payload is a formatted path reaches the JSON handed to
@@ -1295,12 +1314,12 @@ mod tests {
             assert!(!panics.is_empty(), "{what}: panic event missing from {json}");
             // Other tests in this process panic too, from other files.
             for p in &panics {
-                assert!(p["file"].as_str().is_some_and(|f| f.ends_with(".rs")), "{what}: {p}");
+                assert!(p["at"].as_str().is_some_and(|f| f.ends_with(".rs")), "{what}: {p}");
                 assert!(p["line"].is_u64());
-                assert!(p.get("message").is_none(), "{what}: {p}");
+                assert!(p.get("message").is_none() && p.get("file").is_none(), "{what}: {p}");
             }
             assert!(
-                panics.iter().any(|p| p["file"].as_str().is_some_and(|f| f.ends_with("lib.rs"))),
+                panics.iter().any(|p| p["at"].as_str().is_some_and(|f| f.ends_with("lib.rs"))),
                 "{what}: this test's own panic site (lib.rs) is missing: {json}"
             );
         }

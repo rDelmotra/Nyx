@@ -10,6 +10,10 @@
 mod temp_guard;
 use temp_guard::TempStr;
 
+#[path = "../common/fail_after.rs"]
+mod fail_after;
+use fail_after::FailAfterNWrites;
+
 use luks_core::device::FileDevice;
 use luks_core::forensic::{drain_notable, Ext4Event, ForensicEvent, ForensicRecord};
 use luks_core::fs::ext4::Ext4;
@@ -142,4 +146,60 @@ fn failure_records_stage_and_code_but_no_name() {
     // The rendered line holds no trace of the name.
     let json = luks_core::forensic::ring_json();
     assert!(!json.contains("dup"), "name leaked into ring json");
+}
+
+fn open_failing(path: &str) -> Ext4<FailAfterNWrites> {
+    let len = std::fs::metadata(path).expect("stat scratch").len();
+    let dev = FileDevice::open_writable(path, len).expect("open writable");
+    Ext4::mount(FailAfterNWrites::new(dev, usize::MAX)).expect("mount")
+}
+
+fn set_budget(fs: &mut Ext4<FailAfterNWrites>, n: usize) {
+    fs.device_mut().budget.store(n, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// S5: a device that dies mid-window leaves the disk dirty. The log must say
+/// so explicitly (LeftDirty), not make the reader infer it from a missing
+/// MarkClean, and must carry the suppressed rollback's code and the resync
+/// outcome.
+#[test]
+fn mid_window_device_failure_records_left_dirty_and_no_mark_clean() {
+    let _g = lock();
+    let img = scratch("leftdirty");
+    let mut fs = open_failing(&img);
+    let mut w = fs.begin_file(10_000).expect("begin");
+    fs.write_chunk(&mut w, &[7u8; 10_000]).expect("write");
+    drain_notable();
+
+    // Let the dirty mark and a little more through, then the device vanishes.
+    set_budget(&mut fs, 3);
+    let err = fs.finish_file(w, 2, "x.bin", FileType::Regular).expect_err("device died mid-window");
+    let cleanup = fs.take_cleanup_failure().map(|e| e.forensic_code());
+
+    let evs = ext4_events(drain_notable().0);
+    let dirty = position(&evs, &Ext4Event::MarkDirty);
+    let left = evs
+        .iter()
+        .position(|e| matches!(e, Ext4Event::LeftDirty { .. }))
+        .unwrap_or_else(|| panic!("no LeftDirty in {evs:?}"));
+    let error = position(&evs, &Ext4Event::Error { stage: "finish_file", code: err.forensic_code() });
+    assert!(dirty < left && left < error, "MarkDirty, LeftDirty, then Error: {evs:?}");
+    assert_eq!(evs[left], Ext4Event::LeftDirty { cleanup_code: cleanup, resync_ok: true }, "{evs:?}");
+    assert!(!evs.contains(&Ext4Event::MarkClean), "the fs is NOT clean: {evs:?}");
+}
+
+/// S5: a USB failure while streaming data is an error return of a public
+/// entry point and must be recorded with its stage.
+#[test]
+fn write_chunk_failure_records_its_stage() {
+    let _g = lock();
+    let img = scratch("chunkerr");
+    let mut fs = open_failing(&img);
+    let mut w = fs.begin_file_streaming().expect("begin");
+    drain_notable();
+
+    set_budget(&mut fs, 0);
+    let err = fs.write_chunk(&mut w, &[1u8; 20_000]).expect_err("device refuses data writes");
+    let evs = ext4_events(drain_notable().0);
+    position(&evs, &Ext4Event::Error { stage: "write_chunk", code: err.forensic_code() });
 }

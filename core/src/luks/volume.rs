@@ -144,6 +144,12 @@ impl<D: ReadAt> LuksVolume<D> {
         self.sector_size
     }
 
+    /// Length of the master key this volume opened with, in bits. A number
+    /// only: the key itself never leaves [`Secret`].
+    pub fn key_bits(&self) -> u32 {
+        (self.master_key.len() * 8) as u32
+    }
+
     /// The device underneath, for callers that need to keep talking to it
     /// (a JNI handle asking the SCSI layer for its capacity, say).
     pub fn device(&self) -> &D {

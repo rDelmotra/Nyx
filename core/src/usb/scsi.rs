@@ -324,7 +324,7 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
                         let sense_key = sense[2] & 0x0F;
                         crate::forensic::record_scsi(crate::forensic::ScsiEvent::Result {
                             opcode: OP_TEST_UNIT_READY,
-                            status: "NOT READY",
+                            status: crate::forensic::ScsiStatus::NotReady,
                             transferred: 0,
                             sense_key: Some(sense_key),
                         });
@@ -487,7 +487,7 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
                 if csw.data_residue != 0 {
                     crate::forensic::record_scsi(crate::forensic::ScsiEvent::Result {
                         opcode,
-                        status: "RESIDUE_ERROR",
+                        status: crate::forensic::ScsiStatus::ResidueError,
                         transferred,
                         sense_key: None,
                     });
@@ -497,7 +497,7 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
                 }
                 crate::forensic::record_scsi(crate::forensic::ScsiEvent::Result {
                     opcode,
-                    status: "PASSED",
+                    status: crate::forensic::ScsiStatus::Passed,
                     transferred,
                     sense_key: None,
                 });
@@ -512,7 +512,7 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
                 let sense_key = sense.as_ref().map(|s| s.key);
                 crate::forensic::record_scsi(crate::forensic::ScsiEvent::Result {
                     opcode,
-                    status: "FAILED",
+                    status: crate::forensic::ScsiStatus::Failed,
                     transferred,
                     sense_key,
                 });
@@ -521,7 +521,7 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
             CswStatus::PhaseError => {
                 crate::forensic::record_scsi(crate::forensic::ScsiEvent::Result {
                     opcode,
-                    status: "PHASE_ERROR",
+                    status: crate::forensic::ScsiStatus::PhaseError,
                     transferred,
                     sense_key: None,
                 });
@@ -635,7 +635,7 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
                 if matches!(direction, Direction::Out) && csw.data_residue != 0 {
                     crate::forensic::record_scsi(crate::forensic::ScsiEvent::Result {
                         opcode,
-                        status: "RESIDUE_ERROR",
+                        status: crate::forensic::ScsiStatus::ResidueError,
                         transferred,
                         sense_key: None,
                     });
@@ -645,7 +645,7 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
                 }
                 crate::forensic::record_scsi(crate::forensic::ScsiEvent::Result {
                     opcode,
-                    status: "PASSED",
+                    status: crate::forensic::ScsiStatus::Passed,
                     transferred,
                     sense_key: None,
                 });
@@ -666,7 +666,7 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
                 let sense_key = sense.as_ref().map(|s| s.key);
                 crate::forensic::record_scsi(crate::forensic::ScsiEvent::Result {
                     opcode,
-                    status: "FAILED",
+                    status: crate::forensic::ScsiStatus::Failed,
                     transferred,
                     sense_key,
                 });
@@ -677,7 +677,7 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
                 // the phase error that caused it.
                 crate::forensic::record_scsi(crate::forensic::ScsiEvent::Result {
                     opcode,
-                    status: "PHASE_ERROR",
+                    status: crate::forensic::ScsiStatus::PhaseError,
                     transferred,
                     sense_key: None,
                 });

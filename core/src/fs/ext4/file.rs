@@ -290,6 +290,11 @@ impl<D: WriteAt> Ext4<D> {
     /// Append one chunk. Chunks may have any length; only a final partial
     /// filesystem block is retained, so payload residency stays bounded.
     pub fn write_chunk(&mut self, writer: &mut FileWriter, data: &[u8]) -> Result<()> {
+        note_err(self.write_chunk_inner(writer, data), "write_chunk")
+    }
+
+    /// Body of [`write_chunk`](Self::write_chunk), separated so that every error return is recorded in one place.
+    fn write_chunk_inner(&mut self, writer: &mut FileWriter, data: &[u8]) -> Result<()> {
         let end = writer
             .written
             .checked_add(data.len() as u64)

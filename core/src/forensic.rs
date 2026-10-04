@@ -60,12 +60,53 @@ pub enum UsbEvent {
     UnrecognizedReap { ptr: usize },
 }
 
+/// Outcome of a SCSI command as seen at the Bulk-Only Transport. An enum, not a
+/// string, so the notable classification cannot drift from what the emitter
+/// writes (an earlier version compared against a literal nobody produced).
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub enum ScsiStatus {
+    #[serde(rename = "PASSED")]
+    Passed,
+    #[serde(rename = "FAILED")]
+    Failed,
+    #[serde(rename = "PHASE_ERROR")]
+    PhaseError,
+    #[serde(rename = "RESIDUE_ERROR")]
+    ResidueError,
+    #[serde(rename = "NOT READY")]
+    NotReady,
+}
+
+impl ScsiStatus {
+    /// Human label used by `dump_text` / `dump_json` (unchanged from before).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Passed => "PASSED",
+            Self::Failed => "FAILED",
+            Self::PhaseError => "PHASE_ERROR",
+            Self::ResidueError => "RESIDUE_ERROR",
+            Self::NotReady => "NOT READY",
+        }
+    }
+
+    /// Wire form for the event JSON (C7): `^[a-z0-9_.:-]{1,48}$`.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::PhaseError => "phase_error",
+            Self::ResidueError => "residue_error",
+            Self::NotReady => "not_ready",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub enum ScsiEvent {
     /// `lba`/`blocks` are set for READ/WRITE(10/16) only. Raw numbers, no
     /// names or content, so the privacy invariant is unchanged.
     Command { opcode: u8, tag: u32, data_len: u32, dir: &'static str, lba: Option<u64>, blocks: Option<u32> },
-    Result { opcode: u8, status: &'static str, transferred: usize, sense_key: Option<u8> },
+    Result { opcode: u8, status: ScsiStatus, transferred: usize, sense_key: Option<u8> },
     Reset,
 }
 
@@ -107,6 +148,12 @@ pub enum Ext4Event {
     MarkDirty,
     MarkClean,
     Flush { ok: bool },
+    /// A mutation window failed with the metadata inconsistent, so the disk is
+    /// deliberately left marked dirty. `cleanup_code` is the suppressed
+    /// rollback failure (if the rollback itself failed), `resync_ok` whether
+    /// memory could be reloaded from disk afterwards (false: this session
+    /// now refuses writes).
+    LeftDirty { cleanup_code: Option<i32>, resync_ok: bool },
     /// `code` is [`crate::error::LuksError::forensic_code`].
     Error { stage: &'static str, code: i32 },
 }
@@ -272,7 +319,7 @@ pub fn is_notable(event: &ForensicEvent) -> bool {
         },
         ForensicEvent::Scsi(s) => match s {
             ScsiEvent::Command { .. } => false,
-            ScsiEvent::Result { status, sense_key, .. } => *status != "good" || sense_key.is_some(),
+            ScsiEvent::Result { status, sense_key, .. } => *status != ScsiStatus::Passed || sense_key.is_some(),
             ScsiEvent::Reset => true,
         },
         ForensicEvent::Btrfs(b) => match b {
@@ -752,7 +799,8 @@ pub fn dump_text() -> String {
                 }
                 ScsiEvent::Result { opcode, status, transferred, sense_key } => {
                     out.push_str(&format!(
-                        "SCSI res op=0x{opcode:02X} status={status} xfer={transferred} sense={:?}\n",
+                        "SCSI res op=0x{opcode:02X} status={} xfer={transferred} sense={:?}\n",
+                        status.label(),
                         sense_key
                     ));
                 }
@@ -820,8 +868,30 @@ fn num<T: Into<serde_json::Number>>(v: T) -> serde_json::Value {
     serde_json::Value::Number(v.into())
 }
 
-fn text(v: &'static str) -> serde_json::Value {
-    serde_json::Value::String(v.to_string())
+/// Make a fixed native string wire-safe (C7): lowercase, `/` and `\\` become
+/// `.`, any other character outside `[a-z0-9_.:-]` becomes `_`, at most 48
+/// characters, never empty. Applied to every string value on the wire so a
+/// new event cannot emit something the Kotlin side would reject.
+fn wire_string(v: &str) -> String {
+    let mapped: Vec<char> = v
+        .chars()
+        .map(|c| match c.to_ascii_lowercase() {
+            c @ ('a'..='z' | '0'..='9' | '_' | '.' | ':' | '-') => c,
+            '/' | '\\' => '.',
+            _ => '_',
+        })
+        .collect();
+    // Keep the tail when too long: for a source location that is the file name.
+    let keep = mapped.len().saturating_sub(48);
+    let mut out: String = mapped[keep..].iter().collect();
+    if out.is_empty() {
+        out.push('_');
+    }
+    out
+}
+
+fn text(v: &str) -> serde_json::Value {
+    serde_json::Value::String(wire_string(v))
 }
 
 /// `usize` has no `Into<Number>`; widen explicitly (usize is at most 64 bits
@@ -842,14 +912,14 @@ fn event_fields(event: &ForensicEvent) -> (String, Fields) {
             UsbEvent::Reap { ep, status, bytes, gen } => ("usb_reap".into(), vec![("ep", num(*ep)), ("status", num(*status)), ("bytes", unum(*bytes)), ("gen", num(*gen))]),
             UsbEvent::Timeout { ep, elapsed_ms, active_urbs, gen } => ("usb_timeout".into(), vec![("ep", num(*ep)), ("elapsed_ms", num(*elapsed_ms)), ("active_urbs", unum(*active_urbs)), ("gen", num(*gen))]),
             UsbEvent::StateTransition { from, to } => ("usb_state_transition".into(), vec![("from", text(from)), ("to", text(to))]),
-            UsbEvent::Reset { kind, status } => ("usb_reset".into(), vec![("kind", text(kind)), ("status", num(*status))]),
+            UsbEvent::Reset { kind, status } => ("usb_reset".into(), vec![("reset_kind", text(kind)), ("status", num(*status))]),
             UsbEvent::Drain { discarded_count, remaining } => ("usb_drain".into(), vec![("discarded_count", unum(*discarded_count)), ("remaining", unum(*remaining))]),
             UsbEvent::DrainAborted { errno } => ("usb_drain_aborted".into(), vec![("errno", num(*errno))]),
             UsbEvent::UnrecognizedReap { .. } => ("usb_unrecognized_reap".into(), vec![]), // a heap address: kept out of the log (ASLR)
         },
         ForensicEvent::Scsi(s) => match s {
             ScsiEvent::Command { opcode, tag, data_len, dir, lba, blocks } => {
-                let mut f: Fields = vec![("opcode", num(*opcode)), ("tag", num(*tag)), ("data_len", num(*data_len)), ("dir", text(dir))];
+                let mut f: Fields = vec![("opcode", num(*opcode)), ("tag", num(*tag)), ("data_len", num(*data_len)), ("direction", text(dir))];
                 if let Some(l) = lba {
                     f.push(("lba", num(*l)));
                 }
@@ -859,7 +929,7 @@ fn event_fields(event: &ForensicEvent) -> (String, Fields) {
                 ("scsi_command".into(), f)
             }
             ScsiEvent::Result { opcode, status, transferred, sense_key } => {
-                let mut f: Fields = vec![("opcode", num(*opcode)), ("status", text(status)), ("transferred", unum(*transferred))];
+                let mut f: Fields = vec![("opcode", num(*opcode)), ("status", text(status.wire())), ("transferred", unum(*transferred))];
                 if let Some(k) = sense_key {
                     f.push(("sense_key", num(*k)));
                 }
@@ -869,7 +939,7 @@ fn event_fields(event: &ForensicEvent) -> (String, Fields) {
         },
         ForensicEvent::Btrfs(b) => match b {
             BtrfsEvent::Mount { generation, root_bytenr } => ("btrfs_mount".into(), vec![("generation", num(*generation)), ("root_bytenr", num(*root_bytenr))]),
-            BtrfsEvent::BeginFile { file_len } => ("btrfs_begin_file".into(), vec![("file_len", num(*file_len))]),
+            BtrfsEvent::BeginFile { file_len } => ("btrfs_begin_file".into(), vec![("len_bytes", num(*file_len))]),
             BtrfsEvent::WriteChunk { len, bytenr } => ("btrfs_write_chunk".into(), vec![("len", unum(*len)), ("bytenr", num(*bytenr))]),
             BtrfsEvent::FinishFile { ino, total_bytes } => ("btrfs_finish_file".into(), vec![("ino", num(*ino)), ("total_bytes", num(*total_bytes))]),
             BtrfsEvent::AbandonFile { runs_count, total_bytes } => ("btrfs_abandon_file".into(), vec![("runs_count", unum(*runs_count)), ("total_bytes", num(*total_bytes))]),
@@ -900,12 +970,19 @@ fn event_fields(event: &ForensicEvent) -> (String, Fields) {
             Ext4Event::MarkDirty => ("ext4_mark_dirty".into(), vec![]),
             Ext4Event::MarkClean => ("ext4_mark_clean".into(), vec![]),
             Ext4Event::Flush { ok } => ("ext4_flush".into(), vec![("ok", Bool(*ok))]),
+            Ext4Event::LeftDirty { cleanup_code, resync_ok } => {
+                let mut f: Fields = vec![("resync_ok", Bool(*resync_ok))];
+                if let Some(c) = cleanup_code {
+                    f.push(("cleanup_code", num(*c)));
+                }
+                ("ext4_left_dirty".into(), f)
+            }
             Ext4Event::Error { stage, code } => ("ext4_error".into(), vec![("stage", text(stage)), ("code", num(*code))]),
         },
         // Location only. `message` is deliberately not rendered: it is a
         // literal today, but this is the one function every line passes
         // through, so the rule is enforced here too.
-        ForensicEvent::Panic(p) => ("panic".into(), vec![("file", serde_json::Value::String(p.file.clone())), ("line", num(p.line))]),
+        ForensicEvent::Panic(p) => ("panic".into(), vec![("at", text(&p.file)), ("line", num(p.line))]),
     }
 }
 
@@ -963,15 +1040,15 @@ const WINDOW: u64 = 0x1_0000;
             E::Usb(UsbEvent::Submit { ep: 1, count: 2, bytes: 3, gen: 4 }),
             E::Usb(UsbEvent::Reap { ep: 1, status: -2, bytes: 3, gen: 4 }),
             E::Usb(UsbEvent::Timeout { ep: 1, elapsed_ms: 2, active_urbs: 3, gen: 4 }),
-            E::Usb(UsbEvent::StateTransition { from: "ready", to: "dead" }),
-            E::Usb(UsbEvent::Reset { kind: "port", status: 0 }),
+            E::Usb(UsbEvent::StateTransition { from: "Healthy", to: "Dead" }),
+            E::Usb(UsbEvent::Reset { kind: "bot_mass_storage_reset", status: 0 }),
             E::Usb(UsbEvent::Drain { discarded_count: 1, remaining: 2 }),
             E::Usb(UsbEvent::DrainAborted { errno: 110 }),
             E::Usb(UsbEvent::UnrecognizedReap { ptr: 0xdead }),
-            E::Scsi(ScsiEvent::Command { opcode: 0x2a, tag: 7, data_len: 512, dir: "out", lba: Some(9), blocks: Some(1) }),
-            E::Scsi(ScsiEvent::Command { opcode: 0x00, tag: 7, data_len: 0, dir: "none", lba: None, blocks: None }),
-            E::Scsi(ScsiEvent::Result { opcode: 0x2a, status: "good", transferred: 512, sense_key: None }),
-            E::Scsi(ScsiEvent::Result { opcode: 0x2a, status: "check", transferred: 0, sense_key: Some(3) }),
+            E::Scsi(ScsiEvent::Command { opcode: 0x2a, tag: 7, data_len: 512, dir: "OUT", lba: Some(9), blocks: Some(1) }),
+            E::Scsi(ScsiEvent::Command { opcode: 0x00, tag: 7, data_len: 0, dir: "NONE", lba: None, blocks: None }),
+            E::Scsi(ScsiEvent::Result { opcode: 0x2a, status: ScsiStatus::Passed, transferred: 512, sense_key: None }),
+            E::Scsi(ScsiEvent::Result { opcode: 0x2a, status: ScsiStatus::Failed, transferred: 0, sense_key: Some(3) }),
             E::Scsi(ScsiEvent::Reset),
             E::Btrfs(BtrfsEvent::Mount { generation: 1, root_bytenr: 2 }),
             E::Btrfs(BtrfsEvent::BeginFile { file_len: 1 }),
@@ -1003,9 +1080,11 @@ const WINDOW: u64 = 0x1_0000;
             E::Ext4(Ext4Event::MarkDirty),
             E::Ext4(Ext4Event::MarkClean),
             E::Ext4(Ext4Event::Flush { ok: false }),
-            E::Ext4(Ext4Event::Error { stage: "finish", code: 5 }),
+            E::Ext4(Ext4Event::LeftDirty { cleanup_code: Some(9), resync_ok: false }),
+            E::Ext4(Ext4Event::LeftDirty { cleanup_code: None, resync_ok: true }),
+            E::Ext4(Ext4Event::Error { stage: "finish_file", code: 5 }),
             E::Panic(PanicEvent {
-                file: "src/lib.rs".into(),
+                file: "src/fs/ext4/file.rs".into(),
                 line: 10,
                 col: 4,
                 message: "cannot open /sdcard/secret-folder/file.txt".into(),
@@ -1067,8 +1146,9 @@ const WINDOW: u64 = 0x1_0000;
                 Ext4Event::MarkClean => 39,
                 Ext4Event::Flush { .. } => 40,
                 Ext4Event::Error { .. } => 41,
+                Ext4Event::LeftDirty { .. } => 42,
             },
-            E::Panic(_) => 42,
+            E::Panic(_) => 43,
         }
     }
 
@@ -1077,7 +1157,7 @@ const WINDOW: u64 = 0x1_0000;
         let mut seen: Vec<usize> = every_variant().iter().map(witness).collect();
         seen.sort_unstable();
         seen.dedup();
-        assert_eq!(seen, (0..=42).collect::<Vec<_>>(), "every_variant() misses a variant");
+        assert_eq!(seen, (0..=43).collect::<Vec<_>>(), "every_variant() misses a variant");
     }
 
     #[test]
@@ -1088,7 +1168,7 @@ const WINDOW: u64 = 0x1_0000;
             E::Usb(UsbEvent::Submit { ep: 1, count: 1, bytes: 1, gen: 1 }),
             E::Usb(UsbEvent::Reap { ep: 1, status: 0, bytes: 1, gen: 1 }),
             E::Scsi(ScsiEvent::Command { opcode: 0x2a, tag: 1, data_len: 1, dir: "out", lba: Some(1), blocks: Some(1) }),
-            E::Scsi(ScsiEvent::Result { opcode: 0x2a, status: "good", transferred: 1, sense_key: None }),
+            E::Scsi(ScsiEvent::Result { opcode: 0x2a, status: ScsiStatus::Passed, transferred: 1, sense_key: None }),
             E::Btrfs(BtrfsEvent::WriteChunk { len: 1, bytenr: 1 }),
             E::Btrfs(BtrfsEvent::BeginFile { file_len: 1 }),
             E::Btrfs(BtrfsEvent::LeafSplit { tree: 1, shape: 1, groups: 1, pos_class: 1 }),
@@ -1106,12 +1186,12 @@ const WINDOW: u64 = 0x1_0000;
         let notable = [
             E::Usb(UsbEvent::Timeout { ep: 1, elapsed_ms: 1, active_urbs: 1, gen: 1 }),
             E::Usb(UsbEvent::StateTransition { from: "a", to: "b" }),
-            E::Usb(UsbEvent::Reset { kind: "port", status: 0 }),
+            E::Usb(UsbEvent::Reset { kind: "bot_mass_storage_reset", status: 0 }),
             E::Usb(UsbEvent::Drain { discarded_count: 1, remaining: 0 }),
             E::Usb(UsbEvent::DrainAborted { errno: 1 }),
             E::Usb(UsbEvent::UnrecognizedReap { ptr: 1 }),
-            E::Scsi(ScsiEvent::Result { opcode: 0x2a, status: "check", transferred: 0, sense_key: Some(2) }),
-            E::Scsi(ScsiEvent::Result { opcode: 0x2a, status: "busy", transferred: 0, sense_key: None }),
+            E::Scsi(ScsiEvent::Result { opcode: 0x2a, status: ScsiStatus::Failed, transferred: 0, sense_key: Some(2) }),
+            E::Scsi(ScsiEvent::Result { opcode: 0x2a, status: ScsiStatus::NotReady, transferred: 0, sense_key: None }),
             E::Scsi(ScsiEvent::Reset),
             E::Btrfs(BtrfsEvent::Mount { generation: 1, root_bytenr: 1 }),
             E::Btrfs(BtrfsEvent::FinishFile { ino: 1, total_bytes: 1 }),
@@ -1133,6 +1213,7 @@ const WINDOW: u64 = 0x1_0000;
             E::Ext4(Ext4Event::MarkDirty),
             E::Ext4(Ext4Event::MarkClean),
             E::Ext4(Ext4Event::Flush { ok: true }),
+            E::Ext4(Ext4Event::LeftDirty { cleanup_code: None, resync_ok: true }),
             E::Ext4(Ext4Event::Error { stage: "x", code: 1 }),
             E::Panic(PanicEvent { file: "src/a.rs".into(), line: 1, col: 1, message: String::new() }),
         ];
@@ -1143,7 +1224,7 @@ const WINDOW: u64 = 0x1_0000;
         let mut covered: Vec<usize> = hot.iter().chain(notable.iter()).map(witness).collect();
         covered.sort_unstable();
         covered.dedup();
-        assert_eq!(covered, (0..=42).collect::<Vec<_>>());
+        assert_eq!(covered, (0..=43).collect::<Vec<_>>());
     }
 
     /// Drain until our markers are provably out of the way.
@@ -1242,9 +1323,11 @@ const WINDOW: u64 = 0x1_0000;
         }
         let by_ev = |name: &str| events.iter().find(|o| o["ev"] == name).unwrap_or_else(|| panic!("no {name}"));
         assert_eq!(by_ev("usb_timeout")["ep"], 1);
-        assert_eq!(by_ev("usb_state_transition")["from"], "ready");
+        assert_eq!(by_ev("usb_state_transition")["from"], "healthy");
+        assert_eq!(by_ev("usb_reset")["reset_kind"], "bot_mass_storage_reset");
+        assert_eq!(by_ev("scsi_result")["status"], "passed");
         assert_eq!(by_ev("ext4_finish_file")["ino"], 12);
-        assert_eq!(by_ev("ext4_error")["stage"], "finish");
+        assert_eq!(by_ev("ext4_error")["stage"], "finish_file");
         assert_eq!(by_ev("ext4_mark_dirty")["ev"], "ext4_mark_dirty");
         assert_eq!(by_ev("btrfs_commit")["transid"], 3);
         assert_eq!(by_ev("scsi_reset")["ev"], "scsi_reset");
@@ -1271,7 +1354,7 @@ const WINDOW: u64 = 0x1_0000;
         let v: Value = serde_json::from_str(&text).expect("valid JSON");
         let o = &v["events"][0];
         assert_eq!(o["ev"], "panic");
-        assert_eq!(o["file"], "src/lib.rs");
+        assert_eq!(o["at"], "src.lib.rs");
         assert_eq!(o["line"], 10);
         assert!(o.get("message").is_none());
     }
@@ -1308,5 +1391,72 @@ const WINDOW: u64 = 0x1_0000;
             let hit = v["events"].as_array().expect("events").iter().any(|o| o["ev"] == "usb_submit" && o["gen"] == MARK + 4 * WINDOW);
             assert!(hit, "ring json lacks the hot marker event");
         }
+    }
+
+    fn every_record() -> Vec<ForensicRecord> {
+        every_variant()
+            .into_iter()
+            .enumerate()
+            .map(|(i, event)| ForensicRecord { seq: i as u64 + 1, timestamp_ms: 1_700_000_000_000 + i as u64, event })
+            .collect()
+    }
+
+    /// C7: every rendered key and string value satisfies the grammar the
+    /// Kotlin sanitizer enforces. Checked on rendered output, so a new
+    /// variant, a renamed field or a new string literal is covered.
+    #[test]
+    fn wire_contract_every_key_and_value_is_kotlin_safe() {
+        const RESERVED: [&str; 9] = ["t", "seq", "sid", "src", "ev", "kind", "nt", "nseq", "xfer"];
+        const ENVELOPE: [&str; 3] = ["nseq", "t", "ev"];
+        const BANNED: [&str; 9] = ["name", "path", "file", "filename", "dir", "label", "uuid", "serial", "entry"];
+        let wire_value = |s: &str| {
+            (1..=48).contains(&s.len())
+                && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "_.:-".contains(c))
+        };
+        let v: Value = serde_json::from_str(&events_to_json(&every_record(), 0)).expect("valid JSON");
+        let events = v["events"].as_array().expect("events");
+        assert_eq!(events.len(), every_variant().len());
+        for o in events {
+            let o = o.as_object().expect("object");
+            for (k, val) in o {
+                assert!(snake_ok(k), "key {k:?} is not [a-z0-9_]+");
+                if !ENVELOPE.contains(&k.as_str()) {
+                    assert!(!RESERVED.contains(&k.as_str()), "payload key {k:?} collides with a reserved key in {o:?}");
+                }
+                for part in k.split('_') {
+                    assert!(!BANNED.contains(&part), "key {k:?} contains banned word {part:?}");
+                }
+                if let Value::String(sv) = val {
+                    assert!(wire_value(sv), "value {sv:?} of {k} breaks ^[a-z0-9_.:-]{{1,48}}$ in {o:?}");
+                }
+            }
+        }
+    }
+
+    fn golden_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../android/app/src/test/resources/native-events-golden.json")
+    }
+
+    /// The cross-language contract: one record of EVERY native variant,
+    /// rendered by the real renderer, checked in. The Kotlin NativeDrain test
+    /// feeds this exact file through its parser and asserts nothing is
+    /// dropped. Rewrite with `UPDATE_GOLDEN=1 cargo test -p luks_core --lib
+    /// forensic::tests::golden`.
+    #[test]
+    fn golden_native_events_file_is_current() {
+        let v: Value = serde_json::from_str(&events_to_json(&every_record(), 3)).expect("valid JSON");
+        let mut want = serde_json::to_string_pretty(&v).expect("pretty-print");
+        want.push('\n');
+        let path = golden_path();
+        if std::env::var("UPDATE_GOLDEN").is_ok_and(|v| v == "1") {
+            let dir = path.parent().expect("golden dir");
+            std::fs::create_dir_all(dir).expect("create golden dir");
+            std::fs::write(&path, &want).expect("write golden");
+            return;
+        }
+        let have = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("golden {} unreadable ({e}); regenerate with UPDATE_GOLDEN=1", path.display()));
+        assert_eq!(have, want, "native-events-golden.json is stale; regenerate with UPDATE_GOLDEN=1");
     }
 }

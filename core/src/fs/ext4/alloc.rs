@@ -1088,8 +1088,10 @@ impl<D: WriteAt> Ext4<D> {
                 Err(a.err)
             }
             Err(a) => {
+                let cleanup_code = a.cleanup.as_ref().map(|e| e.forensic_code());
                 self.cleanup_failure = a.cleanup;
-                self.resync_after_failure();
+                let resync_ok = self.resync_after_failure();
+                crate::forensic::record_ext4(crate::forensic::Ext4Event::LeftDirty { cleanup_code, resync_ok });
                 Err(a.err)
             }
         }
@@ -1104,9 +1106,14 @@ impl<D: WriteAt> Ext4<D> {
 
     /// Bring memory back in line with the disk after a failed window; on
     /// failure to do even that, make the session refuse further writes.
-    pub(super) fn resync_after_failure(&mut self) {
+    ///
+    /// Returns whether memory could be reloaded from disk.
+    pub(super) fn resync_after_failure(&mut self) -> bool {
         if self.reload_metadata().is_err() {
             self.sb.state &= !super::STATE_CLEANLY_UNMOUNTED;
+            false
+        } else {
+            true
         }
     }
 

@@ -495,3 +495,7 @@ path = "tests/ext4/ext4_health.rs"
 name = "ext4_forensic"
 path = "tests/ext4/ext4_forensic.rs"
 required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "scsi_forensic"
+path = "tests/device_scsi/scsi_forensic.rs"

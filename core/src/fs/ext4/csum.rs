@@ -269,6 +269,21 @@ impl Seed {
         Some(crc32c_seed(crc, &block[..block.len() - DIR_TAIL_SIZE]))
     }
 
+    /// An htree (`dx_root` / `dx_node`) block's checksum. The covered bytes are
+    /// the block up to the end of the live index entries, then the tail's
+    /// 4-byte reserved word, then four zero bytes standing in for the
+    /// checksum field (`ext4_dx_csum`).
+    pub fn dx_block(&self, dir_ino: u64, dir_generation: u32, covered: &[u8], tail_reserved: [u8; 4]) -> Option<u32> {
+        if !self.enabled {
+            return None;
+        }
+        let crc = crc32c_seed(self.seed, &(dir_ino as u32).to_le_bytes());
+        let crc = crc32c_seed(crc, &dir_generation.to_le_bytes());
+        let crc = crc32c_seed(crc, covered);
+        let crc = crc32c_seed(crc, &tail_reserved);
+        Some(crc32c_seed(crc, &[0u8; 4]))
+    }
+
     /// An extent tree block's checksum, carried in an `ext4_extent_tail` struct
     /// at the very end of the block.
     ///

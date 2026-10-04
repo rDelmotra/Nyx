@@ -28,6 +28,7 @@ mod leak_class;
 use common::fail_after::FailAfterNWrites;
 use luks_core::device::{FileDevice, ReadAt, WriteAt};
 use luks_core::fs::ext4::Ext4;
+use luks_core::fs::health::Verdict;
 use luks_core::fs::FileType;
 use std::path::PathBuf;
 use std::process::Command;
@@ -61,6 +62,12 @@ fn grade(img: &PathBuf) -> Result<(), String> {
         String::from_utf8_lossy(&out.stderr)
     );
     if out.status.success() { Ok(()) } else { Err(text) }
+}
+
+/// F8: what the read-only checker says about an image on disk.
+fn health(img: &PathBuf) -> luks_core::fs::health::HealthReport {
+    let fs = Ext4::mount(FileDevice::open(img).expect("open read-only")).expect("mount");
+    fs.check_health(&|| false)
 }
 
 fn payload() -> Vec<u8> {
@@ -229,6 +236,11 @@ fn f0_2a_fail_before_publish_image_always_clean() {
         if disk_state(&img) & 1 == 0 {
             dirty.push(format!("N={n}/{total}: marked not-clean before publish started"));
         }
+        // F8: the checker must agree with the kernel that nothing is wrong.
+        let h = health(&img);
+        if h.verdict != Verdict::Clean {
+            dirty.push(format!("N={n}/{total}: health {:?} {:?}", h.verdict, h.findings));
+        }
     }
     assert!(dirty.is_empty(), "{} of {} pre-publish budgets left the image dirty:\n{}", dirty.len(), before_finish + 1, dirty.join("\n"));
 }
@@ -243,6 +255,9 @@ fn f0_2b_fail_inside_publish_is_flagged_and_leak_class_only() {
     let mut violations = Vec::new();
     let mut flagged = 0;
     let mut clean_after_all = false;
+    // F8: at every boundary the checker's verdict must be the kernel's class:
+    // never Corrupt on a leak-class image, never Clean on a dirty one.
+    let mut health_classes: Vec<Verdict> = Vec::new();
     for n in before_finish + 1..=total {
         let img = scratch(&format!("b{n}"));
         {
@@ -250,7 +265,20 @@ fn f0_2b_fail_inside_publish_is_flagged_and_leak_class_only() {
             scenario(&mut fs, attempted_of);
         }
         let marked_clean = disk_state(&img) & 1 == 1;
-        match grade(&img) {
+        let graded = grade(&img);
+        let expected = match &graded {
+            Ok(()) if marked_clean => Verdict::Clean,
+            Ok(()) => Verdict::Leaks,
+            Err(text) if non_leak_lines(text, ino).is_empty() => Verdict::Leaks,
+            Err(_) => Verdict::Corrupt,
+        };
+        let h = health(&img);
+        if h.verdict != expected {
+            violations.push(format!("N={n}/{total}: health {:?} {:?}, the kernel says {expected:?}", h.verdict, h.findings));
+        }
+        println!("f0_2b N={n}/{total}: health {:?} {:?}", h.verdict, h.findings);
+        health_classes.push(h.verdict);
+        match graded {
             Ok(()) => {
                 println!("f0_2b N={n}/{total}: e2fsck clean, marked_clean={marked_clean}");
                 if n == total {
@@ -277,5 +305,11 @@ fn f0_2b_fail_inside_publish_is_flagged_and_leak_class_only() {
     }
     assert!(clean_after_all, "the complete run must end clean to e2fsck and marked clean");
     assert!(flagged > 0, "vacuity: some publish boundary must leave a flagged, dirty image");
+    // The key negative control: the sweep produced leak-class images and the
+    // checker called them amber, and none red.
+    let leaks = health_classes.iter().filter(|v| **v == Verdict::Leaks).count();
+    assert!(leaks >= 2, "vacuity: the sweep must contain several leak-class images ({health_classes:?})");
+    assert!(!health_classes.contains(&Verdict::Corrupt), "a leak-class image was called Corrupt: {health_classes:?}");
+    assert_eq!(health_classes.last(), Some(&Verdict::Clean), "the complete run must be Clean");
     assert!(violations.is_empty(), "{} boundaries violate the publish-window contract:\n{}", violations.len(), violations.join("\n"));
 }

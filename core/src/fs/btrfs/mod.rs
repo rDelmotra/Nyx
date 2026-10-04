@@ -31,6 +31,7 @@ pub mod crc32c;
 pub mod cursor;
 pub mod dir;
 pub mod extent;
+pub mod health;
 pub mod inode;
 pub mod subvol;
 pub mod superblock;

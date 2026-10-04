@@ -135,6 +135,12 @@ pub mod code {
     /// opened. The read was refused instead of returning another file's bytes.
     /// The remedy is to re-list and start the transfer again.
     pub const FILE_CHANGED: i32 = 23;
+
+    /// Reserved for Kotlin: the app refused a write because the F8 health
+    /// check found errors. Never produced natively; listed so the number is
+    /// not reused.
+    #[allow(dead_code)]
+    pub const HEALTH_READ_ONLY: i32 = 24;
 }
 
 pub fn error_code(e: &LuksError) -> i32 {
@@ -1494,6 +1500,101 @@ impl VolumeHandle {
     }
 }
 
+impl VolumeHandle {
+    /// F8: run the drive-health check and return its JSON (see [`health_json`]).
+    ///
+    /// `cancel_token` is a token from `register_cancel_token` (0 = none); the
+    /// checker polls it between units of work and stops with
+    /// `unknown/cancelled`.
+    pub fn health_check_json(&self, cancel_token: u64) -> String {
+        self.health_check_json_with(|| cancel_token != 0 && is_cancelled(cancel_token))
+    }
+
+    /// [`health_check_json`](Self::health_check_json) with the cancel poll
+    /// supplied by the caller (tests drive cancellation and panics through it).
+    ///
+    /// # Locking, panics, fences
+    ///
+    /// * One `fs` lock for the whole scan (A6): the scan sees one coherent
+    ///   state, and a transfer that wants the lock waits at most one poll
+    ///   interval because Kotlin signals the token first.
+    /// * The checker runs under `catch_unwind` **inside** the lock (A7). The
+    ///   guard is held outside the closure, so a panic unwinds only to this
+    ///   frame and the guard drops normally: the mutex is not poisoned and
+    ///   `fs_for_writing` keeps working. A checker panic is a bug in the
+    ///   checker, not a sign the drive is in an unknown state: it only reads.
+    /// * Taken with `fs_for_reading`, so a fenced or poisoned session is
+    ///   checked too. The checker reads from the device, never from the
+    ///   in-memory write state, and a fenced session is exactly when the user
+    ///   wants to know what the drive looks like. Refusing there would make the
+    ///   light go grey in the one situation it matters.
+    pub fn health_check_json_with(&self, cancel: impl Fn() -> bool) -> String {
+        crate::install_panic_hook();
+        let started = std::time::Instant::now();
+        let fs = self.fs_for_reading();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &*fs {
+            MountedFs::Ext4(e) => e.check_health(&cancel),
+            MountedFs::Btrfs(b) => b.check_health(&cancel),
+        }));
+        drop(fs);
+        let report = match outcome {
+            Ok(r) => r,
+            Err(_payload) => {
+                // Logs and records the source location only, never the payload
+                // (it can hold names); the text it returns is not surfaced.
+                crate::report_panic();
+                luks_core::fs::health::Findings::default()
+                    .unknown(luks_core::fs::health::UnknownReason::Internal, started.elapsed())
+            }
+        };
+        health_json(&report)
+    }
+}
+
+/// The JSON the app reads: kinds and counts only, no samples, no paths.
+///
+/// `writeSafe` is true for a clean drive, and for a leaks verdict whose every
+/// finding is `write_safe()`. It is false for corrupt and for unknown (an
+/// unjudged drive is not "safe", but Kotlin only gates on corrupt / unsafe
+/// leaks, so unknown never blocks a write by itself).
+pub fn health_json(report: &luks_core::fs::health::HealthReport) -> String {
+    use luks_core::fs::health::{UnknownReason, Verdict};
+    let verdict = match report.verdict {
+        Verdict::Clean => "clean",
+        Verdict::Leaks => "leaks",
+        Verdict::Corrupt => "corrupt",
+        Verdict::Unknown => "unknown",
+    };
+    let unknown = report.unknown.map(|r| match r {
+        UnknownReason::Cancelled => "cancelled",
+        UnknownReason::Unsupported => "unsupported",
+        UnknownReason::TooLarge => "too_large",
+        UnknownReason::Busy => "busy",
+        UnknownReason::Io => "io",
+        UnknownReason::Internal => "internal",
+    });
+    let write_safe = match report.verdict {
+        Verdict::Clean => true,
+        Verdict::Leaks => report.findings.keys().all(|k| k.write_safe()),
+        Verdict::Corrupt | Verdict::Unknown => false,
+    };
+    // An unknown verdict carries no findings across the boundary: whatever the
+    // checker saw before it stopped is not a judgement.
+    let findings: serde_json::Map<String, Value> = if report.verdict == Verdict::Unknown {
+        serde_json::Map::new()
+    } else {
+        report.findings.iter().map(|(k, n)| (k.name().to_string(), json!(n))).collect()
+    };
+    json!({
+        "verdict": verdict,
+        "unknown": unknown,
+        "writeSafe": write_safe,
+        "findings": findings,
+        "elapsedMs": report.elapsed.as_millis() as u64,
+    })
+    .to_string()
+}
+
 /// Time the CPU-side work in isolation, with no USB involved.
 ///
 /// This exists because comparing the raw-read benchmark against the full-stack
@@ -2717,5 +2818,226 @@ mod tests {
             "a LUKS volume must not need arming"
         );
     }
-}
 
+    // ------------------------------------------------------------- F8 health
+
+    /// A plain ext2/ext4 volume on a scratch copy of `fixture` with `patch`
+    /// applied to the image bytes first. Unlinked at once: the fd keeps it alive and
+    /// nothing is left in $TMPDIR if an assertion panics.
+    fn patched_plain(fixture: &str, test: &str, patch: impl FnOnce(&mut Vec<u8>)) -> VolumeHandle {
+        let src = format!("{}/../fixtures/ext4/{fixture}", env!("CARGO_MANIFEST_DIR"));
+        let mut bytes = std::fs::read(src).expect("read fixture");
+        patch(&mut bytes);
+        let scratch = std::env::temp_dir().join(format!("luks-jni-health-{test}.img"));
+        std::fs::write(&scratch, &bytes).expect("write scratch");
+        #[cfg(feature = "dangerous-write-support")]
+        let fs_dev = {
+            let len = bytes.len() as u64;
+            luks_core::device::FileDevice::open_writable(&scratch, len).expect("open scratch")
+        };
+        #[cfg(not(feature = "dangerous-write-support"))]
+        let fs_dev = luks_core::device::FileDevice::open(&scratch).expect("open scratch");
+        std::fs::remove_file(&scratch).expect("unlink scratch");
+        let fs_len = bytes.len() as u64;
+        let disk = TestMbrDisk::new(fs_dev, 0x83);
+        let dev = DeviceHandle::new(disk, 512, (512 + fs_len) / 512, "T".into(), "E".into())
+            .expect("scan MBR disk");
+        dev.open_plain(512).expect("open plain ext4")
+    }
+
+    /// small-1k has metadata_csum: a hand-patched bitmap or superblock would
+    /// (rightly) fail its checksum, so shape tests that patch use ext2-1k.
+    fn patched_plain_ext4(test: &str, patch: impl FnOnce(&mut Vec<u8>)) -> VolumeHandle {
+        patched_plain("small-1k.img", test, patch)
+    }
+
+    fn patched_plain_ext2(test: &str, patch: impl FnOnce(&mut Vec<u8>)) -> VolumeHandle {
+        patched_plain("ext2-1k.img", test, patch)
+    }
+
+    /// Group 0's block bitmap offset in a 1 KiB-block image (GDT is block 2).
+    fn bitmap0_offset(img: &[u8]) -> usize {
+        u32::from_le_bytes(img[2048..2052].try_into().unwrap()) as usize * 1024
+    }
+
+    fn health(vol: &VolumeHandle) -> Value {
+        serde_json::from_str(&vol.health_check_json(0)).expect("health json")
+    }
+
+    #[test]
+    fn a_clean_image_reports_clean_and_write_safe() {
+        let vol = patched_plain_ext4("clean", |_| {});
+        let h = health(&vol);
+        assert_eq!(h["verdict"], "clean", "{h}");
+        assert_eq!(h["writeSafe"], true);
+        assert!(h["unknown"].is_null());
+        assert_eq!(h["findings"].as_object().unwrap().len(), 0);
+        assert!(h["elapsedMs"].is_u64());
+    }
+
+    /// The btrfs half goes through the same entry point (read-only open of the
+    /// committed fixture; nothing is written).
+    #[test]
+    fn a_clean_btrfs_image_reports_clean() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../fixtures/btrfs/plain.img");
+        let fs_dev = luks_core::device::FileDevice::open(path).expect("open btrfs fixture");
+        let fs_len = fs_dev.len().unwrap();
+        let disk = TestMbrDisk::new(fs_dev, 0x83);
+        let dev = DeviceHandle::new(disk, 512, (512 + fs_len) / 512, "T".into(), "B".into())
+            .expect("scan MBR disk");
+        let vol = dev.open_plain(512).expect("open plain btrfs");
+        let h = health(&vol);
+        assert_eq!(h["verdict"], "clean", "{h}");
+        assert_eq!(h["writeSafe"], true);
+    }
+
+    #[test]
+    fn a_leaked_block_is_leaks_and_write_safe() {
+        // Set the first free bit of group 0's bitmap: a block nobody owns.
+        let vol = patched_plain_ext2("leak", |img| {
+            let off = bitmap0_offset(img);
+            let byte = (0..1024)
+                .find(|&i| img[off + i] != 0xFF)
+                .expect("a free bit in group 0");
+            let bit = (0..8).find(|b| img[off + byte] & (1 << b) == 0).unwrap();
+            img[off + byte] |= 1 << bit;
+        });
+        let h = health(&vol);
+        assert_eq!(h["verdict"], "leaks", "{h}");
+        assert_eq!(h["findings"]["leaked_blocks"], 1, "{h}");
+        assert_eq!(h["writeSafe"], true, "{h}");
+    }
+
+    #[test]
+    fn a_dirty_flag_is_leaks_but_not_write_safe() {
+        // s_state (superblock + 0x3A): drop VALID_FS (bit 0).
+        let vol = patched_plain_ext2("dirty", |img| img[1024 + 0x3A] &= !1);
+        let h = health(&vol);
+        assert_eq!(h["verdict"], "leaks", "{h}");
+        assert_eq!(h["findings"]["marked_dirty"], 1, "{h}");
+        assert_eq!(h["writeSafe"], false, "{h}");
+    }
+
+    #[test]
+    fn a_cleared_bitmap_bit_under_live_data_is_corrupt() {
+        // Clear every used bit in group 0's bitmap: owned blocks now look free.
+        let vol = patched_plain_ext2("corrupt", |img| {
+            let off = bitmap0_offset(img);
+            img[off..off + 16].fill(0);
+        });
+        let h = health(&vol);
+        assert_eq!(h["verdict"], "corrupt", "{h}");
+        assert_eq!(h["writeSafe"], false);
+        assert!(h["findings"]["block_in_use_but_free"].as_u64().unwrap() > 0, "{h}");
+    }
+
+    #[test]
+    fn a_cancelled_check_is_unknown_cancelled_with_no_findings() {
+        let vol = patched_plain_ext2("cancel", |img| img[1024 + 0x3A] &= !1);
+        let h: Value = serde_json::from_str(&vol.health_check_json_with(|| true)).unwrap();
+        assert_eq!(h["verdict"], "unknown", "{h}");
+        assert_eq!(h["unknown"], "cancelled");
+        assert_eq!(h["writeSafe"], false);
+        assert_eq!(h["findings"].as_object().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn a_registered_token_cancels_through_the_native_registry() {
+        let vol = patched_plain_ext4("token", |_| {});
+        let token = register_cancel_token();
+        cancel_operation(token);
+        let h: Value = serde_json::from_str(&vol.health_check_json(token)).unwrap();
+        unregister_cancel_token(token);
+        assert_eq!(h["unknown"], "cancelled", "{h}");
+        // An unsignalled token does not stop the check.
+        let live = register_cancel_token();
+        let h: Value = serde_json::from_str(&vol.health_check_json(live)).unwrap();
+        unregister_cancel_token(live);
+        assert_eq!(h["verdict"], "clean", "{h}");
+    }
+
+    #[test]
+    fn every_unknown_reason_and_no_samples_cross_the_boundary() {
+        use luks_core::fs::health::{FindingKind, Findings, UnknownReason};
+        use std::time::Duration;
+        for (reason, name) in [
+            (UnknownReason::Cancelled, "cancelled"),
+            (UnknownReason::Unsupported, "unsupported"),
+            (UnknownReason::TooLarge, "too_large"),
+            (UnknownReason::Busy, "busy"),
+            (UnknownReason::Io, "io"),
+            (UnknownReason::Internal, "internal"),
+        ] {
+            let mut f = Findings::default();
+            f.add(FindingKind::LeakedBlocks, 3, Some(12345));
+            let j: Value =
+                serde_json::from_str(&health_json(&f.unknown(reason, Duration::from_millis(7)))).unwrap();
+            assert_eq!(j["verdict"], "unknown");
+            assert_eq!(j["unknown"], name);
+            assert_eq!(j["elapsedMs"], 7);
+            assert_eq!(j["findings"].as_object().unwrap().len(), 0);
+        }
+        let mut f = Findings::default();
+        f.add(FindingKind::LeakedBlocks, 3, Some(12345));
+        let text = health_json(&f.finish(Duration::ZERO));
+        assert!(!text.contains("12345"), "block numbers must not cross: {text}");
+    }
+
+    #[test]
+    fn write_safe_is_decided_per_finding_kind() {
+        use luks_core::fs::health::{FindingKind, Findings};
+        use std::time::Duration;
+        let safe = |kinds: &[FindingKind]| {
+            let mut f = Findings::default();
+            for k in kinds {
+                f.add(*k, 1, None);
+            }
+            let j: Value = serde_json::from_str(&health_json(&f.finish(Duration::ZERO))).unwrap();
+            (j["verdict"].as_str().unwrap().to_string(), j["writeSafe"].as_bool().unwrap())
+        };
+        assert_eq!(safe(&[FindingKind::LeakedBlocks, FindingKind::LeakedInodes]), ("leaks".into(), true));
+        assert_eq!(safe(&[FindingKind::LeakedBlocks, FindingKind::UnattachedInode]), ("leaks".into(), false));
+        assert_eq!(safe(&[FindingKind::LinkCountLow]), ("leaks".into(), false));
+        assert_eq!(safe(&[FindingKind::DoubleOwnedBlock]), ("corrupt".into(), false));
+    }
+
+    /// A checker panic is `unknown/internal`; the fs lock is not poisoned.
+    #[test]
+    fn a_checker_panic_is_unknown_internal_and_does_not_poison_the_lock() {
+        let vol = patched_plain_ext4("panic", |_| {});
+        let h: Value = serde_json::from_str(&vol.health_check_json_with(|| panic!("boom"))).unwrap();
+        assert_eq!(h["verdict"], "unknown", "{h}");
+        assert_eq!(h["unknown"], "internal");
+        assert!(!vol.fs.is_poisoned(), "the checker panic must not poison the fs mutex");
+        // And the volume still reads and still checks.
+        assert_eq!(health(&vol)["verdict"], "clean");
+        vol.read_file("/hello.txt", 1024).expect("read after a checker panic");
+    }
+
+    /// The same, for the write side: the next mutating call works and the
+    /// session is not fenced.
+    #[cfg(feature = "dangerous-write-support")]
+    #[test]
+    fn after_a_checker_panic_the_next_write_works_and_the_session_is_not_fenced() {
+        let vol = patched_plain_ext4("panic-write", |_| {});
+        vol.arm_plain_writes();
+        let h: Value = serde_json::from_str(&vol.health_check_json_with(|| panic!("boom"))).unwrap();
+        assert_eq!(h["unknown"], "internal");
+        assert!(vol.fence_reason().is_none(), "a checker panic must not fence the session");
+        vol.write_file("/", "after.txt", b"ok").expect("write after a checker panic");
+        assert_eq!(vol.read_file("/after.txt", 16).unwrap(), b"ok");
+        // The file we just wrote leaves the drive clean.
+        assert_eq!(health(&vol)["verdict"], "clean");
+    }
+
+    /// Fenced sessions are checked read-only, not refused.
+    #[cfg(feature = "dangerous-write-support")]
+    #[test]
+    fn a_fenced_session_can_still_be_checked() {
+        let vol = patched_plain_ext4("fenced", |_| {});
+        vol.arm_plain_writes();
+        vol.fence_writes("test fence");
+        assert!(vol.fence_reason().is_some());
+        assert_eq!(health(&vol)["verdict"], "clean");
+    }
+}

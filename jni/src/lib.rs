@@ -766,6 +766,24 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeSha256WithCancel<'l
     })
 }
 
+/// F8: drive-health check. JSON `{verdict, unknown, writeSafe, findings,
+/// elapsedMs}`; see `bridge::health_json`. Never throws for a damaged drive:
+/// damage is the answer. `cancel_token` <= 0 means none.
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeHealthCheck<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    handle: jlong,
+    cancel_token: jlong,
+) -> jstring {
+    guard(&mut env, std::ptr::null_mut(), |env| {
+        let vol = bridge::volume_ref(handle).map_err(bad_handle)?;
+        let token = if cancel_token > 0 { cancel_token as u64 } else { 0 };
+        let json = vol.health_check_json(token);
+        out_string(env, &json)
+    })
+}
+
 #[no_mangle]
 pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeReadFileStream<'l>(
     mut env: JNIEnv<'l>,

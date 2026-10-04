@@ -738,3 +738,100 @@ fn a_batch_that_names_the_same_block_twice_is_refused() {
         "a batch freeing the same block twice was accepted"
     );
 }
+
+// --- F8.0: BLOCK_UNINIT backup group on a non-64bit filesystem ---------------
+
+/// Homebrew's keg-only e2fsprogs, the same tools `tools/gen-ext4-fixtures.sh`
+/// uses. A missing tool is a failure, not a skip.
+fn e2fs_tool(name: &str) -> String {
+    let p = format!("/opt/homebrew/opt/e2fsprogs/sbin/{name}");
+    assert!(std::path::Path::new(&p).exists(), "{name} not found: brew install e2fsprogs");
+    p
+}
+
+fn run_tool(args: &[&str]) {
+    let tool = e2fs_tool(args[0]);
+    let out = Command::new(&tool).args(&args[1..]).output().expect("run e2fsprogs tool");
+    assert!(
+        out.status.success(),
+        "{} failed: {}",
+        args[0],
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// F8.0. `materialize_bitmap` sized the backup group descriptor table with the
+/// raw `s_desc_size`, which is 0 without `64bit`: the backup GDT blocks of a
+/// BLOCK_UNINIT group were left out of the computed bitmap and the allocator
+/// handed them to a file. The kernel's e2fsck is the grader: before the write
+/// the image must be clean (control), after it the file must not sit on the
+/// backup GDT.
+#[test]
+fn a_file_never_lands_on_the_backup_gdt_of_an_uninit_group_without_64bit() {
+    let Some(script) = verify_script() else {
+        eprintln!("skipping: colima is not running");
+        return;
+    };
+    let path = std::env::temp_dir().join(format!("ext4-alloc-f80-{}.img", std::process::id()));
+    let _guard = temp_guard::TempPath::new(path.clone());
+    let p = path.to_str().expect("utf8 path");
+
+    // 32 MiB, 2048-block groups: backups in groups 1, 3, 5, 7. No resize inode,
+    // so the only blocks after the superblock copy are the GDT itself.
+    run_tool(&["mke2fs", "-q", "-t", "ext4", "-O", "^64bit,^resize_inode", "-b", "4096", "-g", "2048", p, "32M"]);
+    // Group 1 (a backup group) carries no data: mark it INODE|BLOCK_UNINIT, a
+    // state the kernel's own lazy init produces and e2fsck accepts.
+    // One debugfs session: after the first command alone the descriptor
+    // checksum is stale and debugfs refuses to reopen the image.
+    let cmds = temp_guard::TempPath::new(std::env::temp_dir().join(format!("ext4-alloc-f80-{}.cmds", std::process::id())));
+    std::fs::write(&*cmds, "set_bg 1 flags 0x3\nset_bg 1 checksum calc\n").expect("write debugfs commands");
+    let cmds_path = cmds.to_str().expect("utf8 path");
+    let out = Command::new(e2fs_tool("debugfs")).args(["-w", "-f", cmds_path, p]).output().expect("run debugfs");
+    assert!(
+        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("Checksum set to"),
+        "debugfs did not set the descriptor: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let grade = || {
+        Command::new("bash").arg(&script).arg(&path).output().expect("run the verifier")
+    };
+    let control = grade();
+    assert!(
+        control.status.success(),
+        "control: the hand-made image must be clean before any write:\n{}\n{}",
+        String::from_utf8_lossy(&control.stdout),
+        String::from_utf8_lossy(&control.stderr)
+    );
+
+    let uninit_before = {
+        let fs = open(p);
+        assert_eq!(fs.superblock().group_desc_size(), 32, "this test needs a 32-byte descriptor");
+        assert!(fs.groups()[1].block_bitmap_uninit(), "group 1 must be BLOCK_UNINIT");
+        fs.groups()[1].free_blocks_count
+    };
+    assert!(uninit_before > 0);
+
+    {
+        let mut fs = open(p);
+        // 12 MiB: group 0 holds about 1500 free blocks, so the rest lands in group 1.
+        let data = vec![0xA5u8; 12 * 1024 * 1024];
+        let mut w = fs.begin_file(data.len() as u64).expect("begin_file");
+        fs.write_chunk(&mut w, &data).expect("write_chunk");
+        fs.finish_file(w, 2, "spill.bin", luks_core::fs::FileType::Regular).expect("finish_file");
+        fs.flush().expect("flush");
+        assert!(
+            !fs.groups()[1].block_bitmap_uninit(),
+            "vacuity: the file must have allocated into group 1"
+        );
+    }
+
+    let out = grade();
+    assert!(
+        out.status.success(),
+        "e2fsck rejected the image after a file spilled into a BLOCK_UNINIT backup group:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

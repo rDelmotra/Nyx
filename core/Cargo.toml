@@ -482,3 +482,11 @@ required-features = ["dangerous-write-support"]
 [[test]]
 name = "btrfs_read_integrity"
 path = "tests/btrfs_ops/btrfs_read_integrity.rs"
+
+[[test]]
+name = "btrfs_health"
+path = "tests/btrfs_ops/btrfs_health.rs"
+
+[[test]]
+name = "ext4_health"
+path = "tests/ext4/ext4_health.rs"

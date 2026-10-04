@@ -12,6 +12,7 @@
 #[cfg(feature = "dangerous-write-support")]
 pub mod alloc;
 pub mod csum;
+pub mod health;
 #[cfg(feature = "dangerous-write-support")]
 pub mod dirent;
 #[cfg(feature = "dangerous-write-support")]

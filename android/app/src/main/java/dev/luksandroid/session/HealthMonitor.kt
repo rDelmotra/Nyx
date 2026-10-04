@@ -3,6 +3,8 @@ package dev.luksandroid.session
 import dev.luksandroid.Health
 import dev.luksandroid.HealthUnknownReason
 import dev.luksandroid.Trace
+import dev.luksandroid.log.Ev
+import dev.luksandroid.log.EventLog
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
@@ -182,14 +184,18 @@ class HealthMonitor internal constructor(
 
     private fun execute(scan: Scan, b: Binding) {
         var result: Health = Health.Unknown(HealthUnknownReason.INTERNAL)
+        var failure: Throwable? = null
+        val startNs = System.nanoTime()
         try {
             result = b.check(scan.token)
         } catch (c: CancellationException) {
             result = Health.Unknown(HealthUnknownReason.CANCELLED)
             throw c
         } catch (t: Throwable) {
+            failure = t
             Trace.e("HealthMonitor: check failed: ${Trace.throwableSummary(t)}")
         } finally {
+            logVerdict(if (scan.cancelRequested) Health.Unknown(HealthUnknownReason.CANCELLED) else result, failure, (System.nanoTime() - startNs) / 1_000_000L)
             synchronized(lock) {
                 tokens.close(scan.token)
                 if (current === scan) {
@@ -202,6 +208,28 @@ class HealthMonitor internal constructor(
                 }
             }
         }
+    }
+
+    /** One `health` line per finished scan, plus one `health_finding` per finding kind (kinds and counts, never a location). */
+    private fun logVerdict(h: Health, failure: Throwable?, ms: Long) {
+        val findings: Map<String, Long> = when (h) {
+            is Health.Corrupt -> h.findings
+            is Health.Leaks -> h.findings
+            else -> emptyMap()
+        }
+        EventLog.ev(Ev.HEALTH) {
+            when (h) {
+                Health.Clean -> verdict("clean")
+                Health.Checking -> verdict("checking")
+                is Health.Leaks -> { verdict("leaks"); reason(if (h.writeSafe) "write_safe" else "write_blocked") }
+                is Health.Corrupt -> verdict("corrupt")
+                is Health.Unknown -> { verdict("unknown"); reason(h.reason.name.lowercase()) }
+            }
+            ms(ms)
+            n(findings.size)
+            failure?.let { exc(it) }
+        }
+        for ((kind, count) in findings) EventLog.ev(Ev.HEALTH_FINDING) { kind(kind.lowercase()); n(count) }
     }
 
     private fun stopLocked() {

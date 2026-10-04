@@ -225,6 +225,7 @@ fun runDirectoryImport(
     mode: CollisionMode,
     onProgress: (TransferProgress) -> Unit,
     isCancelled: () -> Boolean,
+    onFileDone: (dev.luksandroid.transfer.FileDone) -> Unit = {},
 ): dev.luksandroid.transfer.TransferOutcome = TreeImporter.importTree(
     volume = volume,
     plan = request.plan,
@@ -237,6 +238,7 @@ fun runDirectoryImport(
     collisionMode = mode,
     onProgress = onProgress,
     isCancelled = isCancelled,
+    onFileDone = onFileDone,
 ).also {
     Trace.i(formatThroughput("import", it.bytesCopied, it.stats))
     // Unsaved-file accounting: a clean outcome includes the importer's final commit.
@@ -265,6 +267,7 @@ fun runDirectoryExport(
     mode: CollisionMode,
     onProgress: (TransferProgress) -> Unit,
     isCancelled: () -> Boolean,
+    onFileDone: (dev.luksandroid.transfer.FileDone) -> Unit = {},
 ): dev.luksandroid.transfer.TransferOutcome {
     val destination: ExportDestination = SafExportDestination(context.contentResolver, treeUri)
     val rootId = DocumentsContract.getTreeDocumentId(treeUri)
@@ -281,5 +284,6 @@ fun runDirectoryExport(
         mimeTypeFor = SafExportDestination::mimeTypeFor,
         onProgress = onProgress,
         isCancelled = isCancelled,
+        onFileDone = onFileDone,
     ).also { Trace.i(formatThroughput("export", it.bytesCopied, it.stats)) }
 }

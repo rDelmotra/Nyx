@@ -10,6 +10,10 @@ import dev.luksandroid.LuksVolume
 import dev.luksandroid.PartitionInfo
 import dev.luksandroid.SessionClosedException
 import dev.luksandroid.Trace
+import dev.luksandroid.log.Ev
+import dev.luksandroid.log.EventLog
+import dev.luksandroid.log.NativeDrain
+import dev.luksandroid.log.SessionHeader
 import dev.luksandroid.UnlockService
 import dev.luksandroid.withNativeCancel
 import dev.luksandroid.security.SecurePassphraseBuffer
@@ -68,6 +72,23 @@ open class SessionController(
     val activeLeasesFlow: StateFlow<Int> = _activeLeases.asStateFlow()
 
     private val isLocking = AtomicBoolean(false)
+
+    /** F9: native event drains (periodic while unlocked, final on teardown). Replaceable by tests. */
+    internal var nativeDrain: NativeDrain = NativeDrain.default
+    internal var drainPeriodMs: Long = NativeDrain.PERIOD_MS
+    private var drainJob: Job? = null
+
+    /** Every [drainPeriodMs] while a session is open. Only exists when the event log does, so a bare controller stays inert. */
+    private fun startDrainLoop() {
+        if (!EventLog.enabled) return
+        drainJob?.cancel()
+        drainJob = scope.launch(Dispatchers.IO) {
+            while (isActive) {
+                delay(drainPeriodMs)
+                nativeDrain.requestDrain()
+            }
+        }
+    }
 
     /** Test seam: whether the transfer engine has no queued job, SAF write or exclusive mutator. */
     internal var transferWritesIdle: () -> Boolean = { TransferManager.writesIdle() }
@@ -286,7 +307,8 @@ open class SessionController(
                 if (remaining <= 0) {
                     if (_activeLeases.value == 0) {
                         Trace.i("LuksSession: idle timeout expired, locking session")
-                        lock()
+                        EventLog.ev(Ev.IDLE_LOCK)
+                        lock("idle")
                         break
                     } else {
                         delay(100)
@@ -369,6 +391,7 @@ open class SessionController(
     ): SessionState = mutex.withLock {
         Trace.i("LuksSession: unlocking partition at offset ${partition.offsetBytes}")
         retirePriorSession(incoming = device)
+        EventLog.newSession()
         _state.value = SessionState.Unlocking(partition)
         this.activeUsbDevice = device.usbDevice
         val started = timeProvider()
@@ -382,6 +405,7 @@ open class SessionController(
                 }
             }
             val kdfMs = timeProvider() - started
+            val unlockMs = kdfMs
             val info = vol.info
             Trace.i(
                 "LuksSession: unlocked in $kdfMs ms · fs=${info.fsType} " +
@@ -399,9 +423,12 @@ open class SessionController(
             onSessionAdopted()
 
             val unlocked = SessionState.Unlocked(vol, partition, entries)
+            logHeader(device, vol)
+            EventLog.ev(Ev.UNLOCK) { ms(unlockMs) }
             _state.value = unlocked
             restartIdleTimer()
             attachHealth(vol)
+            startDrainLoop()
             unlocked
         } catch (e: CancellationException) {
             this.activeUsbDevice = null
@@ -417,6 +444,7 @@ open class SessionController(
             closeProduced(producedVolume)
             Trace.err(e.code, "unlock")
             Trace.e("LuksSession: unlock failed: ${Trace.throwableSummary(e)}")
+            logUnlockFail("unlock", e)
             // "wrong passphrase" is matched by the devices screen; everything else is code-only.
             val msg = if (e.isWrongPassword) "wrong passphrase" else codeOnlyMessage(e.code)
             val failed = SessionState.Failed(msg, partition)
@@ -427,6 +455,7 @@ open class SessionController(
             closeProduced(producedVolume)
             Trace.err(-1, "unlock")
             Trace.e("LuksSession: unlock failed: ${Trace.throwableSummary(e)}")
+            logUnlockFail("unlock", e)
             val failed = SessionState.Failed(unexpectedFailureMessage(), partition)
             _state.value = failed
             failed
@@ -468,6 +497,7 @@ open class SessionController(
                 v
             }
             val mountMs = timeProvider() - started
+            val unlockMs = mountMs
             val info = vol.info
             Trace.i(
                 "LuksSession: plain volume opened in $mountMs ms · fs=${info.fsType} " +
@@ -485,9 +515,12 @@ open class SessionController(
             onSessionAdopted()
 
             val unlocked = SessionState.Unlocked(vol, partition, entries)
+            logHeader(device, vol)
+            EventLog.ev(Ev.UNLOCK) { ms(unlockMs) }
             _state.value = unlocked
             restartIdleTimer()
             attachHealth(vol)
+            startDrainLoop()
             unlocked
         } catch (e: CancellationException) {
             this.activeUsbDevice = null
@@ -503,6 +536,7 @@ open class SessionController(
             closeProduced(producedVolume)
             Trace.err(e.code, "open_plain")
             Trace.e("LuksSession: openPlain failed: ${Trace.throwableSummary(e)}")
+            logUnlockFail("open_plain", e)
             val failed = SessionState.Failed(codeOnlyMessage(e.code), partition)
             _state.value = failed
             failed
@@ -511,6 +545,7 @@ open class SessionController(
             closeProduced(producedVolume)
             Trace.err(-1, "open_plain")
             Trace.e("LuksSession: openPlain failed: ${Trace.throwableSummary(e)}")
+            logUnlockFail("open_plain", e)
             val failed = SessionState.Failed(unexpectedFailureMessage(), partition)
             _state.value = failed
             failed
@@ -532,7 +567,7 @@ open class SessionController(
     /**
      * Waits for all active leases to drain, then commits and tears down the volume and device handles.
      */
-    suspend fun lock(): Unit {
+    suspend fun lock(reason: String = "user"): Unit {
         if (_state.value is SessionState.Locked && !isLocking.get()) {
             return
         }
@@ -548,6 +583,7 @@ open class SessionController(
         }
         if (!shouldProceed) return
 
+        EventLog.ev(Ev.LOCK) { reason(reason) }
         // Before the lease wait, not after: a scan holds the native filesystem lock, and a lease
         // blocked on it would never drain.
         healthMonitor.detach()
@@ -580,13 +616,14 @@ open class SessionController(
      * and close can each cost a full USB timeout, and nothing else may queue behind that
      * while the UI still claims the drive is unlocked. A detach with nothing open is ignored (C7).
      */
-    suspend fun onDeviceDetached(message: String = "USB drive was disconnected") {
+    suspend fun onDeviceDetached(message: String = "USB drive was disconnected", reason: String = "usb_detach") {
         val handles = mutex.withLock {
             if (_state.value is SessionState.Locked) {
                 Trace.i("LuksSession: detach ignored, nothing is open")
                 return
             }
             Trace.i("LuksSession: device detached")
+            EventLog.ev(Ev.DETACH) { reason(reason) }
             isLocking.set(false)
             val h = takeHandles()
             _state.value = SessionState.Detached(message)
@@ -634,6 +671,7 @@ open class SessionController(
             _isWriteDead.value = true
             Trace.err(code, if (fenced) "write_session_fenced" else "write_poison")
             Trace.e("LuksSession: fatal write failure [code=$code], session failed")
+            EventLog.ev(Ev.LOCK) { reason(if (fenced) "write_session_fenced" else "write_poison"); code(code) }
             isLocking.set(false)
             val h = takeHandles()
             val d = CompletableDeferred<Unit>().also { pendingClose = it }
@@ -685,6 +723,7 @@ open class SessionController(
     @Suppress("DEPRECATION")
     fun onTrimMemory(level: Int) {
         Trace.i("LuksSession: onTrimMemory level=$level")
+        EventLog.ev(Ev.TRIM_MEMORY) { n(level) }
         val criticalLevel = level == android.content.ComponentCallbacks2.TRIM_MEMORY_COMPLETE ||
             level == android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL
         if (criticalLevel && !isBusy) {
@@ -728,6 +767,8 @@ open class SessionController(
      */
     private fun takeHandles(): Handles {
         cancelIdleTimer()
+        drainJob?.cancel()
+        drainJob = null
         // Stops the health scan before anything else: every teardown path (lock, idle-lock,
         // detach, fatal close, re-unlock) comes through here.
         healthMonitor.detach()
@@ -789,6 +830,7 @@ open class SessionController(
                 } catch (t: Throwable) {
                     commitFailure = t
                     Trace.e("LuksSession: commit before close failed: ${Trace.throwableSummary(t)}")
+                    EventLog.nativeErr("commit_before_close", t)
                 } finally {
                     TransferManager.releaseSafWriteLock()
                 }
@@ -804,6 +846,7 @@ open class SessionController(
         } catch (t: Throwable) {
             closeFailure = t
             Trace.e("LuksSession: error closing volume during teardown: ${Trace.throwableSummary(t)}")
+            EventLog.nativeErr("close_volume", t)
         }
 
         // 2. Device must close SECOND
@@ -811,6 +854,7 @@ open class SessionController(
             h.deviceCloseable?.close()
         } catch (t: Throwable) {
             Trace.e("LuksSession: error closing device during teardown: ${Trace.throwableSummary(t)}")
+            EventLog.nativeErr("close_device", t)
         }
 
         if (closeFailure != null && closeFailure !is UnsatisfiedLinkError) {
@@ -824,6 +868,11 @@ open class SessionController(
             // The close's own commit succeeded, so everything reported done is on the drive.
             noteBatchCommitted()
         }
+
+        // F9: the close itself may have produced native events. Requested after the close, tagged with this
+        // session's id (captured now), and only then does the session id go back to "-".
+        nativeDrain.requestDrain()
+        EventLog.endSession()
     }
 
     private fun volumeCanWrite(v: LuksVolume): Boolean =
@@ -848,6 +897,22 @@ open class SessionController(
         _closeWarning.value = null
         _isWriteDead.value = false
         unsavedFiles.set(0)
+    }
+
+    private fun logHeader(device: LuksDevice, vol: LuksVolume) {
+        SessionHeader.emit(
+            device = device.info,
+            volume = vol.info,
+            canWrite = volumeCanWrite(vol),
+            vendorId = device.usbDevice?.vendorId,
+            productId = device.usbDevice?.productId,
+        )
+    }
+
+    /** Class (and code) of what failed an unlock, never its text; a native error also gets its `native_err` line. */
+    private fun logUnlockFail(stage: String, t: Throwable) {
+        EventLog.nativeErr(stage, t, stage = stage)
+        EventLog.ev(Ev.UNLOCK_FAIL) { stage(stage); exc(t) }
     }
 
     /**

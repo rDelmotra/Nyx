@@ -1,0 +1,13 @@
+{"t":1790000000000,"seq":1,"sid":"-","src":"kt","ev":"process_start","n":4101}
+{"t":1790000000040,"seq":2,"sid":"-","src":"kt","ev":"service_start"}
+{"t":1790000000900,"seq":3,"sid":"a1b2c3d4","src":"kt","ev":"session_header","app":"0.9.0-debug","git":"d60ee82","model":"Pixel 7","sdk":34,"vid":1921,"pid":21889,"dev_bytes":500107862016,"sector":512,"flush":true,"max_xfer":1048576,"fs":"btrfs","cipher":"aes-xts-plain64","key_bits":512,"write":true}
+{"t":1790000005100,"seq":4,"sid":"a1b2c3d4","src":"kt","ev":"unlock","ms":4200}
+{"t":1790000005200,"seq":5,"sid":"a1b2c3d4","src":"kt","ev":"health","verdict":"clean","reason":"ok","ms":95}
+{"t":1790000009000,"seq":6,"sid":"a1b2c3d4","src":"kt","ev":"xfer_queued","xfer":1,"op":"import","n":2,"bytes":104857600}
+{"t":1790000009010,"seq":7,"sid":"a1b2c3d4","src":"kt","ev":"xfer_start","xfer":1}
+{"t":1790000009020,"seq":8,"sid":"a1b2c3d4","src":"kt","ev":"xfer_phase","xfer":1,"stage":"begin","ms":8,"bytes":0,"ino":300}
+{"t":1790000013000,"seq":9,"sid":"a1b2c3d4","src":"kt","ev":"xfer_phase","xfer":1,"stage":"write","ms":3900,"bytes":104857600,"ino":300}
+{"t":1790000013100,"seq":10,"sid":"a1b2c3d4","src":"rs","ev":"usb_timeout","nseq":17,"ep":129,"ms":1000}
+{"t":1790000013110,"seq":11,"sid":"a1b2c3d4","src":"kt","ev":"xfer_phase","xfer":1,"stage":"commit","ms":80,"bytes":0,"ino":300}
+{"t":1790000013120,"seq":12,"sid":"a1b2c3d4","src":"kt","ev":"xfer_end","xfer":1,"state":"done","code":0,"stage":"commit","ms":4100,"bytes":104857600,"n":2}
+{"t":1790000014000,"seq":16,"sid":"a1b2c3d4","src":"kt","ev":"dropped","n":2}

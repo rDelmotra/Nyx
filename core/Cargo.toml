@@ -490,3 +490,8 @@ path = "tests/btrfs_ops/btrfs_health.rs"
 [[test]]
 name = "ext4_health"
 path = "tests/ext4/ext4_health.rs"
+
+[[test]]
+name = "ext4_forensic"
+path = "tests/ext4/ext4_forensic.rs"
+required-features = ["dangerous-write-support"]

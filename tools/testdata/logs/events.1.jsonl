@@ -1,0 +1,12 @@
+{"t":1790000020000,"seq":17,"sid":"a1b2c3d4","src":"kt","ev":"xfer_queued","xfer":2,"op":"export","n":1,"bytes":52428800}
+{"t":1790000020010,"seq":18,"sid":"a1b2c3d4","src":"kt","ev":"xfer_start","xfer":2}
+{"t":1790000020020,"seq":19,"sid":"a1b2c3d4","src":"kt","ev":"xfer_phase","xfer":2,"stage":"read","ms":900,"bytes":20971520,"ino":301}
+{"t":1790000022000,"seq":20,"sid":"a1b2c3d4","src":"rs","ev":"scsi_result","nseq":31,"status":2,"sense_key":3,"asc":17,"lba":812345,"blocks":256}
+{"t":1790000022005,"seq":21,"sid":"a1b2c3d4","src":"rs","ev":"usb_reset","nseq":32,"ep":129}
+{"t":1790000022010,"seq":22,"sid":"a1b2c3d4","src":"kt","ev":"native_err","op":"read_file","code":5,"exc":"LuksException","stage":"read"}
+{"t":1790000022020,"seq":23,"sid":"a1b2c3d4","src":"kt","ev":"xfer_end","xfer":2,"state":"failed","code":5,"stage":"read","exc":"LuksException","ms":2000,"bytes":20971520,"n":1}
+{"t":1790000022030,"seq":24,"sid":"a1b2c3d4","src":"rs","ev":"native_ring","xfer":2,"nseq":30,"kind":"scsi_command","lba":812345,"blocks":256}
+{"t":1790000022031,"seq":25,"sid":"a1b2c3d4","src":"rs","ev":"native_ring","xfer":2,"nseq":31,"kind":"scsi_result","status":2,"sense_key":3,"lba":812345}
+{"t":1790000022032,"seq":26,"sid":"a1b2c3d4","src":"rs","ev":"native_ring","xfer":2,"nseq":32,"kind":"usb_reset","ep":129}
+{"t":1790000022040,"seq":27,"sid":"a1b2c3d4","src":"kt","ev":"native_dropped","n":4}
+{"t":1790000025000,"seq":28,"sid":"a1b2c3d4","src":"kt","ev":"detach","reason":"usb_gone"}

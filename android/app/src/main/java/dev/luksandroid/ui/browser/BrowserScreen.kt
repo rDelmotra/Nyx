@@ -902,7 +902,7 @@ fun BrowserScreen(
         scope.launch {
             try {
                 withContext(Dispatchers.IO) {
-                    TransferManager.withExclusiveWrite { v -> v.createDirectory(currentPath, name) }
+                    TransferManager.withExclusiveWrite(op = "mkdir") { v -> v.createDirectory(currentPath, name) }
                 }
                 refreshFlushSupported()
                 showNewFolderDialog = false
@@ -947,7 +947,7 @@ fun BrowserScreen(
         scope.launch {
             try {
                 withContext(Dispatchers.IO) {
-                    TransferManager.withExclusiveWrite { v ->
+                    TransferManager.withExclusiveWrite(op = "rename") { v ->
                         v.rename(currentPath, item.name, currentPath, newName)
                     }
                 }
@@ -982,7 +982,7 @@ fun BrowserScreen(
         scope.launch {
             try {
                 withContext(Dispatchers.IO) {
-                    TransferManager.withExclusiveWrite { v -> v.deleteFile(item.fullPath) }
+                    TransferManager.withExclusiveWrite(op = "delete") { v -> v.deleteFile(item.fullPath) }
                 }
                 refreshFlushSupported()
                 deletingItem = null
@@ -1043,7 +1043,7 @@ fun BrowserScreen(
         scope.launch {
             try {
                 val result = withContext(Dispatchers.IO) {
-                    TransferManager.withExclusiveWrite { v ->
+                    TransferManager.withExclusiveWrite(op = "delete") { v ->
                         runBatchDelete(toDelete) { item -> v.deleteFile(item.fullPath) }
                     }
                 }

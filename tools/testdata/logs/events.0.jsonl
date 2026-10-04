@@ -1,0 +1,9 @@
+{"t":1790000060000,"seq":1,"sid":"-","src":"kt","ev":"process_start","n":4222}
+{"t":1790000060100,"seq":2,"sid":"-","src":"kt","ev":"unlock_fail","exc":"WrongPassword","code":2,"stage":"keyslot"}
+{this line is not json
+{"t":1790000070000,"seq":3,"sid":"e5f60718","src":"kt","ev":"session_header","app":"0.9.0-debug","git":"d60ee82","model":"Pixel 7","sdk":34,"vid":1921,"pid":21889,"dev_bytes":500107862016,"sector":512,"flush":true,"max_xfer":1048576,"fs":"btrfs","cipher":"aes-xts-plain64","key_bits":512,"write":true}
+{"t":1790000074000,"seq":4,"sid":"e5f60718","src":"kt","ev":"unlock","ms":3900}
+{"t":1790000074100,"seq":5,"sid":"e5f60718","src":"kt","ev":"health","verdict":"leaks","reason":"orphan_extents","ms":120}
+{"t":1790000074101,"seq":6,"sid":"e5f60718","src":"kt","ev":"health_finding","kind":"leaked_extent","n":3}
+{"t":1790000074500,"seq":7,"sid":"e5f60718","src":"kt","ev":"trace","lvl":"I","msg":"mounted"}
+{"t":1790000080000,"seq":8,"sid":"e5f60718","src":"kt","ev":"lock","reason":"user"}

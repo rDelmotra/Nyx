@@ -26,9 +26,13 @@ class LuksApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
-        Trace.initFileLogging(this)
+        // F9: the event log first, so everything after it (including a crash in this method) is recorded.
+        dev.luksandroid.log.EventLog.init(this)
+        dev.luksandroid.log.CrashLogger.install()
+        dev.luksandroid.log.EventLog.ev(dev.luksandroid.log.Ev.PROCESS_START) { n(android.os.Process.myPid()) }
+        removeLegacySessionLog()
         Trace.i("LuksApp", "Application initializing; LuksSession initialized")
-        
+
         sessionLifecycle = LuksSessionLifecycle(LuksSession)
         registerActivityLifecycleCallbacks(sessionLifecycle)
         registerComponentCallbacks(sessionLifecycle)
@@ -46,6 +50,14 @@ class LuksApp : Application() {
         // for the very job that reported the error.
         appScope.launch {
             TransferManager.fatalWriteErrors.collect { LuksSession.reportWriteFailure(it) }
+        }
+    }
+
+    /** `luks_session.log` was replaced by `logs/events.N.jsonl`; old text files would otherwise sit there forever. */
+    private fun removeLegacySessionLog() {
+        for (name in listOf("luks_session.log", "luks_session.log.old")) {
+            val f = java.io.File(filesDir, name)
+            if (f.exists() && !f.delete()) Trace.e("LuksApp", "legacy session log could not be removed")
         }
     }
 

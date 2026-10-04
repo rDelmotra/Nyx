@@ -350,6 +350,64 @@ impl LuksError {
         )
     }
 
+    /// Stable numeric class for forensic events. The numbers are the JNI
+    /// wire codes (`luks_jni::bridge::code`), so a native `ext4_error` line
+    /// and the Kotlin exception it caused carry the same `code`. The match is
+    /// exhaustive on purpose: a new variant must choose a number. A jni test
+    /// pins this against `error_code`.
+    pub fn forensic_code(&self) -> i32 {
+        use LuksError::*;
+        match self {
+            KdfFailed(_) => 1,
+            WrongPassword => 2,
+            BadMagic { .. } | NoPartitionTable => 3,
+            UnsupportedVersion(_)
+            | Luks1NotImplemented
+            | UnsupportedChecksumAlg(_)
+            | UnsupportedHash(_)
+            | UnsupportedCipher(_)
+            | UnsupportedDigest(_)
+            | BadKeyLength(_)
+            | BadSectorSize(_)
+            | UnsupportedFsFeature(_)
+            | NotExt4(_)
+            | NotBtrfs(_)
+            | UnknownFs
+            | UnsupportedFs(_)
+            | AmbiguousFs => 4,
+            ChecksumMismatch
+            | Truncated { .. }
+            | ImplausibleHeaderSize(_)
+            | JsonNotUtf8
+            | JsonParse(_)
+            | BadIntegerField { .. }
+            | Missing(_)
+            | BadExtentHeader(_)
+            | BadExtentTree(_)
+            | CorruptFs(_)
+            | FsChecksumMismatch(_)
+            | SymlinkLoop(_)
+            | BadGpt(_)
+            | OutOfBounds => 5,
+            NotFound(_) | NotADirectory(_) | IsADirectory(_) | BadInode(_) => 6,
+            ScsiProtocol(_) | ScsiCommandFailed { .. } | UsbTransfer(_) | UsbErrno { .. } => 7,
+            FsNeedsRecovery => 8,
+            Io { .. } => 9,
+            FilesystemFull | NoFreeInodes => 12,
+            WrongWriteTarget { .. } => 13,
+            UnverifiableWriteTarget { .. } => 14,
+            AlreadyExists(_) => 15,
+            WriterBusy => 16,
+            BtrfsItemTooLarge { .. } => 17,
+            SessionPoisoned => 18,
+            Cancelled => 19,
+            DirectoryNotEmpty(_) => 20,
+            WriteSessionFenced(_) => 21,
+            ReadOnlyVolume => 22,
+            FileChanged => 23,
+        }
+    }
+
     /// A kernel transfer failure that kept its errno. See [`LuksError::UsbErrno`].
     pub fn usb_errno(errno: i32, detail: impl Into<String>) -> Self {
         Self::UsbErrno {

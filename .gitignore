@@ -36,6 +36,8 @@
 # ---- shell tooling ----
 !tools/*.sh
 !tools/*.c
+!tools/*.py
+!tools/testdata/logs/*.jsonl
 
 # ---- CI ----
 !.github/workflows/*.yml
@@ -109,6 +111,9 @@ staging/
 fixtures/
 !fixtures/luks/
 !fixtures/transfer/
+
+# ---- pulled device logs (may be shared only deliberately) ----
+/logs/
 
 # ---- local IDE & agent directories ----
 .idea/

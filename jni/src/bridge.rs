@@ -501,6 +501,9 @@ pub struct VolumeHandle {
     fs: Mutex<MountedFs>,
     pub partition_offset: u64,
     pub encrypted: bool,
+    /// LUKS cipher shape for the debug log header: (cipher, key bits, cipher
+    /// sector). `None` for a plain volume. Never key material.
+    luks_params: Option<(String, Option<u32>, u32)>,
     /// The device's writer flag, shared with every other volume on it.
     /// See [`VolumeHandle::write_file`].
     #[cfg_attr(
@@ -1061,6 +1064,13 @@ impl DeviceHandle {
             &header,
             password,
         )?;
+        // Header shape for the debug log. Logging must never fail an unlock
+        // that already succeeded, so a missing piece is left out, not an error
+        // (LuksVolume::open above already required the segment and a keyslot).
+        let luks_params = header.primary_segment().ok().map(|seg| {
+            let key_bits = header.metadata.keyslots.values().next().map(|k| k.key_size as u32 * 8);
+            (seg.encryption.clone(), key_bits, seg.sector_size)
+        });
         let fs = MountedFs::mount(luks_core::volume::VolumeSource::Luks(volume))?;
         let id = NEXT_VOLUME_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(VolumeHandle {
@@ -1068,6 +1078,7 @@ impl DeviceHandle {
             fs: Mutex::new(fs),
             partition_offset,
             encrypted: true,
+            luks_params,
             device_writer: Arc::clone(&self.dev.writer),
             dev: self.dev.clone(),
             write_fence: Mutex::new(None),
@@ -1108,6 +1119,7 @@ impl DeviceHandle {
             fs: Mutex::new(fs),
             partition_offset,
             encrypted: false,
+            luks_params: None,
             device_writer: Arc::clone(&self.dev.writer),
             dev: self.dev.clone(),
             write_fence: Mutex::new(None),
@@ -1190,6 +1202,11 @@ impl VolumeHandle {
             // its own build flavour matches.
             "canWrite": cfg!(feature = "dangerous-write-support"),
         });
+        if let Some((cipher, key_bits, sector)) = &self.luks_params {
+            info["cipher"] = json!(cipher);
+            info["keyBits"] = json!(key_bits);
+            info["cipherSector"] = json!(sector);
+        }
         // `true`/`false` once the drive has answered a SYNCHRONIZE CACHE,
         // `null` until the first flush. `false` means a flush is a silent
         // no-op and "committed" is not known to be on the medium (D3).
@@ -1998,6 +2015,17 @@ mod tests {
         assert_eq!(v["label"], "DISKDATA");
         assert_eq!(v["partitionOffset"], 6144u64 * 512);
         assert_eq!(v["encrypted"], true);
+    }
+
+    /// The debug log's session header names the cipher and key size so a log
+    /// says which crypto path ran. Shape only, never key material.
+    #[test]
+    fn volume_info_json_reports_cipher_parameters() {
+        let vol = unlock_fixture();
+        let v: Value = serde_json::from_str(&vol.info_json()).unwrap();
+        assert_eq!(v["cipher"], "aes-xts-plain64");
+        assert!(matches!(v["keyBits"].as_u64(), Some(256 | 512)), "keyBits {}", v["keyBits"]);
+        assert!(matches!(v["cipherSector"].as_u64(), Some(512 | 4096)), "cipherSector {}", v["cipherSector"]);
     }
 
     #[test]

@@ -6,6 +6,10 @@ import dev.luksandroid.LuksException
 import dev.luksandroid.LuksNative
 import dev.luksandroid.LuksVolume
 import dev.luksandroid.Trace
+import dev.luksandroid.log.Ev
+import dev.luksandroid.log.EventLog
+import dev.luksandroid.log.NativeDrain
+import dev.luksandroid.transfer.FileDone
 import dev.luksandroid.ui.UiErrorMessage
 import dev.luksandroid.withNativeCancel
 import dev.luksandroid.zeroEntireCapacity
@@ -159,6 +163,52 @@ open class TransferController {
     @Volatile private var safToken: LockToken? = null
 
     internal var cancelTokens: CancelTokens = NativeCancelTokens
+
+    /** F9: where native events are drained after a failure and after the queue empties. Replaceable by tests. */
+    internal var nativeDrain: NativeDrain = NativeDrain.default
+
+    // F9 log bookkeeping, keyed by transfer id: when it started (nanoTime) and the last phase it
+    // entered, which is the stage it died in if it fails. Numbers and fixed words only.
+    private val xferStartNs = ConcurrentHashMap<Long, Long>()
+    private val xferStage = ConcurrentHashMap<Long, String>()
+
+    private fun opOf(type: TransferType) = when (type) {
+        TransferType.IMPORT -> "import"
+        TransferType.EXPORT -> "export"
+        TransferType.HASH -> "hash"
+    }
+
+    private fun noteStart(id: Long) {
+        if (xferStartNs.putIfAbsent(id, System.nanoTime()) == null) EventLog.ev(Ev.XFER_START) { xfer(id) }
+    }
+
+    private fun msSinceStart(id: Long): Long? = xferStartNs[id]?.let { (System.nanoTime() - it) / 1_000_000L }
+
+    /** Marks [stage] as the one [id] is in now, so a failure inside it is attributed to it. */
+    private fun enter(id: Long, stage: String) {
+        xferStage[id] = stage
+    }
+
+    /** One finished per-file phase line. Never per chunk. */
+    private fun phase(id: Long, stage: String, ms: Long, bytes: Long? = null, ino: Long? = null) {
+        EventLog.ev(Ev.XFER_PHASE) {
+            xfer(id); stage(stage); ms(ms)
+            if (bytes != null) bytes(bytes)
+            if (ino != null) ino(ino)
+        }
+    }
+
+    /** Runs [block] as phase [stage] of [id]: marks it entered, logs `xfer_phase` with its duration when it completes. */
+    private inline fun <T> timedPhase(id: Long, stage: String, bytes: Long? = null, block: () -> T): T {
+        enter(id, stage)
+        val t0 = System.nanoTime()
+        val r = block()
+        phase(id, stage, (System.nanoTime() - t0) / 1_000_000L, bytes)
+        return r
+    }
+
+    private fun nativeErr(op: String, t: Throwable, id: Long? = null) =
+        EventLog.nativeErr(op, t, xfer = id, stage = id?.let { xferStage[it] })
 
     /** How long [withExclusiveWrite] waits for the transfer lock before reporting the drive busy. */
     internal var exclusiveWaitMs: Long = EXCLUSIVE_WAIT_MS
@@ -346,7 +396,24 @@ open class TransferController {
      * writer (N8). A fatal write failure inside [block] is published on [fatalWriteErrors] and
      * rethrown after the lock is released.
      */
-    suspend fun <T> withExclusiveWrite(block: suspend (LuksVolume) -> T): T {
+    suspend fun <T> withExclusiveWrite(op: String? = null, block: suspend (LuksVolume) -> T): T {
+        if (op == null) return exclusiveWrite(null, block)
+        // F9: a browser mutation has no queue entry, so it gets a log id of its own.
+        val id = nextTransferId.getAndIncrement()
+        EventLog.ev(Ev.XFER_QUEUED) { xfer(id); op(op); n(1) }
+        noteStart(id)
+        enter(id, op)
+        try {
+            val r = exclusiveWrite(id, block)
+            logEnd(id, TransferState.COMPLETED, null, null)
+            return r
+        } catch (t: Throwable) {
+            logEnd(id, if (t is CancellationException) TransferState.CANCELLED else TransferState.FAILED, null, t)
+            throw t
+        }
+    }
+
+    private suspend fun <T> exclusiveWrite(id: Long?, block: suspend (LuksVolume) -> T): T {
         requireHealthWritable()
         val token = LockToken("mutator")
         // Bounded, like a SAF write: behind a long import the UI gets an answer, not a hang.
@@ -379,7 +446,10 @@ open class TransferController {
             transferMutex.unlock(token)
             LuksSession.healthMonitor.noteIdle()
         }
-        thrown?.let { throw it }
+        thrown?.let {
+            nativeErr(xferStage[id ?: -1L] ?: "mutator", it, id)
+            throw it
+        }
         @Suppress("UNCHECKED_CAST")
         return result as T
     }
@@ -415,6 +485,7 @@ open class TransferController {
     } catch (t: Throwable) {
         val e = (t as? LuksException) ?: LuksException("commit failed", LuksException.GENERIC)
         Trace.err(e.code, "commit")
+        nativeErr("commit", t)
         _commitFailure.value = e
         noteFatal(volume, t)
         false
@@ -471,7 +542,10 @@ open class TransferController {
             if (ran && q.writes) dirty = true
             try {
                 // Policy (a): the queue drained after write work.
-                if (dirty && synchronized(queueLock) { outstanding } == 1) drainCommit()
+                val lastOne = synchronized(queueLock) { outstanding } == 1
+                if (dirty && lastOne) drainCommit()
+                // F9: the queue emptied; pull the native timeline of everything it just did.
+                if (lastOne) nativeDrain.requestDrain()
             } catch (t: Throwable) {
                 Trace.e("TransferManager: drain commit error: ${Trace.throwableSummary(t)}")
             }
@@ -509,8 +583,12 @@ open class TransferController {
 
     // ------------------------------------------------------------------ transfer bookkeeping
 
-    private fun addQueued(item: TransferItem) {
+    private fun addQueued(item: TransferItem, op: String = opOf(item.type)) {
         _transfers.update { listOf(item) + it }
+        EventLog.ev(Ev.XFER_QUEUED) {
+            xfer(item.id); op(op); n(maxOf(item.filesTotal, 1))
+            if (item.totalBytes >= 0L) bytes(item.totalBytes)
+        }
     }
 
     private fun queuedItem(id: Long, name: String, type: TransferType, totalBytes: Long, extra: (TransferItem) -> TransferItem = { it }) =
@@ -546,10 +624,12 @@ open class TransferController {
         state: TransferState,
         error: String? = null,
         errorCode: Int? = null,
+        cause: Throwable? = null,
         adjust: (TransferItem) -> TransferItem = { it },
     ): Boolean {
         require(state.isTerminal()) { "finishTransfer needs a terminal state" }
         var applied = false
+        var final: TransferItem? = null
         _transfers.update { list ->
             applied = false
             list.map {
@@ -562,11 +642,33 @@ open class TransferController {
                         etaSeconds = 0L,
                         verifying = false,
                         speedBytesPerSec = if (state == TransferState.COMPLETED) adjust(it).speedBytesPerSec else 0L,
-                    )
+                    ).also { done -> final = done }
                 } else it
             }
         }
+        // Logged after the update, never inside it: the update lambda can be retried.
+        if (applied) logEnd(id, state, final, cause)
         return applied
+    }
+
+    /** `xfer_end`: state, code, stage it was in, exception class, duration, bytes and files. Never a name or a message. */
+    private fun logEnd(id: Long, state: TransferState, item: TransferItem?, cause: Throwable?) {
+        val ms = msSinceStart(id)
+        val stage = xferStage.remove(id)
+        xferStartNs.remove(id)
+        EventLog.ev(Ev.XFER_END) {
+            xfer(id)
+            state(state.name.lowercase())
+            val code = item?.errorCode ?: (cause as? LuksException)?.code
+            if (code != null) code(code)
+            if (state != TransferState.COMPLETED && stage != null) stage(stage)
+            if (cause != null) exc(cause)
+            if (ms != null) ms(ms)
+            if (item != null) {
+                bytes(item.transferredBytes)
+                if (item.filesTotal > 0 || item.filesDone > 0) n(item.filesDone)
+            }
+        }
     }
 
     /**
@@ -575,13 +677,17 @@ open class TransferController {
      * overrides FAILED or an earlier COMPLETED.
      */
     private fun confirmPublished(id: Long, adjust: (TransferItem) -> TransferItem) {
+        var flipped: TransferItem? = null
         _transfers.update { list ->
+            flipped = null
             list.map {
                 if (it.id == id && (it.state == TransferState.CANCELLED || !it.state.isTerminal())) {
                     adjust(it).copy(state = TransferState.COMPLETED, error = null, errorCode = null, etaSeconds = 0L, verifying = false)
+                        .also { done -> flipped = done }
                 } else it
             }
         }
+        flipped?.let { logEnd(id, TransferState.COMPLETED, it, null) }
     }
 
     /** Progress and other non-terminal updates; ignored once the item is terminal. */
@@ -603,6 +709,7 @@ open class TransferController {
                 } else it
             }
         }
+        if (ok) noteStart(id)
         return ok
     }
 
@@ -611,6 +718,7 @@ open class TransferController {
      * of a `*WithProgress` function (no queue) creates the item here.
      */
     private fun registerRunning(transferId: Long, name: String, type: TransferType, totalBytes: Long) {
+        noteStart(transferId)
         _transfers.update { list ->
             if (list.any { it.id == transferId }) {
                 list.map {
@@ -658,8 +766,12 @@ open class TransferController {
         }
         val code = (t as? LuksException)?.code
         val message = if (t is TransferFailure) t.userMessage else UiErrorMessage.getUserMessage(t, operation)
-        finishTransfer(id, TransferState.FAILED, error = message, errorCode = code ?: (t as? TransferFailure)?.code)
+        // F9: the native error is recorded before the terminal state, so the end line follows its cause.
+        nativeErr(operation.lowercase(), t, id)
+        val applied = finishTransfer(id, TransferState.FAILED, error = message, errorCode = code ?: (t as? TransferFailure)?.code, cause = t)
         Trace.err(code ?: LuksException.GENERIC, operation.lowercase())
+        // Off this thread: pulls the native events that led here, then the whole ring, tagged with this transfer.
+        if (applied) nativeDrain.onTransferFailure(id)
     }
 
     /**
@@ -809,6 +921,7 @@ open class TransferController {
             queuedItem(id, request.rootName, direction, request.plan.totalBytes) {
                 it.copy(filesTotal = request.plan.fileCount, totalIsLowerBound = request.plan.hasUnknownSizes)
             },
+            op = if (direction == TransferType.IMPORT) "dir_import" else "dir_export",
         )
         val writes = direction == TransferType.IMPORT
         enqueue(id, writes) {
@@ -829,17 +942,24 @@ open class TransferController {
                     }
                 }
                 val cancelled = { isTransferCancelled(tid) }
+                // F9: one line per finished file (never per chunk); numbers only, no name.
+                val onFileDone: (FileDone) -> Unit = { f -> phase(tid, "finish", f.ms, bytes = f.bytes, ino = f.ino) }
+                enter(tid, "tree")
                 val outcome = withTransferCancelToken(tid) { token ->
                     // No suspension inside: the thread-local token holds for the whole tree.
                     withNativeCancel(token) {
                         if (direction == TransferType.IMPORT) {
-                            runDirectoryImport(context, volume, request, treeUri, mode, onProgress, cancelled)
+                            runDirectoryImport(context, volume, request, treeUri, mode, onProgress, cancelled, onFileDone)
                         } else {
-                            runDirectoryExport(context, volume, request, treeUri, mode, onProgress, cancelled)
+                            runDirectoryExport(context, volume, request, treeUri, mode, onProgress, cancelled, onFileDone)
                         }
                     }
                 }
                 noteFatal(volume, outcome.failure)
+                outcome.failure?.let { f ->
+                    nativeErr("transfer", f, tid)
+                    if (f !is TransferCancelledException) nativeDrain.onTransferFailure(tid)
+                }
 
                 // A tree transfer reports its own outcome rather than throwing (§5.2: what
                 // already landed is kept), so the terminal state is set from that outcome, not
@@ -853,6 +973,7 @@ open class TransferController {
                     },
                     error = if (outcome.succeeded) null else stoppedSummary(outcome, request.plan.fileCount),
                     errorCode = (outcome.failure as? LuksException)?.code,
+                    cause = outcome.failure,
                 ) {
                     it.copy(
                         filesDone = outcome.filesCopied + outcome.filesSkipped,
@@ -989,6 +1110,7 @@ open class TransferController {
         var output: java.io.OutputStream? = null
         try {
             withTransferCancelToken(transferId) { _ ->
+                enter(transferId, "begin")
                 file = volume.openFile(path)
                 val totalBytes = volume.fileSizeOf(file)
                 updateActive(transferId) { it.copy(totalBytes = totalBytes) }
@@ -1003,6 +1125,8 @@ open class TransferController {
                 var done = 0L
                 val out = target.openOutput()
                 output = out
+                enter(transferId, "read")
+                val readStartNs = System.nanoTime()
                 while (done < totalBytes) {
                     currentCoroutineContext().ensureActive()
                     if (isTransferCancelled(transferId)) throw CancellationException("Transfer cancelled")
@@ -1022,6 +1146,7 @@ open class TransferController {
                 out.flush()
                 out.close() // a close that fails means the bytes may not have landed
                 output = null
+                phase(transferId, "read", (System.nanoTime() - readStartNs) / 1_000_000L, bytes = done)
 
                 currentCoroutineContext().ensureActive()
                 if (isTransferCancelled(transferId)) throw CancellationException("Transfer cancelled")
@@ -1029,6 +1154,8 @@ open class TransferController {
 
                 val level = target.verifyLevel
                 updateActive(transferId) { it.copy(verifyLevel = level, verifying = true, transferredBytes = 0L, speedBytesPerSec = 0L) }
+                enter(transferId, "verify")
+                val verifyStartNs = System.nanoTime()
                 when (level) {
                     VerifyLevel.FULL -> {
                         val verifyMeter = Meter(transferId, done)
@@ -1055,7 +1182,8 @@ open class TransferController {
                         }
                     }
                 }
-                target.commit()
+                phase(transferId, "verify", (System.nanoTime() - verifyStartNs) / 1_000_000L, bytes = done)
+                timedPhase(transferId, "commit") { target.commit() }
 
                 succeeded = finishTransfer(transferId, TransferState.COMPLETED) {
                     it.copy(transferredBytes = done, speedBytesPerSec = meter.finalSpeed(done))
@@ -1114,11 +1242,13 @@ open class TransferController {
                 val meter = Meter(transferId, totalBytes)
                 var done = 0L
 
-                val w = volume.beginFile(totalBytes)
+                val w = timedPhase(transferId, "begin") { volume.beginFile(totalBytes) }
                 writer = w
                 val buf = java.nio.ByteBuffer.allocateDirect(CHUNK_SIZE)
                 buffer = buf
 
+                enter(transferId, "write")
+                val writeStartNs = System.nanoTime()
                 source.open().use { channel ->
                     while (done < totalBytes) {
                         currentCoroutineContext().ensureActive()
@@ -1157,10 +1287,14 @@ open class TransferController {
                         throw TransferFailure("The file is larger than it reported, so it was not copied.")
                     }
                 }
+                phase(transferId, "write", (System.nanoTime() - writeStartNs) / 1_000_000L, bytes = done)
 
+                enter(transferId, "finish")
+                val finishStartNs = System.nanoTime()
                 val ino = stats.commit { w.finish(parentPath, targetName) }
+                phase(transferId, "finish", (System.nanoTime() - finishStartNs) / 1_000_000L, bytes = done, ino = ino)
                 LuksSession.noteFilesFinished()
-                stats.commit { volume.commitActiveBatch() }
+                timedPhase(transferId, "commit") { stats.commit { volume.commitActiveBatch() } }
                 LuksSession.noteBatchCommitted()
                 confirmPublished(transferId) {
                     it.copy(transferredBytes = done, speedBytesPerSec = meter.finalSpeed(done))
@@ -1224,7 +1358,7 @@ open class TransferController {
 
         try {
             val digest = withTransferCancelToken(transferId) { token ->
-                withNativeCancel(token) { volume.sha256(path) }
+                timedPhase(transferId, "read") { withNativeCancel(token) { volume.sha256(path) } }
             }
             finishTransfer(transferId, TransferState.COMPLETED) {
                 it.copy(

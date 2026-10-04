@@ -1018,6 +1018,19 @@ impl<D: WriteAt> Ext4<D> {
     /// describing the filesystem as it was gated at mount, which is what lets
     /// the checksum seed and the write gate keep working inside the window.
     fn write_fs_state(&mut self, clean: bool) -> Result<()> {
+        use crate::forensic::{record_ext4, Ext4Event};
+        let r = self.write_fs_state_inner(clean);
+        match &r {
+            Ok(()) => record_ext4(if clean { Ext4Event::MarkClean } else { Ext4Event::MarkDirty }),
+            Err(e) => record_ext4(Ext4Event::Error {
+                stage: if clean { "mark_clean" } else { "mark_dirty" },
+                code: e.forensic_code(),
+            }),
+        }
+        r
+    }
+
+    fn write_fs_state_inner(&mut self, clean: bool) -> Result<()> {
         let seed = Seed::for_writing(&self.sb)?;
         let mut sb = vec![0u8; 1024];
         self.device.read_at(1024, &mut sb)?;
@@ -1195,7 +1208,9 @@ impl<D: WriteAt> Ext4<D> {
     /// reaches its own buffer, so without this a "completed" allocation can
     /// still be lost to a pulled cable.
     pub fn flush(&self) -> Result<()> {
-        self.device.flush()
+        let r = self.device.flush();
+        crate::forensic::record_ext4(crate::forensic::Ext4Event::Flush { ok: r.is_ok() });
+        r
     }
 
     /// The in-memory descriptor for one group, for tests and diagnostics.

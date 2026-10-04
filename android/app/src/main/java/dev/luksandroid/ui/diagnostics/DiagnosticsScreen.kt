@@ -291,12 +291,12 @@ fun DiagnosticsScreen(
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 Text(
-                    text = "Session File Log (On-Disk)",
+                    text = "Event Log (On-Disk, structured)",
                     style = MaterialTheme.typography.titleMedium,
                     color = MaterialTheme.colorScheme.onSurface,
                 )
                 Text(
-                    text = "Persistent rolling log file saved to internal storage (luks_session.log). Zero password / zero file contents exposure.",
+                    text = "JSON Lines event log under files/logs (events.0..4.jsonl, 5 x 4 MiB), debug builds only. The view shows the newest part; pull the whole set with tools/pull-logs.sh. No passphrases, file names or paths.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )

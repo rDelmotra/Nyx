@@ -8,6 +8,35 @@ plugins {
 val releaseKeystoreFile = (findProperty("luksReleaseStoreFile") as String?)?.let(::file)
 val hasReleaseSigningKey = releaseKeystoreFile?.exists() == true
 
+// F9: the commit a log line came from. Resolved at configuration time and never silently
+// guessed: if git itself fails the value is "unknown" AND the build says so, because a log tagged
+// with a made-up commit would send an investigation at the wrong code. A dirty tree is marked
+// "-dirty": the daily debug APK is routinely built from uncommitted work.
+fun gitOutput(vararg args: String): String? = try {
+    val out = providers.exec {
+        commandLine("git", *args)
+        workingDir = rootProject.projectDir
+        isIgnoreExitValue = true
+    }
+    if (out.result.get().exitValue == 0) out.standardOutput.asText.get().trim() else null
+} catch (e: Exception) {
+    null
+}
+
+val gitCommit: String = run {
+    val head = gitOutput("rev-parse", "--short", "HEAD")?.takeIf { it.isNotEmpty() }
+    if (head == null) {
+        logger.lifecycle("GIT_COMMIT: `git rev-parse --short HEAD` failed; BuildConfig.GIT_COMMIT = \"unknown\"")
+        "unknown"
+    } else {
+        val dirty = gitOutput("status", "--porcelain", "--untracked-files=no")
+        if (dirty == null) {
+            logger.lifecycle("GIT_COMMIT: `git status` failed; dirty state unknown, BuildConfig.GIT_COMMIT = \"$head\"")
+            head
+        } else if (dirty.isNotEmpty()) "$head-dirty" else head
+    }
+}
+
 android {
     namespace = "dev.luksandroid"
     compileSdk = 36
@@ -22,6 +51,7 @@ android {
         targetSdk = 36
         versionCode = 4
         versionName = "0.4.0"
+        buildConfigField("String", "GIT_COMMIT", "\"$gitCommit\"")
 
         // The Rust build produces arm64 by default. Anything else in the APK
         // would be a stale copy, so be explicit rather than shipping whatever

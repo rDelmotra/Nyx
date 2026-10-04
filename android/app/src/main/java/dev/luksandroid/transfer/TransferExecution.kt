@@ -54,6 +54,13 @@ data class TransferProgress(
  * notes/feature-directory-transfer.md §5.2 there is deliberately no rollback,
  * so these counts are the accurate "N of M" the plan requires.
  */
+/**
+ * A finished file inside a tree transfer, for the structured log (F9): numbers only. [ino] is the
+ * inode the drive assigned on import, null on export (the destination is a phone document).
+ * The name is deliberately not part of this type.
+ */
+data class FileDone(val bytes: Long, val ino: Long?, val ms: Long)
+
 data class TransferOutcome(
     val filesCopied: Int,
     val filesSkipped: Int,

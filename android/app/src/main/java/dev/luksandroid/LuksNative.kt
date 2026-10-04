@@ -39,6 +39,17 @@ internal object LuksNative {
     external fun nativeClearForensicLog()
 
     /**
+     * F9 C4: removes and returns the native "notable events" queue as JSON
+     * `{"dropped":n,"events":[{flat fields}]}`. Absent in a `.so` older than F9: the caller
+     * ([dev.luksandroid.log.NativeDrain]) treats the resulting `UnsatisfiedLinkError` as "no
+     * native timeline" and stops asking.
+     */
+    external fun nativeDrainEvents(): String
+
+    /** F9 C4: the whole 256-entry forensic ring in the same JSON shape as [nativeDrainEvents]; the ring is NOT cleared. */
+    external fun nativeRingJson(): String
+
+    /**
      * @param fd from `UsbDeviceConnection.getFileDescriptor()`. Stays owned by
      *   Java; Rust never closes it, and it must outlive the returned handle.
      * @param maxTransfer bytes per bulk transfer, or 0 for the safe default of

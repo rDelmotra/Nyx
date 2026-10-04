@@ -104,6 +104,7 @@ object TreeExporter {
         mimeTypeFor: (String) -> String = { DEFAULT_MIME },
         onProgress: (TransferProgress) -> Unit = {},
         isCancelled: () -> Boolean = { false },
+        onFileDone: (FileDone) -> Unit = {},
     ): TransferOutcome {
         // Execution trusts this ordering completely (a child's parent directory
         // must already have a document ID); a broken plan must fail loudly here,
@@ -223,6 +224,7 @@ object TreeExporter {
             }
 
             val written: Long
+            val fileStartNs = System.nanoTime()
             var created: CreatedDocument
             var createdDoc: CreatedDocument? = null
             try {
@@ -261,6 +263,7 @@ object TreeExporter {
             state.recordCreatedFile(parentId, created)
             bytesCopied += written
             filesCopied++
+            onFileDone(FileDone(written, null, (System.nanoTime() - fileStartNs) / 1_000_000L))
             fireProgress(entry.relativePath, bytesCopied, force = true)
         }
 

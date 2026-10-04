@@ -33,7 +33,8 @@ use crate::device::WriteAt;
 use crate::error::{LuksError, Result};
 use crate::fs::ext4::alloc::{Aborted, Extent};
 use crate::fs::ext4::csum::{Seed, DIR_TAIL_SIZE};
-use crate::fs::ext4::{Ext4, Inode};
+use crate::forensic::{record_ext4, Ext4Event};
+use crate::fs::ext4::{note_err, Ext4, Inode};
 use crate::fs::FileType;
 
 const EXTENT_MAGIC: u16 = 0xF30A;
@@ -203,6 +204,11 @@ impl<D: WriteAt> Ext4<D> {
     /// free on disk; data written into them is garbage in free space until
     /// publish.
     pub fn begin_file(&mut self, size: u64) -> Result<FileWriter> {
+        note_err(self.begin_file_inner(size), "begin_file")
+    }
+
+    /// Body of [`begin_file`](Self::begin_file), separated so that every error return is recorded in one place.
+    fn begin_file_inner(&mut self, size: u64) -> Result<FileWriter> {
         let seed = Seed::for_writing(&self.sb)?;
         let bs = self.sb.block_size as u64;
         let blocks_needed = size.div_ceil(bs.max(1));
@@ -237,6 +243,7 @@ impl<D: WriteAt> Ext4<D> {
                 }
             }
         }
+        record_ext4(Ext4Event::BeginFile { size });
         Ok(FileWriter {
             ino,
             generation: self.next_generation(),
@@ -257,8 +264,14 @@ impl<D: WriteAt> Ext4<D> {
     /// Blocks are reserved (memory only) as data arrives via
     /// [`write_chunk`](Self::write_chunk).
     pub fn begin_file_streaming(&mut self) -> Result<FileWriter> {
+        note_err(self.begin_file_streaming_inner(), "begin_file_streaming")
+    }
+
+    /// Body of [`begin_file_streaming`](Self::begin_file_streaming), separated so that every error return is recorded in one place.
+    fn begin_file_streaming_inner(&mut self) -> Result<FileWriter> {
         let seed = Seed::for_writing(&self.sb)?;
         let ino = self.reserve_inode()?;
+        record_ext4(Ext4Event::BeginFile { size: 0 });
         Ok(FileWriter {
             ino,
             generation: self.next_generation(),
@@ -402,6 +415,17 @@ impl<D: WriteAt> Ext4<D> {
     /// marked dirty on disk, as it truthfully is.
     pub fn finish_file(
         &mut self,
+        writer: FileWriter,
+        dir_ino: u64,
+        name: &str,
+        file_type: crate::fs::FileType,
+    ) -> Result<u64> {
+        note_err(self.finish_file_inner(writer, dir_ino, name, file_type), "finish_file")
+    }
+
+    /// Body of [`finish_file`](Self::finish_file), separated so that every error return is recorded in one place.
+    fn finish_file_inner(
+        &mut self,
         mut writer: FileWriter,
         dir_ino: u64,
         name: &str,
@@ -437,7 +461,8 @@ impl<D: WriteAt> Ext4<D> {
         // Whatever happened, the writer is spent: its promises end here.
         self.release_blocks(&writer.extents);
         self.release_inode(writer.ino);
-        result
+        let bytes = writer.written;
+        result.inspect(|&ino| record_ext4(Ext4Event::FinishFile { ino, bytes }))
     }
 
     /// Roll back a stream that will never be published.
@@ -447,6 +472,7 @@ impl<D: WriteAt> Ext4<D> {
     /// or unplugged device. (Data already written into the reserved blocks is
     /// garbage in free space and is left to be overwritten.)
     pub fn abandon_file(&mut self, writer: FileWriter) {
+        record_ext4(Ext4Event::AbandonFile { bytes: writer.written });
         self.release_blocks(&writer.extents);
         self.release_inode(writer.ino);
     }
@@ -579,6 +605,17 @@ impl<D: WriteAt> Ext4<D> {
         data: &[u8],
         file_type: crate::fs::FileType,
     ) -> Result<u64> {
+        note_err(self.create_file_inner(dir_ino, name, data, file_type), "create_file")
+    }
+
+    /// Body of [`create_file`](Self::create_file), separated so that every error return is recorded in one place.
+    fn create_file_inner(
+        &mut self,
+        dir_ino: u64,
+        name: &str,
+        data: &[u8],
+        file_type: crate::fs::FileType,
+    ) -> Result<u64> {
         // Before anything is allocated. A name that cannot be linked is worth
         // discovering now rather than after every block of the file has
         // crossed a USB cable — and the error then names the real problem
@@ -597,6 +634,7 @@ impl<D: WriteAt> Ext4<D> {
             }
             Ok(ino)
         })
+        .inspect(|&ino| record_ext4(Ext4Event::CreateFile { parent: dir_ino, ino }))
     }
 
     /// Undo a file that was written but never named.
@@ -1030,6 +1068,11 @@ impl<D: WriteAt> Ext4<D> {
     /// 6. Bumps parent directory's `i_links_count` using `patch_inode_links_count`.
     /// 7. Provides compensation rollback on any failure before completion.
     pub fn create_directory(&mut self, dir_ino: u32, name: &str) -> Result<u32> {
+        note_err(self.create_directory_inner(dir_ino, name), "create_directory")
+    }
+
+    /// Body of [`create_directory`](Self::create_directory), separated so that every error return is recorded in one place.
+    fn create_directory_inner(&mut self, dir_ino: u32, name: &str) -> Result<u32> {
         let seed = Seed::for_writing(&self.sb)?;
 
         super::dirent::validate_name(name.as_bytes())?;
@@ -1044,6 +1087,7 @@ impl<D: WriteAt> Ext4<D> {
         self.preflight_link(dir_ino as u64, name)?;
 
         self.dirty_window(|fs| fs.create_directory_body(&seed, dir_ino, name))
+            .inspect(|&ino| record_ext4(Ext4Event::Mkdir { parent: dir_ino as u64, ino: ino as u64 }))
     }
 
     /// The writing half of [`create_directory`](Self::create_directory), run
@@ -1140,6 +1184,11 @@ impl<D: WriteAt> Ext4<D> {
     /// absent), then the old name is removed, and only then is the replaced
     /// file's inode and blocks freed.
     pub fn rename_file(&mut self, dir_ino: u32, old_name: &str, new_name: &str) -> Result<()> {
+        note_err(self.rename_file_inner(dir_ino, old_name, new_name), "rename_file")
+    }
+
+    /// Body of [`rename_file`](Self::rename_file), separated so that every error return is recorded in one place.
+    fn rename_file_inner(&mut self, dir_ino: u32, old_name: &str, new_name: &str) -> Result<()> {
         let _seed = Seed::for_writing(&self.sb)?;
 
         // Refusal gate: cross-directory move
@@ -1286,16 +1335,22 @@ impl<D: WriteAt> Ext4<D> {
             }
             Ok(())
         })
+        .inspect(|()| {
+            record_ext4(Ext4Event::Rename { from_parent: dir_ino as u64, to_parent: dir_ino as u64, ino: old_ino })
+        })
     }
 
     /// Rename an item given old and new parent directory paths and names.
     pub fn rename(&mut self, old_parent: &str, old_name: &str, new_parent: &str, new_name: &str) -> Result<()> {
-        let old_dir = self.resolve(old_parent)?;
-        let new_dir = self.resolve(new_parent)?;
+        let old_dir = note_err(self.resolve(old_parent), "rename")?;
+        let new_dir = note_err(self.resolve(new_parent), "rename")?;
         if old_dir.number != new_dir.number {
-            return Err(LuksError::UnsupportedFsFeature(
-                "ext4 cross-directory rename is not supported".into(),
-            ));
+            return note_err(
+                Err(LuksError::UnsupportedFsFeature(
+                    "ext4 cross-directory rename is not supported".into(),
+                )),
+                "rename",
+            );
         }
         self.rename_file(old_dir.number as u32, old_name, new_name)
     }

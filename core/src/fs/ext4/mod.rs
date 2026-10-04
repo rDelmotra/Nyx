@@ -1269,6 +1269,9 @@ impl<D: ReadAt> Ext4<D> {
 const MAX_DELETE_DEPTH: usize = 1024;
 
 #[cfg(feature = "dangerous-write-support")]
+use crate::forensic::{record_ext4, Ext4Event};
+
+#[cfg(feature = "dangerous-write-support")]
 impl<D: WriteAt> Ext4<D> {
     /// Delete the file or directory at `path`. Refuses hardlinks. A directory
     /// is emptied first, depth-first, one flushed operation per child — the
@@ -1277,6 +1280,11 @@ impl<D: WriteAt> Ext4<D> {
     /// leaves exactly what it would if a caller had stopped there themselves.
     /// Follows the Phase 0–4 ordering: collect and validate everything -> sever name -> zero inode -> free blocks -> flush.
     pub fn delete_file(&mut self, path: &str) -> Result<()> {
+        note_err(self.delete_file_inner(path), "delete_file")
+    }
+
+    /// Body of [`delete_file`](Self::delete_file), separated so that every error return is recorded in one place.
+    fn delete_file_inner(&mut self, path: &str) -> Result<()> {
         // `.` and `..` are never real stored entries (`list_inode` filters
         // both), but `resolve`/`resolve_no_follow` silently collapse them
         // during path resolution while the plain string split below does
@@ -1411,5 +1419,16 @@ impl<D: WriteAt> Ext4<D> {
             fs.flush()?;
             Ok(())
         })
+        .inspect(|()| {
+            record_ext4(Ext4Event::DeleteFile { parent: parent_dir.number, ino: target_inode.number })
+        })
     }
+}
+
+/// Record an error return from a public ext4 write entry point as
+/// `Ext4Event::Error { stage, code }` (numbers and a fixed literal only) and
+/// pass the result through unchanged. `stage` names the entry point.
+#[cfg(feature = "dangerous-write-support")]
+pub(crate) fn note_err<T>(r: Result<T>, stage: &'static str) -> Result<T> {
+    r.inspect_err(|e| record_ext4(Ext4Event::Error { stage, code: e.forensic_code() }))
 }

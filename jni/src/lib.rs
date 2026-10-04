@@ -266,6 +266,30 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeDumpForensicLog<'l>
     })
 }
 
+/// Take the lossless notable-event queue (F9 C4) as
+/// `{"dropped":n,"events":[..]}`. Destructive: what is returned is removed.
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeDrainEvents<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+) -> jstring {
+    guard(&mut env, std::ptr::null_mut(), |env| {
+        out_string(env, luks_core::forensic::drain_notable_json())
+    })
+}
+
+/// Snapshot of the whole forensic ring as `{"dropped":n,"events":[..]}`. The
+/// ring is NOT cleared.
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeRingJson<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+) -> jstring {
+    guard(&mut env, std::ptr::null_mut(), |env| {
+        out_string(env, luks_core::forensic::ring_json())
+    })
+}
+
 #[no_mangle]
 pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeClearForensicLog<'l>(
     mut env: JNIEnv<'l>,
@@ -1229,6 +1253,106 @@ mod tests {
         assert!(!panics.is_empty(), "panic was not recorded");
         for p in panics {
             assert_clean("forensic panic", &format!("{} {}", p.file, p.message));
+        }
+    }
+
+    /// The two F9 entry points exist with the exact exported names Kotlin
+    /// binds to (a rename here would be an UnsatisfiedLinkError at runtime).
+    #[test]
+    fn event_export_symbols_exist() {
+        let drain: *const () = Java_dev_luksandroid_LuksNative_nativeDrainEvents as *const ();
+        let ring: *const () = Java_dev_luksandroid_LuksNative_nativeRingJson as *const ();
+        assert!(!drain.is_null() && !ring.is_null() && drain != ring);
+    }
+
+    /// A panic whose payload is a formatted path reaches the JSON handed to
+    /// Kotlin as file:line only: no message, no payload text.
+    #[test]
+    fn event_json_for_a_panic_carries_no_path_text() {
+        install_panic_hook();
+        luks_core::forensic::drain_notable();
+        let outcome = catch_unwind(|| {
+            let name = SECRET;
+            if !name.is_empty() {
+                panic!("cannot open {name}");
+            }
+        });
+        assert!(outcome.is_err());
+        let _ = report_panic();
+        for (what, json) in [
+            ("ring", luks_core::forensic::ring_json()),
+            ("drain", luks_core::forensic::drain_notable_json()),
+        ] {
+            assert_clean(what, &json);
+            assert!(!json.contains("cannot open"), "{what}: panic message leaked: {json}");
+            let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+            let panics: Vec<_> = v["events"]
+                .as_array()
+                .expect("events array")
+                .iter()
+                .filter(|o| o["ev"] == "panic")
+                .collect();
+            assert!(!panics.is_empty(), "{what}: panic event missing from {json}");
+            // Other tests in this process panic too, from other files.
+            for p in &panics {
+                assert!(p["file"].as_str().is_some_and(|f| f.ends_with(".rs")), "{what}: {p}");
+                assert!(p["line"].is_u64());
+                assert!(p.get("message").is_none(), "{what}: {p}");
+            }
+            assert!(
+                panics.iter().any(|p| p["file"].as_str().is_some_and(|f| f.ends_with("lib.rs"))),
+                "{what}: this test's own panic site (lib.rs) is missing: {json}"
+            );
+        }
+    }
+
+    /// `LuksError::forensic_code` is a copy of `error_code` living in core
+    /// (core cannot see the jni constants). This is what keeps them equal.
+    #[test]
+    fn forensic_code_agrees_with_the_jni_wire_code() {
+        let io = || std::io::Error::from(std::io::ErrorKind::NotFound);
+        let errors = [
+            LuksError::WrongPassword,
+            LuksError::BadMagic { found: [0; 6] },
+            LuksError::NoPartitionTable,
+            LuksError::UnsupportedVersion(9),
+            LuksError::Luks1NotImplemented,
+            LuksError::UnsupportedFsFeature("x".into()),
+            LuksError::NotExt4(0),
+            LuksError::UnknownFs,
+            LuksError::AmbiguousFs,
+            LuksError::ChecksumMismatch,
+            LuksError::Truncated { needed: 2, got: 1 },
+            LuksError::OutOfBounds,
+            LuksError::CorruptFs("x"),
+            LuksError::FsChecksumMismatch("x"),
+            LuksError::BadInode(1),
+            LuksError::NotFound("x".into()),
+            LuksError::NotADirectory("x".into()),
+            LuksError::IsADirectory("x".into()),
+            LuksError::DirectoryNotEmpty("x".into()),
+            LuksError::ScsiProtocol("x"),
+            LuksError::ScsiCommandFailed { opcode: 0x2a, sense: None },
+            LuksError::UsbTransfer("x".into()),
+            LuksError::usb_errno(110, "x"),
+            LuksError::FsNeedsRecovery,
+            LuksError::Io { path: "x".into(), source: io() },
+            LuksError::FilesystemFull,
+            LuksError::NoFreeInodes,
+            LuksError::WrongWriteTarget { path: "x".into(), expected: 1, detail: "x" },
+            LuksError::UnverifiableWriteTarget { path: "x".into() },
+            LuksError::AlreadyExists("x".into()),
+            LuksError::WriterBusy,
+            LuksError::BtrfsItemTooLarge { what: "x", item_bytes: 1, node_size: 1 },
+            LuksError::SessionPoisoned,
+            LuksError::Cancelled,
+            LuksError::WriteSessionFenced("x".into()),
+            LuksError::ReadOnlyVolume,
+            LuksError::FileChanged,
+            LuksError::KdfFailed("x".into()),
+        ];
+        for e in &errors {
+            assert_eq!(e.forensic_code(), bridge::error_code(e), "{e:?}");
         }
     }
 }

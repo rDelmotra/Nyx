@@ -6,6 +6,8 @@ import android.content.ComponentCallbacks2
 import android.content.res.Configuration
 import android.os.Bundle
 import dev.luksandroid.Trace
+import dev.luksandroid.log.Ev
+import dev.luksandroid.log.EventLog
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -62,7 +64,7 @@ class LuksSessionLifecycle(
                 delay(recreationGraceMs)
                 if (aliveActivities.get() <= 0 && !session.isBusy) {
                     Trace.i("LuksSessionLifecycle", "All activities destroyed and session idle: locking session")
-                    session.lock()
+                    session.lock("activities_destroyed")
                 }
             }
         }
@@ -70,6 +72,7 @@ class LuksSessionLifecycle(
 
     @Suppress("DEPRECATION")
     override fun onTrimMemory(level: Int) {
+        EventLog.ev(Ev.TRIM_MEMORY) { n(level) }
         Trace.i("LuksSessionLifecycle", "onTrimMemory level=$level, startedActivities=${startedActivities.get()}, activeLeases=${session.activeLeases}")
         // notes/feature-session-lifecycle.md §3: idle timeout + explicit lock + unplug are
         // the relock triggers; screen-off/backgrounding relock was rejected by name as
@@ -88,7 +91,7 @@ class LuksSessionLifecycle(
             scope.launch {
                 if (!session.isBusy) {
                     Trace.i("LuksSessionLifecycle", "TrimMemory ($level): locking session and dropping master key")
-                    session.lock()
+                    session.lock("trim_memory")
                 }
             }
         }
@@ -103,7 +106,7 @@ class LuksSessionLifecycle(
         if (!session.isBusy) {
             scope.launch {
                 if (!session.isBusy) {
-                    session.lock()
+                    session.lock("low_memory")
                 }
             }
         }

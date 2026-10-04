@@ -96,6 +96,8 @@ data class DeviceInfo(
      * the volume — so unlike almost everything else here it is safe to log.
      */
     val writeProbe: String?,
+    /** Bytes per bulk transfer the transport settled on, when the native side reports it (F9 header). Null: not reported. */
+    val maxTransfer: Int? = null,
 )
 
 data class VolumeInfo(
@@ -114,6 +116,9 @@ data class VolumeInfo(
      * first flush, in a build without the write path, or when the field is absent.
      */
     val flushSupported: Boolean? = null,
+    /** LUKS cipher spec (e.g. `aes-xts-plain64`) and key size, when the native side reports them (F9 header). Never key material. */
+    val cipher: String? = null,
+    val keyBits: Int? = null,
 )
 
 /** A directory listing plus the count of entries whose inode could not be read (ext4). */
@@ -853,6 +858,7 @@ internal fun parseDeviceInfo(json: String): DeviceInfo {
         tableKind = o.optString("tableKind"),
         partitions = parts,
         writeProbe = if (o.isNull("writeProbe")) null else o.optString("writeProbe"),
+        maxTransfer = if (o.has("maxTransfer") && !o.isNull("maxTransfer")) o.optInt("maxTransfer") else null,
     )
 }
 
@@ -896,6 +902,8 @@ internal fun parseVolumeInfo(json: String): VolumeInfo {
         },
         encrypted = if (o.has("encrypted") && !o.isNull("encrypted")) o.optBoolean("encrypted", true) else true,
         flushSupported = if (o.has("flushSupported") && !o.isNull("flushSupported")) o.optBoolean("flushSupported") else null,
+        cipher = if (o.has("cipher") && !o.isNull("cipher")) o.optString("cipher") else null,
+        keyBits = if (o.has("keyBits") && !o.isNull("keyBits")) o.optInt("keyBits") else null,
     )
 }
 

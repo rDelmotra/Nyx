@@ -50,6 +50,7 @@ object TreeImporter {
         collisionMode: CollisionMode,
         onProgress: (TransferProgress) -> Unit = {},
         isCancelled: () -> Boolean = { false },
+        onFileDone: (FileDone) -> Unit = {},
     ): TransferOutcome {
         // Execution trusts this ordering completely (mkdir-then-descend assumes
         // the parent is already there); a broken plan must fail loudly here; not
@@ -163,7 +164,7 @@ object TreeImporter {
                     CollisionMode.KEEP_BOTH -> {
                         val targetName = uniqueName(destination.namesOf(parentDir), name)
                         val written = try {
-                            streamFile(volume, source, stats, entry, parentDir,targetName) { liveBytes ->
+                            streamFile(volume, source, stats, entry, parentDir, targetName, onFileDone) { liveBytes ->
                                 fireProgress(entry.relativePath, bytesCopied + liveBytes, force = false)
                                 if (isCancelled()) throw TransferCancelledException()
                             }
@@ -182,7 +183,7 @@ object TreeImporter {
                         // aborted run can never collide with this one either.
                         val tempName = uniqueName(destination.namesOf(parentDir), ".transfer-tmp-${name}-${System.nanoTime()}")
                         val written = try {
-                            streamFile(volume, source, stats, entry, parentDir,tempName) { liveBytes ->
+                            streamFile(volume, source, stats, entry, parentDir, tempName, onFileDone) { liveBytes ->
                                 fireProgress(entry.relativePath, bytesCopied + liveBytes, force = false)
                                 if (isCancelled()) throw TransferCancelledException()
                             }
@@ -213,7 +214,7 @@ object TreeImporter {
 
             // No collision: plain write.
             val written = try {
-                streamFile(volume, source, stats, entry, parentDir, name) { liveBytes ->
+                streamFile(volume, source, stats, entry, parentDir, name, onFileDone) { liveBytes ->
                     fireProgress(entry.relativePath, bytesCopied + liveBytes, force = false)
                     if (isCancelled()) throw TransferCancelledException()
                 }
@@ -259,8 +260,10 @@ object TreeImporter {
         entry: PlanEntry,
         parentDir: String,
         targetName: String,
+        onFileDone: (FileDone) -> Unit,
         onChunk: (Long) -> Unit,
     ): Long {
+        val startNs = System.nanoTime()
         // One owner for the writer: every exit below that does not publish the file ends in
         // abandonFile (which is close(), idempotent natively), including a failed finish (W5).
         val writer = if (entry.sizeBytes >= 0L) {
@@ -298,7 +301,8 @@ object TreeImporter {
             if (entry.sizeBytes >= 0L && total != entry.sizeBytes) {
                 throw TransferFailure("A source file is smaller than it reported, so the copy was stopped.")
             }
-            stats.commit { volume.finishFile(writer, parentDir, targetName) }
+            val ino = stats.commit { volume.finishFile(writer, parentDir, targetName) }
+            onFileDone(FileDone(total, ino, (System.nanoTime() - startNs) / 1_000_000L))
         } catch (t: Throwable) {
             try {
                 volume.abandonFile(writer)

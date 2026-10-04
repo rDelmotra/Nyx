@@ -8,6 +8,8 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.IBinder
+import dev.luksandroid.log.Ev
+import dev.luksandroid.log.EventLog
 import dev.luksandroid.session.ForegroundHost
 import dev.luksandroid.session.TransferManager
 
@@ -40,11 +42,13 @@ class TransferService : Service() {
             // not depend on this service, so survive: losing the notification must not crash
             // the process mid-copy.
             Trace.e("TransferService: startForeground refused (${Trace.throwableSummary(t)})")
+            EventLog.ev(Ev.SERVICE_STOP) { reason("refused"); exc(t) }
             stopSelf()
             return START_NOT_STICKY
         }
         // startForegroundService() obliges startForeground() above; having done that, stop at
         // once if the work already ended (a stop that raced this start).
+        if (!TransferManager.busy.value) EventLog.ev(Ev.SERVICE_STOP) { reason("engine_idle") }
         if (!TransferManager.busy.value) stopSelf()
         // Not sticky: a killed process has lost the queue and any open SAF write with it.
         return START_NOT_STICKY
@@ -59,6 +63,7 @@ class TransferService : Service() {
      */
     override fun onTimeout(startId: Int, fgsType: Int) {
         Trace.i("TransferService", "dataSync timeout, stopping")
+        EventLog.ev(Ev.SERVICE_STOP) { reason("datasync_timeout") }
         stopSelf()
     }
 

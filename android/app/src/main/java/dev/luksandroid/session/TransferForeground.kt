@@ -1,6 +1,8 @@
 package dev.luksandroid.session
 
 import dev.luksandroid.Trace
+import dev.luksandroid.log.Ev
+import dev.luksandroid.log.EventLog
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -49,12 +51,14 @@ class TransferForegroundController(
             .collectLatest { total ->
                 try {
                     if (total > 0) {
+                        if (!active) EventLog.ev(Ev.SERVICE_START) { n(total) }
                         active = true
                         host.show(total)
                     } else if (active) {
                         // Cancelled by the next emission, so a flap inside the window never stops it.
                         delay(stopDelayMs)
                         active = false
+                        EventLog.ev(Ev.SERVICE_STOP) { reason("idle") }
                         host.hide()
                     }
                 } catch (c: CancellationException) {

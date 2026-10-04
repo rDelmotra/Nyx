@@ -193,7 +193,9 @@ class DirectoryTransferUiTest {
         assertTrue(summary, summary.contains("37 of 40 files"))
         assertTrue(summary, summary.contains("Photos/IMG_0041.jpg"))
         assertTrue(summary, summary.contains("has been kept"))
-        assertTrue(summary, summary.contains("the session was locked"))
+        // O2: the failure's own text can carry names, so the summary shows the code's message instead.
+        assertFalse(summary, summary.contains("the session was locked"))
+        assertTrue(summary, summary.contains("I/O error"))
     }
 
     @Test

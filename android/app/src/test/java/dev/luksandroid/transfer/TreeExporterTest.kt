@@ -159,6 +159,17 @@ class TreeExporterTest {
             docs.remove(docId)
         }
 
+        /** Flip one byte of what a read-back returns, to model a destination that lost or altered data. */
+        var corruptReadBack = false
+        var unreadable = false
+
+        override fun openInput(docId: String): java.io.InputStream? {
+            if (unreadable) throw IOException("simulated unreadable destination")
+            val b = docs.getValue(docId).bytes.copyOf()
+            if (corruptReadBack && b.isNotEmpty()) b[0] = (b[0] + 1).toByte()
+            return ByteArrayInputStream(b)
+        }
+
         override fun rename(docId: String, newName: String): CreatedDocument {
             if (failRenameTo == newName) throw IOException("simulated rename failure to $newName")
             val doc = docs.getValue(docId)
@@ -313,7 +324,7 @@ class TreeExporterTest {
 
     @Test
     fun `replace - the temp document is written first, so a failed write never destroys the original`() {
-        dest.seedFile(root, "note.txt", "original".toByteArray())
+        val originalId = dest.seedFile(root, "note.txt", "original".toByteArray())
         dest.failWriteAfterTotalBytes = 1
 
         val outcome = export(
@@ -326,7 +337,8 @@ class TreeExporterTest {
         // This is the property that ordering buys: the original is still there
         // and still correct. Under delete-then-write it would be gone.
         assertArrayEquals("original".toByteArray(), dest.bytesAt(root, "note.txt"))
-        assertTrue("the original must not have been deleted", dest.deletedIds.isEmpty())
+        assertTrue("the original must not have been deleted", originalId !in dest.deletedIds)
+        assertTrue("the failed temp document is removed (R5r)", dest.namesUnder(root).none { it.startsWith(".transfer-tmp-") })
     }
 
     // ---- the provider renames behind our back ------------------------------
@@ -395,6 +407,56 @@ class TreeExporterTest {
         assertEquals(1, outcome.filesCopied)
         // §5.2: no rollback. The first file stays.
         assertArrayEquals(ok, dest.bytesAt(root, "first.txt"))
+        // R5r: but the file that failed is not left behind half-written.
+        assertNull(dest.childNamed(root, "second.txt"))
+    }
+
+    @Test
+    fun `R5r a cancelled file is deleted, not left truncated`() {
+        val data = ByteArray(TreeExporter.CHUNK_SIZE * 2) { 1 }
+        var chunks = 0
+        val outcome = export(
+            plan(file("big.bin", data.size.toLong())),
+            FakeSource(mapOf("v:big.bin" to data)),
+            isCancelled = { ++chunks > 2 },
+        )
+        assertTrue(outcome.failure is TransferCancelledException)
+        assertNull(dest.childNamed(root, "big.bin"))
+    }
+
+    @Test
+    fun `R5r a file that reads back different is failed and deleted`() {
+        dest.corruptReadBack = true
+        val outcome = export(plan(file("a.txt", 3)), FakeSource(mapOf("v:a.txt" to "abc".toByteArray())))
+        assertFalse(outcome.succeeded)
+        assertEquals("a.txt", outcome.stoppedAtPath)
+        assertEquals(0, outcome.filesCopied)
+        assertNull(dest.childNamed(root, "a.txt"))
+    }
+
+    @Test
+    fun `R5r a destination that cannot be read back cannot be verified, so the file fails and is deleted`() {
+        dest.unreadable = true
+        val outcome = export(plan(file("a.txt", 3)), FakeSource(mapOf("v:a.txt" to "abc".toByteArray())))
+        assertFalse(outcome.succeeded)
+        assertNull(dest.childNamed(root, "a.txt"))
+    }
+
+    @Test
+    fun `V2 a file whose bytes differ in count from its declared size fails and is deleted`() {
+        val longer = export(plan(file("a.txt", 2)), FakeSource(mapOf("v:a.txt" to "abc".toByteArray())))
+        assertFalse(longer.succeeded)
+        assertNull(dest.childNamed(root, "a.txt"))
+        val shorter = export(plan(file("b.txt", 9)), FakeSource(mapOf("v:b.txt" to "abc".toByteArray())))
+        assertFalse(shorter.succeeded)
+        assertNull(dest.childNamed(root, "b.txt"))
+    }
+
+    @Test
+    fun `an unknown declared size is not a mismatch`() {
+        val outcome = export(plan(file("a.txt", -1)), FakeSource(mapOf("v:a.txt" to "abc".toByteArray())))
+        assertTrue(outcome.succeeded)
+        assertArrayEquals("abc".toByteArray(), dest.bytesAt(root, "a.txt"))
     }
 
     @Test

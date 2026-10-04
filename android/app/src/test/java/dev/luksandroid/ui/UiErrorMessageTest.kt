@@ -32,7 +32,7 @@ class UiErrorMessageTest {
             LuksException.WRONG_TARGET to "target USB",
             LuksException.UNVERIFIABLE_TARGET to "verify the USB",
             LuksException.ALREADY_EXISTS to "already exists",
-            LuksException.WRITER_BUSY to "write operation is currently in progress",
+            LuksException.WRITER_BUSY to "busy with a transfer",
             LuksException.ITEM_TOO_LARGE to "too large",
             LuksException.MUTEX_POISONED to "Drive state was compromised",
             LuksException.CANCELLED to "cancelled",

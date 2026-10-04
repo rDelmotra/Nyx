@@ -27,18 +27,14 @@ kt_red() {
 }
 export -f kt_red
 RED=(
-  # Kotlin (F0.7): gated by -PknownRed=1 (Assume), never by editing source.
-  # Filters are per test method, because the same class also holds a deliberately green test.
-  "W5|$KT '*TransferIntegrityRedTest.w5_*'"
-  "W6|$KT '*TransferIntegrityRedTest.w6_*'"
-  "C1|$KT '*TransferIntegrityRedTest.c1_*'"
-  "C5|$KT '*TransferIntegrityRedTest.c5_cancelRecorded*'"
+  # Empty since F5 (E1): Kotlin W5, W6, C1, C5 are fixed and run in every build.
 )
 
 LOGDIR="$(mktemp -d -t known-red)"
 bad=0
 printf '%-14s %-8s %s\n' ID RESULT LOG
-for entry in "${RED[@]}"; do
+# ${RED[@]+...}: an empty array is "unbound" under `set -u` in bash 3.2 (macOS).
+for entry in ${RED[@]+"${RED[@]}"}; do
   id="${entry%%|*}"; cmd="${entry#*|}"
   log="$LOGDIR/$(echo "$id" | tr '/' '_').log"
   bash -c "$cmd" >"$log" 2>&1

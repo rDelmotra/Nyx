@@ -185,6 +185,41 @@ class TreeImporterTest {
         volume.seedRoot("/dst")
     }
 
+    // ---- V2: declared size is a contract --------------------------------------
+
+    @Test
+    fun `V2 a source longer than its declared size stops the tree and publishes nothing`() {
+        val outcome = TreeImporter.importTree(
+            volume, plan(file("a.txt", 3)), "/dst",
+            FakeSource(mapOf("id:a.txt" to "abcdef".toByteArray())), CollisionMode.SKIP,
+        )
+        assertFalse(outcome.succeeded)
+        assertEquals("a.txt", outcome.stoppedAtPath)
+        assertEquals(0, outcome.filesCopied)
+        assertNull(volume.fileAt("/dst", "a.txt"))
+        assertTrue(volume.writersCreated.single().abandoned)
+    }
+
+    @Test
+    fun `V2 a source shorter than its declared size stops the tree and publishes nothing`() {
+        val outcome = TreeImporter.importTree(
+            volume, plan(file("a.txt", 9)), "/dst",
+            FakeSource(mapOf("id:a.txt" to "abc".toByteArray())), CollisionMode.SKIP,
+        )
+        assertFalse(outcome.succeeded)
+        assertNull(volume.fileAt("/dst", "a.txt"))
+        assertTrue(volume.writersCreated.single().abandoned)
+    }
+
+    @Test
+    fun `V2 an unknown declared size is not a mismatch`() {
+        val outcome = TreeImporter.importTree(
+            volume, plan(file("a.txt", -1)), "/dst",
+            FakeSource(mapOf("id:a.txt" to "abc".toByteArray())), CollisionMode.SKIP,
+        )
+        assertTrue(outcome.succeeded)
+    }
+
     // ---- nested tree, structure and content --------------------------------
 
     @Test

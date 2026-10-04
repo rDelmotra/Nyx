@@ -10,6 +10,8 @@ import dev.luksandroid.Trace
 import dev.luksandroid.Trace.throwableSummary
 import dev.luksandroid.session.LuksSession
 import dev.luksandroid.session.SessionController
+import dev.luksandroid.session.SessionNotice
+import dev.luksandroid.session.WriteHold
 import dev.luksandroid.session.TransferManager
 import kotlinx.coroutines.runBlocking
 
@@ -63,6 +65,17 @@ open class LuksProxyCallback(
 
     /** Whether this callback currently holds [TransferManager]'s SAF write lock. */
     private var writeLockHeld: Boolean = false
+
+    /**
+     * Keeps the session busy for the stream's whole life (C9): between chunks no lease is
+     * held, so without this the last activity being destroyed would lock mid-write.
+     */
+    private var writeHold: WriteHold? = null
+
+    private fun markWriteLockHeld() {
+        writeLockHeld = true
+        writeHold = session.acquireWriteHold()
+    }
 
     override fun onGetSize(): Long {
         // A write-mode proxy answers from the write cursor, never from the volume.
@@ -162,7 +175,7 @@ open class LuksProxyCallback(
             if (!acquired) {
                 throw ErrnoException("pwrite", OsConstants.EBUSY)
             }
-            writeLockHeld = true
+            markWriteLockHeld()
 
             val pending = PendingDocuments.get(documentId)
             if (pending == null) {
@@ -210,13 +223,35 @@ open class LuksProxyCallback(
     }
 
     override fun onFsync() {
-        // Nothing is durable until onRelease's finish materializes the file -- there is no
-        // partial commit this streaming writer can offer. Reporting success here, rather than
-        // an error, is deliberate: a failed fsync is read by most callers as "your data is
-        // gone", which is false -- the bytes are still buffered natively and will land
-        // atomically at close. Reporting success for not-yet-durable data is the better of the
-        // two available answers, since fsync's real guarantee (durability now) is unavailable
-        // either way until the writer finishes.
+        if (mode != "w" && mode != "wt") return
+        if (writer != null) {
+            // A native writer is open: the in-flight file cannot be committed (a btrfs commit
+            // refuses while a writer is open) and becomes durable only at finish + commit in
+            // onRelease, where a failure is surfaced to the user (W12). Nothing is committable
+            // here, so there is nothing to claim and nothing to fail.
+            return
+        }
+        // Commit policy (d): what earlier files left in the batch is made durable now, and a
+        // failure is the client's to hear about (EIO), never reported as a successful fsync.
+        // No stream is open, so this callback holds no transfer lock; take it, so the commit
+        // cannot interleave with another job's writer.
+        val acquired = try {
+            runBlocking { TransferManager.tryAcquireForSafWrite() }
+        } catch (t: Throwable) {
+            false
+        }
+        if (!acquired) throw ErrnoException("fsync", OsConstants.EBUSY)
+        val failure = try {
+            runBlocking { session.commitAndReport(forFinish = false) }
+        } catch (t: Throwable) {
+            t
+        } finally {
+            runCatching { TransferManager.releaseSafWriteLock() }
+        }
+        if (failure != null) {
+            Trace.e("LuksProxyCallback: fsync commit failed: ${throwableSummary(failure)}")
+            throw ErrnoException("fsync", OsConstants.EIO)
+        }
     }
 
     override fun onRelease() {
@@ -268,9 +303,10 @@ open class LuksProxyCallback(
             // retry from here. Drop the pending registration rather than leave it to
             // synthesize a 0-byte row for a document that will never exist.
             PendingDocuments.remove(documentId)
+            session.notifier.notify(SessionNotice.SafFinishFailed)
             return
         }
-        writeLockHeld = true
+        markWriteLockHeld()
 
         val emptyWriter = try {
             runBlocking { session.withLease { it.beginFileStreaming() } }
@@ -278,6 +314,7 @@ open class LuksProxyCallback(
             Trace.e("LuksProxyCallback: beginFileStreaming for an empty file failed: ${throwableSummary(t)}")
             PendingDocuments.remove(documentId)
             releaseWriteLockIfHeld()
+            session.notifier.notify(SessionNotice.SafFinishFailed)
             return
         }
         finishOrAbandon(emptyWriter)
@@ -314,13 +351,22 @@ open class LuksProxyCallback(
         val pending = PendingDocuments.get(documentId)
         try {
             if (pending != null) {
+                // D-d (lead decision, F5-design.md): onRelease cannot tell a clean close from a
+                // killed client, so whatever arrived is published, as POSIX does for a killed
+                // writer on any filesystem. A finish that fails is not silent (W12): the client
+                // already saw its close() succeed, so the user is told via the notice below.
                 runBlocking { session.withLease { it.finishFile(activeWriter, pending.parentPath, pending.name) } }
+                session.noteFilesFinished()
                 notifyMaterialized(pending.parentPath)
+                // Commit policy (c): btrfs finish only queues the file into a batch that
+                // otherwise waits for a threshold or a later mutator. Failure is reported inside.
+                runBlocking { session.commitAndReport(forFinish = true) }
             } else {
                 // The pending entry vanished underneath us (session lock/detach cleared the
                 // registry -- see PendingDocuments.clear) -- there is nothing left to finish
                 // against, so the only safe thing left to do is discard what was written.
                 runCatching { runBlocking { session.withLease { it.abandonFile(activeWriter) } } }
+                reportFinishFailure()
             }
         } catch (e: LuksException) {
             if (e.isAlreadyExists) {
@@ -329,13 +375,21 @@ open class LuksProxyCallback(
                 Trace.e("LuksProxyCallback: finish failed, abandoning: ${throwableSummary(e)}")
             }
             runCatching { runBlocking { session.withLease { it.abandonFile(activeWriter) } } }
+            reportFinishFailure()
         } catch (t: Throwable) {
             Trace.e("LuksProxyCallback: finish failed, abandoning: ${throwableSummary(t)}")
             runCatching { runBlocking { session.withLease { it.abandonFile(activeWriter) } } }
+            reportFinishFailure()
         } finally {
             PendingDocuments.remove(documentId)
             releaseWriteLockIfHeld()
         }
+    }
+
+    /** W12: the client's close() already succeeded, so this is the only place the user can learn of it. */
+    private fun reportFinishFailure() {
+        Trace.e("LuksProxyCallback: a file the client reported closed was NOT saved")
+        session.notifier.notify(SessionNotice.SafFinishFailed)
     }
 
     /** Opens the read handle on first use (one path resolution per proxy). */
@@ -370,6 +424,8 @@ open class LuksProxyCallback(
     }
 
     private fun releaseWriteLockIfHeld() {
+        writeHold?.release()
+        writeHold = null
         if (writeLockHeld) {
             writeLockHeld = false
             runCatching { TransferManager.releaseSafWriteLock() }

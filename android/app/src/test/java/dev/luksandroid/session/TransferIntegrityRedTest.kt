@@ -20,7 +20,6 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
-import org.junit.Assume
 import org.junit.Test
 import java.nio.ByteBuffer
 import java.util.concurrent.CopyOnWriteArrayList
@@ -29,9 +28,8 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * F0.7 red tests: W5, W6, C1, C5 (notes/recon/transfer-issue-register.md).
- * Each asserts the CORRECT behaviour and is @Ignore'd as KNOWN-RED until its
- * fix lands. Run all with: tools/known-red.sh (Kotlin section).
+ * F0.7 tests for W5, W6, C1, C5 (notes/recon/transfer-issue-register.md). They were written
+ * red against the pre-F5 engine and went green with F5 (E1); they now run in every build.
  *
  * JVM seam limits: libluks_jni is not loaded, so every LuksNative call throws
  * UnsatisfiedLinkError and native calls cannot be recorded. W5 therefore
@@ -104,7 +102,6 @@ class TransferIntegrityRedTest {
      */
     @Test
     fun w5_finishThatThrowsNativelyStillClosesTheNativeWriter() {
-        knownRed("W5: fixed by F5 (FileWriter.finish keeps close ownership on native failure)")
         val vol = W5Volume()
         val writer = vol.Writer()
         vol.register(writer)
@@ -188,7 +185,6 @@ class TransferIntegrityRedTest {
      */
     @Test
     fun w6_allocationFailureAfterBeginFileStillClosesWriter() = runBlocking {
-        knownRed("W6: fixed by F5 (writer closed if anything after beginFile throws)")
         val vol = W6Volume()
         val hog = ArrayList<ByteBuffer>()
         try {
@@ -246,7 +242,6 @@ class TransferIntegrityRedTest {
      */
     @Test
     fun c1_resetTransferLocksDoesNotLetSecondJobOverlapFirst() = runBlocking {
-        knownRed("C1: fixed by F5 (transfer mutex with owner token)")
         val vol = GatedHashVolume("/a.bin")
         unlocked(vol)
         try {
@@ -278,7 +273,6 @@ class TransferIntegrityRedTest {
      */
     @Test
     fun c5_cancelRecordedMidFlightIsNotOverwrittenByCompleted() = runBlocking {
-        knownRed("C5: fixed by F5 (terminal states are write-once)")
         val vol = GatedHashVolume("/a.bin")
         unlocked(vol)
         try {
@@ -316,13 +310,4 @@ class TransferIntegrityRedTest {
 
         assertEquals(TransferState.COMPLETED, TransferManager.getTransfer(id)?.state)
     }
-}
-
-/**
- * KNOWN-RED gate. These tests assert correct behaviour and fail on current code.
- * They are skipped (reported as skipped, with this reason) unless the build runs
- * with `-PknownRed=1`, which tools/known-red.sh does. Never edit the source to run them.
- */
-private fun knownRed(reason: String) {
-    Assume.assumeTrue("KNOWN-RED $reason", System.getProperty("knownRed") == "1")
 }

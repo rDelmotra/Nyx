@@ -66,6 +66,13 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 
+        <!-- Held while transfers are queued/running or a SAF write is open. Same type
+             rule as above: must match startForeground() in TransferService. -->
+        <service
+            android:name=".TransferService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
         <provider
             android:name=".documents.LuksDocumentsProvider"
             android:authorities="dev.luksandroid.documents"

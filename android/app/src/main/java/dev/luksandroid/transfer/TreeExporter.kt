@@ -61,6 +61,14 @@ interface ExportDestination {
 
     /** Renames an existing document. The provider may still adjust the name, so the result is authoritative. */
     fun rename(docId: String, newName: String): CreatedDocument
+
+    /**
+     * Opens a finished document for reading back, so the executor can verify size and SHA-256
+     * against what it sent (R5r). Null means this destination cannot be read back, and the
+     * file is then not verified; an [java.io.IOException] means it should have been readable
+     * and was not, which fails the file. The executor closes the stream.
+     */
+    fun openInput(docId: String): java.io.InputStream? = null
 }
 
 object TreeExporter {
@@ -215,13 +223,18 @@ object TreeExporter {
 
             val written: Long
             var created: CreatedDocument
+            var createdDoc: CreatedDocument? = null
             try {
                 created = destination.createFile(parentId, requestedName, mimeTypeFor(name))
+                createdDoc = created
                 written = streamFile(destination, source, stats, entry, created) { liveBytes ->
                     fireProgress(entry.relativePath, bytesCopied + liveBytes, force = false)
                     if (isCancelled()) throw TransferCancelledException()
                 }
             } catch (t: Throwable) {
+                // R5r: a document that failed, was cancelled, or did not verify is not left behind
+                // truncated. (§5.2's "keep what landed" still holds for every file that finished.)
+                createdDoc?.let { doc -> runCatching { destination.delete(doc.id) } }
                 return stop(entry.relativePath, t)
             }
 
@@ -257,15 +270,16 @@ object TreeExporter {
     }
 
     /**
-     * Streams [entry]'s bytes from [source] into [target]'s output stream.
-     * [onChunk] gets the running total for *this file only* after each chunk,
-     * driving live progress and cancellation.
+     * Streams [entry]'s bytes from [source] into [target]'s output stream, then
+     * verifies them. [onChunk] gets the running total for *this file only* after
+     * each chunk, driving live progress and cancellation.
      *
-     * Unlike the import side there is no "abandon" that leaves no trace: the
-     * document already exists by the time any byte is written, so a failure
-     * here leaves a short file behind. The caller deals with that -- for
-     * REPLACE it is only ever the temp document, and for a plain write it is
-     * the partial file §5.2 explicitly chooses to keep rather than roll back.
+     * The document already exists by the time any byte is written, so any throw
+     * here leaves a short or unverified document; the caller deletes it. Two
+     * checks make "success" mean something: the byte count must equal the
+     * declared size when one was declared (V2), and, when the destination can
+     * be read back, its size and SHA-256 must equal the bytes that left the
+     * source (R5r).
      */
     private fun streamFile(
         destination: ExportDestination,
@@ -276,7 +290,9 @@ object TreeExporter {
         onChunk: (Long) -> Unit,
     ): Long {
         var total = 0L
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
         val output = destination.openOutput(target.id)
+        var failure: Throwable? = null
         try {
             source.open(entry.sourceId).use { input ->
                 val buffer = ByteArray(CHUNK_SIZE)
@@ -287,7 +303,11 @@ object TreeExporter {
                         val read = stats.read { input.read(buffer) }
                         if (read < 0) break
                         if (read == 0) continue
+                        if (entry.sizeBytes >= 0L && total + read > entry.sizeBytes) {
+                            throw TransferFailure("A source file is larger than it reported, so the copy was stopped.")
+                        }
                         stats.write { output.write(buffer, 0, read) }
+                        digest.update(buffer, 0, read)
                         total += read
                         onChunk(total)
                     }
@@ -295,11 +315,37 @@ object TreeExporter {
                     java.util.Arrays.fill(buffer, 0.toByte())
                 }
             }
+        } catch (t: Throwable) {
+            failure = t
+            throw t
         } finally {
             // Timed rather than left to `use`: a provider stream can hold a
             // whole file's worth of buffering until close, which would
             // otherwise land in "other" and look like per-entry overhead.
-            stats.commit { output.close() }
+            try {
+                stats.commit { output.close() }
+            } catch (closeFailure: Throwable) {
+                // A close that fails means the bytes may not have landed. It must not hide the
+                // primary failure, but with none it is itself the failure.
+                if (failure != null) failure.addSuppressed(closeFailure) else throw closeFailure
+            }
+        }
+        if (entry.sizeBytes >= 0L && total != entry.sizeBytes) {
+            throw TransferFailure("A source file is smaller than it reported, so the copy was stopped.")
+        }
+        val readBack = try {
+            destination.openInput(target.id)
+        } catch (_: java.io.IOException) {
+            throw TransferFailure("A copied file could not be read back to verify it.")
+        }
+        if (readBack != null) {
+            when (verifyReadBack({ readBack }, total, digest.digest())) {
+                ReadBack.Verified -> Unit
+                is ReadBack.SizeMismatch, ReadBack.HashMismatch ->
+                    throw TransferFailure("A copied file did not match its source, so it was removed.")
+                ReadBack.Unreadable ->
+                    throw TransferFailure("A copied file could not be read back to verify it.")
+            }
         }
         return total
     }

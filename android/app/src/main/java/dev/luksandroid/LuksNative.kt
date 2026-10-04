@@ -140,6 +140,21 @@ internal object LuksNative {
     external fun nativeSha256(handle: Long, path: String, chunkBytes: Int): String
 
     /**
+     * [nativeSha256] that polls [cancelToken] (from [nativeCreateCancelToken]) between chunks and
+     * throws [LuksException.CANCELLED] once it is signalled. A token <= 0 means "none".
+     * Matches `nativeSha256WithCancel` in `jni/src/lib.rs`.
+     */
+    external fun nativeSha256WithCancel(handle: Long, path: String, chunkBytes: Int, cancelToken: Long): String
+
+    /**
+     * Reads the whole file at [path] through the native pipeline into a sink and returns the byte
+     * count, polling [cancelToken] between chunks (<= 0 means none). Nothing is returned to the
+     * JVM, so this is a read-throughput probe, not a way to obtain the bytes.
+     * Matches `nativeReadFileStream` in `jni/src/lib.rs`.
+     */
+    external fun nativeReadFileStream(handle: Long, path: String, chunkBytes: Int, cancelToken: Long): Long
+
+    /**
      * Times a raw block read — no decryption, no filesystem. JSON result also
      * reports the transfer size the kernel actually allowed, which is the only
      * way to tell a self-tuned ceiling from a silent fallback.
@@ -204,6 +219,13 @@ internal object LuksNative {
      */
     external fun nativeBeginFileStreaming(handle: Long): Long
     external fun nativeWriteChunk(handle: Long, writer: Long, data: java.nio.ByteBuffer, len: Int)
+
+    /**
+     * [nativeWriteChunk] that refuses with [LuksException.CANCELLED] when [cancelToken] is already
+     * signalled (<= 0 means none). Same write-support gating. Matches `nativeWriteChunkWithCancel`
+     * in `jni/src/lib.rs`.
+     */
+    external fun nativeWriteChunkWithCancel(handle: Long, writer: Long, data: java.nio.ByteBuffer, len: Int, cancelToken: Long)
     external fun nativeFinishFile(handle: Long, writer: Long, parentPath: String, name: String): Long
     external fun nativeCommitActiveBatch(handle: Long)
     external fun nativeCloseWriter(handle: Long, writer: Long)

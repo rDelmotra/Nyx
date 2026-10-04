@@ -21,6 +21,7 @@ import dev.luksandroid.transfer.TreeExporter
 import dev.luksandroid.transfer.TreeImporter
 import dev.luksandroid.transfer.VolumeChildSource
 import dev.luksandroid.transfer.VolumeSourceBytes
+import dev.luksandroid.transfer.availableFromStatVfs
 import dev.luksandroid.transfer.formatThroughput
 import dev.luksandroid.transfer.precheckTransfer
 import dev.luksandroid.transfer.promptFor
@@ -190,11 +191,22 @@ private fun listDirOrNull(volume: LuksVolume, path: String): List<DestinationEnt
     return entries.map { DestinationEntry(it.name, it.isDir) }
 }
 
-/** Free space at the SAF destination, or [Long.MAX_VALUE] if the provider will not say. */
+/**
+ * Free space at the SAF destination, or [Long.MAX_VALUE] if the provider will not say.
+ *
+ * Reads `fstatvfs` of the picked folder's own document. (This used to hand
+ * `FileDescriptor.toString()` to `StatFs`, which is not a path: it always threw, the catch
+ * below swallowed it, and the precheck never fired -- V3.) Most providers refuse to open a
+ * directory as a file descriptor; "unknown" is then the honest answer, and the per-file
+ * export prechecks real space at each document it creates.
+ */
 private fun availableSpaceFor(context: Context, treeUri: Uri): Long {
     return try {
-        context.contentResolver.openFileDescriptor(treeUri, "r")?.use { pfd ->
-            android.os.StatFs(pfd.fileDescriptor.toString()).availableBytes
+        val rootUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, DocumentsContract.getTreeDocumentId(treeUri))
+        context.contentResolver.openFileDescriptor(rootUri, "r")?.use { pfd ->
+            val st = android.system.Os.fstatvfs(pfd.fileDescriptor)
+            // Zero means the provider filled in nothing: unknown, not full.
+            availableFromStatVfs(st.f_bavail, st.f_frsize).takeIf { it > 0L }
         } ?: Long.MAX_VALUE
     } catch (_: Throwable) {
         // Not knowing is not the same as knowing it will not fit. Refusing on a
@@ -225,7 +237,12 @@ fun runDirectoryImport(
     collisionMode = mode,
     onProgress = onProgress,
     isCancelled = isCancelled,
-).also { Trace.i(formatThroughput("import", it.bytesCopied, it.stats)) }
+).also {
+    Trace.i(formatThroughput("import", it.bytesCopied, it.stats))
+    // Unsaved-file accounting: a clean outcome includes the importer's final commit.
+    LuksSession.noteFilesFinished(it.filesCopied)
+    if (it.failure == null) LuksSession.noteBatchCommitted()
+}
 
 /** Creates [path] if it is not already there, so the plan's children have somewhere to land. */
 private fun ensureDirectory(volume: LuksVolume, path: String) {

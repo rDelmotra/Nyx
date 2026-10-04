@@ -175,6 +175,19 @@ internal fun defaultFormatBytes(bytes: Long): String = when {
  * written, so this deliberately says what was kept rather than implying a
  * rollback that did not happen.
  */
+/**
+ * Text for a stopped transfer that never carries a name from either side (O2): our own refusals
+ * are path-free by construction, native failures map to the shared code messages, and anything
+ * else says only that it was unexpected.
+ */
+private fun safeFailureText(failure: Throwable?): String? = when (failure) {
+    null -> null
+    is TransferFailure -> failure.userMessage
+    is dev.luksandroid.LuksException -> dev.luksandroid.ui.UiErrorMessage.getBaseMessage(failure.code)
+    is java.io.IOException -> dev.luksandroid.ui.UiErrorMessage.getBaseMessage(dev.luksandroid.LuksException.IO)
+    else -> "An unexpected error occurred."
+}
+
 fun stoppedSummary(outcome: TransferOutcome, filesTotal: Int): String {
     if (outcome.succeeded) {
         return "Copied ${outcome.filesCopied} of $filesTotal files."
@@ -186,7 +199,7 @@ fun stoppedSummary(outcome: TransferOutcome, filesTotal: Int): String {
         outcome.stoppedAtPath?.let { append(", at “$it”") }
         append(". Everything already copied has been kept.")
         if (!cancelled) {
-            outcome.failure?.message?.takeIf { it.isNotBlank() }?.let { append("\n$it") }
+            safeFailureText(outcome.failure)?.let { append("\n$it") }
         }
     }
 }

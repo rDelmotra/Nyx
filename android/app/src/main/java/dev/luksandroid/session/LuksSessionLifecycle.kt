@@ -9,6 +9,7 @@ import dev.luksandroid.Trace
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -19,6 +20,11 @@ import java.util.concurrent.atomic.AtomicInteger
 class LuksSessionLifecycle(
     private val session: SessionController = LuksSession,
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
+    /**
+     * An activity recreation (uiMode, locale, density) destroys the old instance before it
+     * creates the new one, so the alive count touches 0. Re-check after this long.
+     */
+    private val recreationGraceMs: Long = 250L,
 ) : Application.ActivityLifecycleCallbacks, ComponentCallbacks2 {
 
     private val startedActivities = AtomicInteger(0)
@@ -47,11 +53,15 @@ class LuksSessionLifecycle(
 
     override fun onActivityDestroyed(activity: Activity) {
         val remaining = aliveActivities.decrementAndGet()
-        Trace.i("LuksSessionLifecycle", "onActivityDestroyed: remaining activities=$remaining, active leases=${session.activeLeases}")
-        if (remaining <= 0 && session.activeLeases == 0) {
+        Trace.i("LuksSessionLifecycle", "onActivityDestroyed: remaining activities=$remaining, active leases=${session.activeLeases}, write holds=${session.activeWriteHolds}")
+        if (remaining <= 0) {
             scope.launch {
-                if (aliveActivities.get() <= 0 && session.activeLeases == 0) {
-                    Trace.i("LuksSessionLifecycle", "All activities destroyed with 0 active leases: locking session")
+                // C9: a lease (transfer) or an open SAF write keeps the session alive. It is not
+                // forgotten: once the work ends and still no activity exists, the lock happens.
+                if (session.isBusy) session.awaitNotBusy()
+                delay(recreationGraceMs)
+                if (aliveActivities.get() <= 0 && !session.isBusy) {
+                    Trace.i("LuksSessionLifecycle", "All activities destroyed and session idle: locking session")
                     session.lock()
                 }
             }
@@ -74,9 +84,9 @@ class LuksSessionLifecycle(
             else -> false
         }
 
-        if (shouldLock && session.activeLeases == 0) {
+        if (shouldLock && !session.isBusy) {
             scope.launch {
-                if (session.activeLeases == 0) {
+                if (!session.isBusy) {
                     Trace.i("LuksSessionLifecycle", "TrimMemory ($level): locking session and dropping master key")
                     session.lock()
                 }
@@ -90,9 +100,9 @@ class LuksSessionLifecycle(
     @Deprecated("Deprecated in ComponentCallbacks")
     override fun onLowMemory() {
         Trace.i("LuksSessionLifecycle", "onLowMemory received: activeLeases=${session.activeLeases}")
-        if (session.activeLeases == 0) {
+        if (!session.isBusy) {
             scope.launch {
-                if (session.activeLeases == 0) {
+                if (!session.isBusy) {
                     session.lock()
                 }
             }

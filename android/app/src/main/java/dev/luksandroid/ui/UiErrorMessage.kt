@@ -35,7 +35,7 @@ object UiErrorMessage {
         LuksException.WRONG_TARGET -> "The target USB device does not match the active session."
         LuksException.UNVERIFIABLE_TARGET -> "Unable to verify the USB mass-storage interface."
         LuksException.ALREADY_EXISTS -> "An item with this name already exists in the destination folder."
-        LuksException.WRITER_BUSY -> "Another write operation is currently in progress. Please wait for it to complete."
+        LuksException.WRITER_BUSY -> "Drive is busy with a transfer — try again when it finishes."
         LuksException.ITEM_TOO_LARGE -> "The item is too large for the filesystem tree structure limits."
         LuksException.MUTEX_POISONED -> "Drive state was compromised by a previous error. Please lock and unlock the volume to retry."
         LuksException.CANCELLED -> "The operation was cancelled."

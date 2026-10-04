@@ -89,6 +89,16 @@ class SafExportDestination(
         contentResolver.openOutputStream(documentUri(docId))
             ?: throw java.io.IOException("the destination refused to open '$docId' for writing")
 
+    /**
+     * Read-back verification only for local providers: re-reading a cloud-backed document would
+     * download everything again. Null (not verified) for the rest.
+     */
+    override fun openInput(docId: String): java.io.InputStream? {
+        if (verifyLevelForAuthority(treeUri.authority) != VerifyLevel.FULL) return null
+        return contentResolver.openInputStream(documentUri(docId))
+            ?: throw java.io.IOException("the destination refused to open '$docId' for reading")
+    }
+
     override fun delete(docId: String) {
         if (!DocumentsContract.deleteDocument(contentResolver, documentUri(docId))) {
             throw java.io.IOException("the destination refused to delete '$docId'")

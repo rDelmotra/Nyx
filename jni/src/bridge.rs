@@ -1194,8 +1194,24 @@ impl VolumeHandle {
         info.to_string()
     }
 
+    /// A listing plus how many entries had an unreadable inode (ext4 only;
+    /// always 0 on btrfs). The entries are still listed, with size and mtime 0,
+    /// so the UI can say "N entries couldn't be read" instead of showing them
+    /// as empty files without comment.
+    fn list_dir_counted(&self, path: &str) -> Result<(Vec<luks_core::fs::DirEntry>, usize)> {
+        use luks_core::fs::MountedFs;
+        let fs = self.fs_for_reading();
+        match &*fs {
+            MountedFs::Ext4(e) => {
+                let (entries, unreadable) = e.list_dir_checked(path)?;
+                Ok((entries, unreadable.len()))
+            }
+            MountedFs::Btrfs(b) => Ok((b.list_dir(path)?, 0)),
+        }
+    }
+
     pub fn list_dir_json(&self, path: &str) -> Result<String> {
-        let mut entries = self.fs_for_reading().list_dir(path)?;
+        let (mut entries, unreadable) = self.list_dir_counted(path)?;
         // "." and ".." are real dirents; the UI never wants them, and filtering
         // here keeps every future shell from re-deciding it.
         entries.retain(|e| e.name != "." && e.name != "..");
@@ -1232,11 +1248,11 @@ impl VolumeHandle {
             })
             .collect();
 
-        Ok(json!({ "path": path, "entries": items }).to_string())
+        Ok(json!({ "path": path, "entries": items, "unreadable": unreadable }).to_string())
     }
 
     pub fn list_directory_paged(&self, path: &str, offset: usize, limit: usize) -> Result<String> {
-        let mut entries = self.fs_for_reading().list_dir(path)?;
+        let (mut entries, unreadable) = self.list_dir_counted(path)?;
         entries.retain(|e| e.name != "." && e.name != "..");
         entries.sort_by(|a, b| {
             b.file_type
@@ -1282,6 +1298,8 @@ impl VolumeHandle {
             "next_offset": next_offset,
             "has_more": has_more,
             "total_count": total_count,
+            // Across the whole directory, not just this page.
+            "unreadable": unreadable,
         })
         .to_string())
     }

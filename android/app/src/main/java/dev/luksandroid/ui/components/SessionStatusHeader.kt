@@ -68,6 +68,7 @@ fun SessionStatusHeader(
     val context = LocalContext.current
     val sessionState by LuksSession.state.collectAsState()
     val activeLeases by LuksSession.activeLeasesFlow.collectAsState()
+    val writeHolds by LuksSession.writeHoldsFlow.collectAsState()
     val scope = rememberCoroutineScope()
 
     LaunchedEffect(sessionState) {
@@ -89,7 +90,7 @@ fun SessionStatusHeader(
                 val volInfo = state.volume.info
                 val label = volInfo.label.ifBlank { state.partition.label }
                 val fsType = volInfo.fsType.uppercase()
-                val isWriting = activeLeases > 0
+                val isWriting = isSessionWriting(activeLeases, writeHolds)
 
                 Surface(
                     modifier = Modifier.fillMaxWidth(),
@@ -325,3 +326,6 @@ fun SessionStatusHeader(
         }
     }
 }
+
+/** Busy when any lease is open or a SAF write holds the session. */
+internal fun isSessionWriting(activeLeases: Int, writeHolds: Int): Boolean = activeLeases > 0 || writeHolds > 0

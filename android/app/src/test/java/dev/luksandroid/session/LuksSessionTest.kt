@@ -331,7 +331,7 @@ class LuksSessionTest {
     @Test
     fun testWithLeaseRefusalDoesNotLeakVolumeContentsFromTheFailureMessage() = runBlocking {
         session.startUnlockedForTest()
-        session.onWritePoison("Internal native error at /private/passwords_database.kdbx")
+        session.onWritePoison(dev.luksandroid.LuksException.PANIC)
 
         val message = try {
             session.withLease { }
@@ -364,13 +364,15 @@ class LuksSessionTest {
         )
 
         // Simulate write poison
-        session.onWritePoison("btrfs allocator panic: poisoned mutex")
+        session.onWritePoison(dev.luksandroid.LuksException.MUTEX_POISONED)
 
         val state = session.state.value
         assertTrue("State must be Failed", state is SessionState.Failed)
         assertTrue(
-            "Message should describe write poison",
-            (state as SessionState.Failed).message.contains("Write poison: btrfs allocator panic: poisoned mutex")
+            "Message should name the remedy and carry only the code",
+            (state as SessionState.Failed).message.let {
+                it.contains("Unlock the volume again") && it.contains("code ${dev.luksandroid.LuksException.MUTEX_POISONED}")
+            }
         )
 
         // Teardown should have executed

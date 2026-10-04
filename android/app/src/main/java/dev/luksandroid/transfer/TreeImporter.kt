@@ -260,6 +260,8 @@ object TreeImporter {
         targetName: String,
         onChunk: (Long) -> Unit,
     ): Long {
+        // One owner for the writer: every exit below that does not publish the file ends in
+        // abandonFile (which is close(), idempotent natively), including a failed finish (W5).
         val writer = if (entry.sizeBytes >= 0L) {
             volume.beginFile(entry.sizeBytes)
         } else {
@@ -279,6 +281,11 @@ object TreeImporter {
                         val read = stats.read { input.read(buffer) }
                         if (read < 0) break
                         if (read == 0) continue
+                        // V2: the declared size is a contract. A source that runs past it
+                        // is stopped before the excess is written, not truncated or extended.
+                        if (entry.sizeBytes >= 0L && total + read > entry.sizeBytes) {
+                            throw TransferFailure("A source file is larger than it reported, so the copy was stopped.")
+                        }
                         stats.write { volume.writeChunk(writer, buffer, 0, read) }
                         total += read
                         onChunk(total)
@@ -287,11 +294,18 @@ object TreeImporter {
                     java.util.Arrays.fill(buffer, 0.toByte())
                 }
             }
+            if (entry.sizeBytes >= 0L && total != entry.sizeBytes) {
+                throw TransferFailure("A source file is smaller than it reported, so the copy was stopped.")
+            }
+            stats.commit { volume.finishFile(writer, parentDir, targetName) }
         } catch (t: Throwable) {
-            volume.abandonFile(writer)
+            try {
+                volume.abandonFile(writer)
+            } catch (cleanup: Throwable) {
+                t.addSuppressed(cleanup)
+            }
             throw t
         }
-        stats.commit { volume.finishFile(writer, parentDir, targetName) }
         return total
     }
 }

@@ -30,6 +30,7 @@ class ExportHandleTest {
         private var live = 0
 
         override fun fileSize(path: String): Long = data.size.toLong()
+        override fun fileSizeOf(file: Long): Long = data.size.toLong()
 
         override fun openFile(path: String): Long {
             opened += path
@@ -57,6 +58,16 @@ class ExportHandleTest {
     private class Sink : ContentResolver(null) {
         val out = ByteArrayOutputStream()
         override fun openOutputStream(uri: Uri): OutputStream = out
+        override fun openInputStream(uri: Uri): java.io.InputStream = java.io.ByteArrayInputStream(out.toByteArray())
+    }
+
+    /** Writes into [sink]; local-provider semantics (full read-back). */
+    private fun targetOf(sink: Sink) = object : dev.luksandroid.transfer.ExportTarget {
+        override fun availableBytes(): Long? = null
+        override fun openOutput(): OutputStream = sink.out
+        override fun openRead(): java.io.InputStream = java.io.ByteArrayInputStream(sink.out.toByteArray())
+        override fun commit() {}
+        override fun discard() {}
     }
 
     private fun ctx(sink: Sink): Context = object : ContextWrapper(null) {
@@ -69,7 +80,7 @@ class ExportHandleTest {
         val vol = ExportVolume(data)
         val sink = Sink()
 
-        val id = TransferManager.exportFileWithProgress(ctx(sink), vol, "/big.bin", Uri.parse("content://t/out"))
+        val id = TransferManager.exportFileWithProgress(ctx(sink), vol, "/big.bin", Uri.parse("content://t/out"), target = targetOf(sink))
 
         assertEquals(TransferState.COMPLETED, TransferManager.getTransfer(id)?.state)
         assertArrayEquals(data, sink.out.toByteArray())
@@ -86,7 +97,7 @@ class ExportHandleTest {
         val vol = ExportVolume(data).also { it.changeAtRead = 2 }
         val sink = Sink()
 
-        val id = TransferManager.exportFileWithProgress(ctx(sink), vol, "/big.bin", Uri.parse("content://t/out2"))
+        val id = TransferManager.exportFileWithProgress(ctx(sink), vol, "/big.bin", Uri.parse("content://t/out2"), target = targetOf(sink))
 
         assertEquals(TransferState.FAILED, TransferManager.getTransfer(id)?.state)
         assertEquals("only the chunk read before the change reached the output", TransferController.CHUNK_SIZE, sink.out.size())

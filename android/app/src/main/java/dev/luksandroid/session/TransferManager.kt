@@ -213,6 +213,21 @@ open class TransferController {
         _busy.value = _queueSize.value > 0 || safToken != null
     }
 
+    /**
+     * True when no job is queued or running, no SAF write holds the lock and no exclusive mutator
+     * does. What the health monitor waits for. Reads volatile fields only, never [queueLock]:
+     * the monitor calls it under its own lock while this class calls the monitor, so taking
+     * [queueLock] here could deadlock.
+     */
+    internal fun writesIdle(): Boolean = _queueSize.value == 0 && safToken == null && lockOwner == null
+
+    /** Refuses with [LuksException.HEALTH_READ_ONLY] while the health check says writes must stop. */
+    private fun requireHealthWritable() {
+        if (LuksSession.healthReadOnly.value) {
+            throw LuksException(UiErrorMessage.HEALTH_READ_ONLY_MESSAGE, LuksException.HEALTH_READ_ONLY)
+        }
+    }
+
     private val fatalChannel = Channel<LuksException>(Channel.UNLIMITED)
 
     /**
@@ -267,6 +282,8 @@ open class TransferController {
         lockOwner = token
         safToken = token
         refreshBusy()
+        // After the busy flag, before the caller's first native call (see HealthMonitor).
+        LuksSession.healthMonitor.yieldToWriter()
         return true
     }
 
@@ -296,6 +313,7 @@ open class TransferController {
         if (lockOwner === token) lockOwner = null
         if (transferMutex.holdsLock(token)) transferMutex.unlock(token)
         refreshBusy()
+        LuksSession.healthMonitor.noteIdle()
     }
 
     /**
@@ -329,12 +347,14 @@ open class TransferController {
      * rethrown after the lock is released.
      */
     suspend fun <T> withExclusiveWrite(block: suspend (LuksVolume) -> T): T {
+        requireHealthWritable()
         val token = LockToken("mutator")
         // Bounded, like a SAF write: behind a long import the UI gets an answer, not a hang.
         if (!acquireBounded(token, exclusiveWaitMs)) {
             throw LuksException("the drive is busy with a transfer", LuksException.WRITER_BUSY)
         }
         lockOwner = token
+        LuksSession.healthMonitor.yieldToWriter()
         var thrown: Throwable? = null
         var result: T? = null
         try {
@@ -357,6 +377,7 @@ open class TransferController {
         } finally {
             if (lockOwner === token) lockOwner = null
             transferMutex.unlock(token)
+            LuksSession.healthMonitor.noteIdle()
         }
         thrown?.let { throw it }
         @Suppress("UNCHECKED_CAST")
@@ -419,6 +440,9 @@ open class TransferController {
                 managerScope.launch { for (q in queue) process(q) }
             }
         }
+        // After refreshBusy above (the monitor re-reads idleness after registering its token).
+        // Reads yield too: a scan holds the filesystem lock, so an export would wait on it.
+        LuksSession.healthMonitor.yieldToWriter(writes)
         queue.trySend(Queued(id, job, writes))
     }
 
@@ -456,6 +480,7 @@ open class TransferController {
                 _queueSize.value = outstanding
                 refreshBusy()
             }
+            LuksSession.healthMonitor.noteIdle()
         }
     }
 
@@ -660,6 +685,11 @@ open class TransferController {
                 try {
                     if (writes && isWriteDead(volume)) {
                         finishTransfer(id, TransferState.FAILED, error = WRITE_DEAD_MESSAGE, errorCode = LuksException.WRITE_SESSION_FENCED)
+                        return@withLease
+                    }
+                    // Not write-dead: the session stays open and reads keep working (A8).
+                    if (writes && LuksSession.healthReadOnly.value) {
+                        finishTransfer(id, TransferState.FAILED, error = UiErrorMessage.HEALTH_READ_ONLY_MESSAGE, errorCode = LuksException.HEALTH_READ_ONLY)
                         return@withLease
                     }
                     body(volume, id)

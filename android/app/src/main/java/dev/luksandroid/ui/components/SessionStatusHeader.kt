@@ -27,6 +27,20 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.rememberModalBottomSheetState
+import androidx.compose.foundation.clickable
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.graphics.Color
+import dev.luksandroid.Health
+import dev.luksandroid.ui.theme.WarningAmber
+import dev.luksandroid.ui.theme.StateLocked as HealthBlue
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -70,6 +84,8 @@ fun SessionStatusHeader(
     val activeLeases by LuksSession.activeLeasesFlow.collectAsState()
     val writeHolds by LuksSession.writeHoldsFlow.collectAsState()
     val scope = rememberCoroutineScope()
+    val health by LuksSession.health.collectAsState()
+    var showHealthSheet by remember { mutableStateOf(false) }
 
     LaunchedEffect(sessionState) {
         when (sessionState) {
@@ -194,6 +210,8 @@ fun SessionStatusHeader(
                                     )
                                 }
                             }
+                            Spacer(modifier = Modifier.width(6.dp))
+                            HealthDot(health = health, onClick = { showHealthSheet = true })
                         }
 
                         Spacer(modifier = Modifier.width(8.dp))
@@ -232,6 +250,7 @@ fun SessionStatusHeader(
                     androidx.compose.material3.HorizontalDivider(color = DarkOutline)
                 }
             }
+            if (showHealthSheet) HealthSheetContent(health = health, onDismiss = { showHealthSheet = false })
         }
 
             is SessionState.Detached -> {
@@ -329,3 +348,62 @@ fun SessionStatusHeader(
 
 /** Busy when any lease is open or a SAF write holds the session. */
 internal fun isSessionWriting(activeLeases: Int, writeHolds: Int): Boolean = activeLeases > 0 || writeHolds > 0
+
+/** Theme colour for a health tone: blue = OK, amber = minor, red = errors, grey = checking or unknown. */
+@Composable
+private fun healthColor(tone: HealthTone): Color = when (tone) {
+    HealthTone.OK -> HealthBlue
+    HealthTone.MINOR -> WarningAmber
+    HealthTone.ERROR -> DestructiveRed
+    HealthTone.NEUTRAL -> TextMuted
+}
+
+/** The coloured dot and short label; tapping opens the findings sheet. */
+@Composable
+private fun HealthDot(health: Health, onClick: () -> Unit) {
+    val badge = HealthPresentation.badge(health)
+    val color = healthColor(badge.tone)
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .clip(RoundedCornerShape(4.dp))
+            .clickable(onClick = onClick)
+            .semantics {
+                contentDescription = badge.description
+                role = Role.Button
+            }
+            .padding(horizontal = 4.dp, vertical = 2.dp),
+    ) {
+        Box(modifier = Modifier.size(8.dp).clip(CircleShape).background(color))
+        Spacer(modifier = Modifier.width(4.dp))
+        Text(
+            text = badge.label,
+            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Medium),
+            color = color,
+            maxLines = 1,
+        )
+    }
+}
+
+@Composable
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
+private fun HealthSheetContent(health: Health, onDismiss: () -> Unit) {
+    val sheet = HealthPresentation.sheet(health)
+    val color = healthColor(HealthPresentation.badge(health).tone)
+    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState()) {
+        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(modifier = Modifier.size(10.dp).clip(CircleShape).background(color))
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(sheet.title, style = MaterialTheme.typography.titleMedium, color = TextPrimary)
+            }
+            Spacer(modifier = Modifier.height(12.dp))
+            sheet.lines.forEach { line ->
+                Text(line, style = MaterialTheme.typography.bodyMedium, color = TextPrimary, modifier = Modifier.padding(vertical = 2.dp))
+            }
+            if (sheet.lines.isNotEmpty()) Spacer(modifier = Modifier.height(12.dp))
+            Text(sheet.action, style = MaterialTheme.typography.bodyMedium, color = TextMuted)
+            Spacer(modifier = Modifier.height(24.dp))
+        }
+    }
+}

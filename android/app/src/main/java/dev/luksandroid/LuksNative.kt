@@ -155,6 +155,15 @@ internal object LuksNative {
     external fun nativeReadFileStream(handle: Long, path: String, chunkBytes: Int, cancelToken: Long): Long
 
     /**
+     * Read-only consistency check of the mounted filesystem (F8). JSON
+     * `{verdict, unknown, writeSafe, findings:{kind:count}, elapsedMs}`; kinds and counts only,
+     * never a path or a block number. Holds the volume's filesystem lock for the whole scan and
+     * polls [cancelToken] (<= 0 means none), stopping with `unknown: "cancelled"`. A damaged drive
+     * is the answer, not an exception. Matches `nativeHealthCheck` in `jni/src/lib.rs`.
+     */
+    external fun nativeHealthCheck(handle: Long, cancelToken: Long): String
+
+    /**
      * Times a raw block read — no decryption, no filesystem. JSON result also
      * reports the transfer size the kernel actually allowed, which is the only
      * way to tell a self-tuned ceiling from a silent fallback.

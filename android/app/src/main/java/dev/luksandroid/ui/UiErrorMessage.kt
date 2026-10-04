@@ -48,8 +48,13 @@ object UiErrorMessage {
         LuksException.FILE_CHANGED ->
             "The file was changed or replaced while it was being read, so the copy was stopped. " +
                 "Refresh the folder and try again."
+        LuksException.HEALTH_READ_ONLY -> HEALTH_READ_ONLY_MESSAGE
         else -> "An unexpected error occurred (code $code)."
     }
+
+    /** Shown wherever a write is refused because the health check found errors. */
+    const val HEALTH_READ_ONLY_MESSAGE =
+        "This drive has errors. Repair it on Linux (e2fsck -f / btrfs check) before writing."
 
     /**
      * Formats user-facing message with operation context and logs the error safely.

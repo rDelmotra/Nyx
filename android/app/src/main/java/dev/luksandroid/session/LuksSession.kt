@@ -3,6 +3,7 @@ package dev.luksandroid.session
 import android.content.Context
 import android.hardware.usb.UsbDevice
 import dev.luksandroid.Entry
+import dev.luksandroid.Health
 import dev.luksandroid.LuksDevice
 import dev.luksandroid.LuksException
 import dev.luksandroid.LuksVolume
@@ -10,6 +11,7 @@ import dev.luksandroid.PartitionInfo
 import dev.luksandroid.SessionClosedException
 import dev.luksandroid.Trace
 import dev.luksandroid.UnlockService
+import dev.luksandroid.withNativeCancel
 import dev.luksandroid.security.SecurePassphraseBuffer
 import dev.luksandroid.ui.UiErrorMessage
 import kotlinx.coroutines.CancellationException
@@ -66,6 +68,34 @@ open class SessionController(
     val activeLeasesFlow: StateFlow<Int> = _activeLeases.asStateFlow()
 
     private val isLocking = AtomicBoolean(false)
+
+    /** Test seam: whether the transfer engine has no queued job, SAF write or exclusive mutator. */
+    internal var transferWritesIdle: () -> Boolean = { TransferManager.writesIdle() }
+
+    /**
+     * Drive-health light and write gate (F8). Runs only when nothing is writing, never takes a
+     * lease and never touches the idle timer; see [HealthMonitor].
+     */
+    internal val healthMonitor = HealthMonitor(
+        scope = scope,
+        dispatcher = Dispatchers.IO,
+        tokens = NativeCancelTokens,
+        // Leases count too: a read must never find a scan already holding the native fs lock.
+        writesIdle = { _writeHolds.value == 0 && _activeLeases.value == 0 && transferWritesIdle() },
+    )
+
+    val health: StateFlow<Health> get() = healthMonitor.state
+
+    /** True while the health check says writes must be refused. Reads keep working; the session stays open. */
+    val healthReadOnly: StateFlow<Boolean> get() = healthMonitor.readOnly
+
+    /** Binds the health monitor to a volume this controller just adopted. */
+    private fun attachHealth(vol: LuksVolume) {
+        healthMonitor.attach(
+            check = { token -> withNativeCancel(token) { vol.healthCheck() } },
+            setReadOnly = { vol.healthReadOnly = it },
+        )
+    }
 
     /**
      * Where user-visible notices go (notification shade). The Application installs the
@@ -304,6 +334,10 @@ open class SessionController(
             val v = volume ?: s.volume
             _activeLeases.update { it + 1 }
             recordActivity()
+            // The choke point for every read and write on the volume (browser, viewer, export,
+            // SAF, thumbnails): cancel a running health scan before the caller's native call
+            // waits on the fs lock. After the lease count above, which the monitor's idle check reads.
+            healthMonitor.yieldToWriter(writes = false)
             v
         }
 
@@ -320,6 +354,7 @@ open class SessionController(
         } finally {
             _activeLeases.update { it - 1 }
             recordActivity()
+            healthMonitor.noteIdle()
         }
     }
 
@@ -366,6 +401,7 @@ open class SessionController(
             val unlocked = SessionState.Unlocked(vol, partition, entries)
             _state.value = unlocked
             restartIdleTimer()
+            attachHealth(vol)
             unlocked
         } catch (e: CancellationException) {
             this.activeUsbDevice = null
@@ -451,6 +487,7 @@ open class SessionController(
             val unlocked = SessionState.Unlocked(vol, partition, entries)
             _state.value = unlocked
             restartIdleTimer()
+            attachHealth(vol)
             unlocked
         } catch (e: CancellationException) {
             this.activeUsbDevice = null
@@ -511,6 +548,9 @@ open class SessionController(
         }
         if (!shouldProceed) return
 
+        // Before the lease wait, not after: a scan holds the native filesystem lock, and a lease
+        // blocked on it would never drain.
+        healthMonitor.detach()
         try {
             Trace.i("LuksSession: locking session, waiting for leases to drain")
             if (_activeLeases.value > 0) {
@@ -688,6 +728,9 @@ open class SessionController(
      */
     private fun takeHandles(): Handles {
         cancelIdleTimer()
+        // Stops the health scan before anything else: every teardown path (lock, idle-lock,
+        // detach, fatal close, re-unlock) comes through here.
+        healthMonitor.detach()
         val h = Handles(
             volume = volume,
             volumeCloseable = volumeCloseable ?: volume,
@@ -729,6 +772,9 @@ open class SessionController(
         // Blocks up to the engine's bounded wait (~2 s). Safe here: this whole function runs on
         // Dispatchers.IO, never on the caller's (possibly main) thread.
         transferReset()
+        // A health scan cancelled by takeHandles holds the native filesystem lock until its next
+        // poll; wait (bounded) for it so the volume and device are not closed under it.
+        healthMonitor.awaitStopped()
 
         var commitFailure: Throwable? = null
         val vol = h.volume

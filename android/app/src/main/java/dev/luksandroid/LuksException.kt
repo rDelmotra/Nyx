@@ -32,6 +32,7 @@ class LuksException(message: String, val code: Int) : Exception(message) {
     val isWriteSessionFenced: Boolean get() = code == WRITE_SESSION_FENCED
     val isReadOnlyVolume: Boolean get() = code == READ_ONLY_VOLUME
     val isFileChanged: Boolean get() = code == FILE_CHANGED
+    val isHealthReadOnly: Boolean get() = code == HEALTH_READ_ONLY
 
     /**
      * Whether this failure means no further write on this volume can be
@@ -131,6 +132,16 @@ class LuksException(message: String, val code: Int) : Exception(message) {
          * transfer again; retrying the same read cannot succeed.
          */
         const val FILE_CHANGED = 23
+
+        /**
+         * The drive health check found errors (corruption, or leftovers a write could trip
+         * over), so this write was refused before it reached the drive. Reads still work.
+         *
+         * Raised in Kotlin only (`HealthMonitor` latch), never by the native layer; 24 is
+         * reserved in `bridge::code` so the number is never reused. Not a write-session failure:
+         * the session stays open and nothing is torn down.
+         */
+        const val HEALTH_READ_ONLY = 24
     }
 }
 

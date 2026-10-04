@@ -448,6 +448,30 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
     }
 
     /**
+     * Read-only drive-health check (F8). Holds the volume's filesystem lock for the whole scan
+     * and polls the thread's native cancel token ([withNativeCancel]); a cancelled scan is
+     * `Unknown(CANCELLED)`, not an exception. Blocking: never on the main thread.
+     */
+    open fun healthCheck(): Health {
+        checkOpen(handle, "volume")
+        return parseHealth(LuksNative.nativeHealthCheck(handle, currentNativeCancelToken()))
+    }
+
+    /**
+     * Set by the session's health monitor when the check found errors a write must not be
+     * built on. Every mutator below refuses with [LuksException.HEALTH_READ_ONLY] while set;
+     * reads, commits and closing are unaffected, and nothing is torn down.
+     */
+    @Volatile
+    var healthReadOnly: Boolean = false
+
+    private fun refuseIfHealthReadOnly() {
+        if (healthReadOnly) {
+            throw LuksException("writes refused: drive health check found errors", LuksException.HEALTH_READ_ONLY)
+        }
+    }
+
+    /**
      * Streams [path] through the native read pipeline into a sink, returning the byte count.
      * Cancellable through [withNativeCancel]. A throughput probe: the bytes never reach the JVM.
      */
@@ -517,6 +541,7 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
     }
 
     open fun writeFile(parentPath: String, name: String, data: ByteArray): Long {
+        refuseIfHealthReadOnly()
         checkOpen(handle, "volume")
         val ino = LuksNative.nativeWriteFile(handle, parentPath, name, data)
         invalidateStatFsCache()
@@ -524,6 +549,7 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
     }
 
     open fun deleteFile(path: String) {
+        refuseIfHealthReadOnly()
         checkOpen(handle, "volume")
         LuksNative.nativeDeleteFile(handle, path)
         invalidateStatFsCache()
@@ -537,6 +563,7 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
     }
 
     open fun createDirectory(parentPath: String, name: String): Long {
+        refuseIfHealthReadOnly()
         checkOpen(handle, "volume")
         val ino = LuksNative.nativeCreateDirectory(handle, parentPath, name)
         invalidateStatFsCache()
@@ -544,6 +571,7 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
     }
 
     open fun rename(oldParent: String, oldName: String, newParent: String, newName: String) {
+        refuseIfHealthReadOnly()
         checkOpen(handle, "volume")
         LuksNative.nativeRename(handle, oldParent, oldName, newParent, newName)
         invalidateStatFsCache()
@@ -605,6 +633,7 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
 
     /** Starts a fixed-memory transfer. Close without [FileWriter.finish] rolls it back. */
     open fun beginFile(sizeBytes: Long): FileWriter {
+        refuseIfHealthReadOnly()
         checkOpen(handle, "volume")
         check(sizeBytes >= 0) { "negative file size" }
         val writer = FileWriter(LuksNative.nativeBeginFile(handle, sizeBytes))
@@ -619,6 +648,7 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
      * fixed-memory, and closing without [FileWriter.finish] rolls it back.
      */
     open fun beginFileStreaming(): FileWriter {
+        refuseIfHealthReadOnly()
         checkOpen(handle, "volume")
         val writer = FileWriter(LuksNative.nativeBeginFileStreaming(handle))
         activeWriters += writer

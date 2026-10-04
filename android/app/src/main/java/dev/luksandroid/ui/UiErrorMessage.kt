@@ -1,6 +1,7 @@
 package dev.luksandroid.ui
 
 import dev.luksandroid.LuksException
+import dev.luksandroid.SessionClosedException
 import dev.luksandroid.Trace
 import kotlinx.coroutines.CancellationException
 import java.io.FileNotFoundException
@@ -88,19 +89,11 @@ object UiErrorMessage {
                 Trace.err(LuksException.GENERIC, op)
                 if (operation.isNotBlank()) "$operation failed: Permission denied." else "Permission denied."
             }
-            is IllegalStateException -> {
-                val code = if (t.message?.contains("locking", ignoreCase = true) == true ||
-                    t.message?.contains("closed", ignoreCase = true) == true ||
-                    t.message?.contains("not unlocked", ignoreCase = true) == true
-                ) {
-                    LuksException.BAD_HANDLE
-                } else {
-                    LuksException.GENERIC
-                }
-                getUserMessage(code, op)
-            }
+            // By type, never by message text: a message can be anything, including a path.
+            is SessionClosedException -> getUserMessage(LuksException.BAD_HANDLE, op)
             else -> {
                 Trace.err(LuksException.GENERIC, op)
+                Trace.e("$op: unmapped ${Trace.throwableSummary(t)}")
                 if (operation.isNotBlank()) {
                     "$operation failed: An unexpected error occurred."
                 } else {

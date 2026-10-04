@@ -176,7 +176,7 @@ class DirectoryTransferUiTest {
     // ---- what a stopped transfer says --------------------------------------
 
     @Test
-    fun `a stopped transfer names how far it got and where it stopped`() {
+    fun `a stopped transfer names how far it got but never where, by name`() {
         val outcome = TransferOutcome(
             filesCopied = 37,
             filesSkipped = 0,
@@ -191,7 +191,9 @@ class DirectoryTransferUiTest {
         // This is the sentence whose absence made a partial copy on 2026-08-23
         // indistinguishable from a finished one.
         assertTrue(summary, summary.contains("37 of 40 files"))
-        assertTrue(summary, summary.contains("Photos/IMG_0041.jpg"))
+        // F6: the item error is a mapped string; the stopping path stays in the outcome, not the text.
+        assertFalse(summary, summary.contains("IMG_0041"))
+        assertFalse(summary, summary.contains("Photos"))
         assertTrue(summary, summary.contains("has been kept"))
         // O2: the failure's own text can carry names, so the summary shows the code's message instead.
         assertFalse(summary, summary.contains("the session was locked"))

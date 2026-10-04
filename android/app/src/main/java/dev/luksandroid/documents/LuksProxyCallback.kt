@@ -246,7 +246,7 @@ open class LuksProxyCallback(
         } catch (t: Throwable) {
             t
         } finally {
-            runCatching { TransferManager.releaseSafWriteLock() }
+            Trace.cleanup("saf_release_write_lock") { TransferManager.releaseSafWriteLock() }
         }
         if (failure != null) {
             Trace.e("LuksProxyCallback: fsync commit failed: ${throwableSummary(failure)}")
@@ -365,7 +365,7 @@ open class LuksProxyCallback(
                 // The pending entry vanished underneath us (session lock/detach cleared the
                 // registry -- see PendingDocuments.clear) -- there is nothing left to finish
                 // against, so the only safe thing left to do is discard what was written.
-                runCatching { runBlocking { session.withLease { it.abandonFile(activeWriter) } } }
+                Trace.cleanup("abandon_writer") { runBlocking { session.withLease { it.abandonFile(activeWriter) } } }
                 reportFinishFailure()
             }
         } catch (e: LuksException) {
@@ -374,11 +374,11 @@ open class LuksProxyCallback(
             } else {
                 Trace.e("LuksProxyCallback: finish failed, abandoning: ${throwableSummary(e)}")
             }
-            runCatching { runBlocking { session.withLease { it.abandonFile(activeWriter) } } }
+            Trace.cleanup("abandon_writer") { runBlocking { session.withLease { it.abandonFile(activeWriter) } } }
             reportFinishFailure()
         } catch (t: Throwable) {
             Trace.e("LuksProxyCallback: finish failed, abandoning: ${throwableSummary(t)}")
-            runCatching { runBlocking { session.withLease { it.abandonFile(activeWriter) } } }
+            Trace.cleanup("abandon_writer") { runBlocking { session.withLease { it.abandonFile(activeWriter) } } }
             reportFinishFailure()
         } finally {
             PendingDocuments.remove(documentId)
@@ -417,7 +417,7 @@ open class LuksProxyCallback(
         val activeWriter = writer
         writer = null
         if (activeWriter != null) {
-            runCatching { runBlocking { session.withLease { it.abandonFile(activeWriter) } } }
+            Trace.cleanup("abandon_writer") { runBlocking { session.withLease { it.abandonFile(activeWriter) } } }
         }
         PendingDocuments.remove(documentId)
         releaseWriteLockIfHeld()
@@ -428,7 +428,7 @@ open class LuksProxyCallback(
         writeHold = null
         if (writeLockHeld) {
             writeLockHeld = false
-            runCatching { TransferManager.releaseSafWriteLock() }
+            Trace.cleanup("saf_release_write_lock") { TransferManager.releaseSafWriteLock() }
         }
     }
 

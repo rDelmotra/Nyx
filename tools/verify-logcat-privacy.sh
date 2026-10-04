@@ -5,7 +5,8 @@
 #   tools/verify-logcat-privacy.sh [session_log_file | --live <forbidden_tokens...>]
 #
 # Checks that filenames, paths, and directory names NEVER enter Android logcat
-# in either `luks` or `luks_err` log tags during on-device operations.
+# in the `luks`, `luks_err`, `luks_native` (Rust), `LUKS_FORENSIC_DUMP` and
+# `RustStdoutStderr` (panic output) tags during on-device operations.
 #
 # Usage:
 #   1. Capture live session while performing create / rename / delete:
@@ -51,11 +52,11 @@ if [ "$MODE" = "live" ]; then
     adb logcat -G 16M >/dev/null
     adb logcat -c
 
-    echo "==> capturing logcat stream (luks:V luks_err:V luks_native:V) to $LOG_FILE..."
+    echo "==> capturing logcat stream (luks:V luks_err:V luks_native:V LUKS_FORENSIC_DUMP:V RustStdoutStderr:V) to $LOG_FILE..."
     echo "==> perform your test operations on device now (create, rename, delete)."
     echo "==> press Ctrl+C or Enter when done to analyze logs."
 
-    adb logcat -s luks:V luks_err:V luks_native:V > "$LOG_FILE" 2>&1 &
+    adb logcat -s luks:V luks_err:V luks_native:V LUKS_FORENSIC_DUMP:V RustStdoutStderr:V > "$LOG_FILE" 2>&1 &
     LOGCAT_PID=$!
 
     trap 'kill $LOGCAT_PID 2>/dev/null || true' EXIT

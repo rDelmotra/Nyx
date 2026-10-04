@@ -92,10 +92,36 @@ impl From<bridge::WriterError> for Fail {
     }
 }
 
+/// The text of `e` that may cross into Java, logcat or the UI.
+///
+/// Core's `Display` stays as it is (tests and tools read it), but several
+/// variants interpolate a path or a name that lives on the encrypted volume or
+/// on the host. Those keep their kind and lose the payload; the error code
+/// travels separately. Every other variant carries only numbers or static
+/// text, so it passes through unchanged.
+fn redacted(e: &LuksError) -> String {
+    use LuksError::*;
+    match e {
+        NotFound(_) => "not found".into(),
+        NotADirectory(_) => "not a directory".into(),
+        IsADirectory(_) => "is a directory".into(),
+        DirectoryNotEmpty(_) => "directory is not empty".into(),
+        SymlinkLoop(_) => "too many levels of symbolic links".into(),
+        WrongWriteTarget { expected, detail, .. } => format!(
+            "refusing to write: the target is not the {expected}-byte device it was confirmed as ({detail})"
+        ),
+        UnverifiableWriteTarget { .. } => {
+            "refusing to write: could not determine the target's size to confirm it".into()
+        }
+        Io { source, .. } => format!("I/O error: {source}"),
+        other => other.to_string(),
+    }
+}
+
 impl Fail {
     fn parts(&self) -> (i32, String) {
         match self {
-            Fail::Luks(e) => (bridge::error_code(e), e.to_string()),
+            Fail::Luks(e) => (bridge::error_code(e), redacted(e)),
             Fail::Msg(c, m) => (*c, m.clone()),
         }
     }
@@ -111,41 +137,61 @@ type R<T> = std::result::Result<T, Fail>;
 /// payload, throw, and return a default value the caller discards because an
 /// exception is pending.
 fn guard<'l, T>(env: &mut JNIEnv<'l>, default: T, f: impl FnOnce(&mut JNIEnv<'l>) -> R<T>) -> T {
+    install_panic_hook();
     let outcome = catch_unwind(AssertUnwindSafe(|| f(env)));
     match outcome {
         Ok(Ok(value)) => value,
         Ok(Err(fail)) => {
             let (code, msg) = fail.parts();
-            #[cfg(debug_assertions)]
-            log::e(&format!("guard failed [{}]: {}", code, msg));
-            #[cfg(not(debug_assertions))]
-            log::e(&format!("guard failed [{}]", code));
+            // `msg` is redacted (see `redacted`): variant kind, no payload.
+            log::e(&format!("guard failed [{code}] {msg}"));
             throw(env, code, &msg);
             default
         }
-        Err(payload) => {
-            let msg = panic_message(&payload);
-            let err_msg = format!("internal error (this is a bug): {msg}");
-            log::e(&format!("guard panicked: {}", err_msg));
-            luks_core::forensic::record_panic(file!(), line!(), 0, &msg);
-            throw(
-                env,
-                bridge::code::PANIC,
-                &err_msg,
-            );
+        Err(_payload) => {
+            let err_msg = report_panic();
+            throw(env, bridge::code::PANIC, &err_msg);
             default
         }
     }
 }
 
-fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
-    if let Some(s) = payload.downcast_ref::<&str>() {
-        (*s).to_string()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "panic with a non-string payload".to_string()
-    }
+thread_local! {
+    /// Where the most recent panic on this thread happened. The panic payload
+    /// is formatted from whatever values the panicking code held, which can be
+    /// a path or a name, so it is never read: only the source location is.
+    static PANIC_SITE: std::cell::RefCell<Option<(String, u32, u32)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn install_panic_hook() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if let Some(loc) = info.location() {
+                let site = (loc.file().to_string(), loc.line(), loc.column());
+                PANIC_SITE.with(|s| *s.borrow_mut() = Some(site));
+            }
+            // The default hook prints the payload to stderr (logcat). Under
+            // the host test harness keep it, so failures stay readable.
+            if cfg!(test) {
+                previous(info);
+            }
+        }));
+    });
+}
+
+/// Log and forensically record the panic just caught on this thread, and
+/// return the text to throw. Never touches the payload.
+fn report_panic() -> String {
+    let (file, line, col) = PANIC_SITE
+        .with(|s| s.borrow_mut().take())
+        .unwrap_or_else(|| (file!().to_string(), line!(), 0));
+    let file = file.as_str();
+    log::e(&format!("guard panicked at {file}:{line}"));
+    luks_core::forensic::record_panic(file, line, col, "panic (payload withheld)");
+    format!("internal error (this is a bug): panic at {file}:{line}")
 }
 
 /// Throw `LuksException(message, code)`.
@@ -1096,4 +1142,75 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeStatFs<'l>(
         let json = vol.statfs_json()?;
         out_string(env, &json)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SECRET: &str = "Volumes/secret-folder/tax-return.pdf";
+
+    fn assert_clean(what: &str, text: &str) {
+        assert!(!text.contains("secret-folder"), "{what} leaked a path: {text}");
+        assert!(!text.contains("tax-return"), "{what} leaked a name: {text}");
+    }
+
+    /// Every variant that interpolates a path or name, through the one
+    /// function that builds the Java exception message. The control at the
+    /// end proves the assertion can fail: core's own Display does leak.
+    #[test]
+    fn exception_message_never_carries_a_path() {
+        let io = || std::io::Error::from(std::io::ErrorKind::NotFound);
+        let errors = [
+            LuksError::NotFound(SECRET.into()),
+            LuksError::NotADirectory(SECRET.into()),
+            LuksError::IsADirectory(SECRET.into()),
+            LuksError::DirectoryNotEmpty(SECRET.into()),
+            LuksError::SymlinkLoop(SECRET.into()),
+            LuksError::AlreadyExists(SECRET.into()),
+            LuksError::WrongWriteTarget { path: SECRET.into(), expected: 7, detail: "d" },
+            LuksError::UnverifiableWriteTarget { path: SECRET.into() },
+            LuksError::Io { path: SECRET.into(), source: io() },
+        ];
+        let mut leaked_by_display = 0;
+        for e in errors {
+            let (code, msg) = Fail::Luks(e).parts();
+            assert_clean("Fail::parts", &msg);
+            assert!(!msg.is_empty() && code != 0);
+        }
+        for e in [LuksError::NotFound(SECRET.into()), LuksError::SymlinkLoop(SECRET.into())] {
+            if e.to_string().contains("secret-folder") {
+                leaked_by_display += 1;
+            }
+        }
+        assert_eq!(leaked_by_display, 2, "control: raw Display must leak, or this test is vacuous");
+    }
+
+    /// A panic whose payload is a formatted path reaches neither the thrown
+    /// text nor the forensic ring.
+    #[test]
+    fn panic_report_never_carries_the_payload() {
+        install_panic_hook();
+        let outcome = catch_unwind(|| {
+            let name = SECRET;
+            if !name.is_empty() {
+                panic!("cannot open {name}");
+            }
+        });
+        assert!(outcome.is_err());
+        let text = report_panic();
+        assert_clean("panic text", &text);
+        assert!(text.contains("lib.rs"), "location kept: {text}");
+        let panics: Vec<_> = luks_core::forensic::snapshot()
+            .into_iter()
+            .filter_map(|r| match r.event {
+                luks_core::forensic::ForensicEvent::Panic(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        assert!(!panics.is_empty(), "panic was not recorded");
+        for p in panics {
+            assert_clean("forensic panic", &format!("{} {}", p.file, p.message));
+        }
+    }
 }

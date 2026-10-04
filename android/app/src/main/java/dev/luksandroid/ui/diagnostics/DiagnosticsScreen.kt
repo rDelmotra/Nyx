@@ -59,7 +59,7 @@ fun DiagnosticsScreen(
         try {
             LuksNative.nativeVersion()
         } catch (t: Throwable) {
-            "Error loading native library: ${t.message}"
+            "Error loading native library: ${dev.luksandroid.Trace.throwableSummary(t)}"
         }
     }
 
@@ -170,7 +170,7 @@ fun DiagnosticsScreen(
                                 }
                                 "$cpu\n\n--- Reflection Probes ---\n$probe"
                             } catch (e: Exception) {
-                                "Self-test failed: ${e.message}"
+                                "Self-test failed: ${dev.luksandroid.Trace.throwableSummary(e)}"
                             } finally {
                                 isRunningSelfTest = false
                             }
@@ -368,7 +368,7 @@ private fun probeReflectionSurface(context: Context): String {
             results.add("PROBE: CONTROL_GOOD = FAIL (unexpected value $res)")
         }
     } catch (t: Throwable) {
-        results.add("PROBE: CONTROL_GOOD = FAIL (${t.javaClass.simpleName}: ${t.message})")
+        results.add("PROBE: CONTROL_GOOD = FAIL (${dev.luksandroid.Trace.throwableSummary(t)})")
     }
 
     try {
@@ -377,7 +377,7 @@ private fun probeReflectionSurface(context: Context): String {
     } catch (e: NoSuchFieldException) {
         results.add("PROBE: CONTROL_BAD = OK (NoSuchFieldException)")
     } catch (t: Throwable) {
-        results.add("PROBE: CONTROL_BAD = FAIL (${t.javaClass.simpleName}: ${t.message})")
+        results.add("PROBE: CONTROL_BAD = FAIL (${dev.luksandroid.Trace.throwableSummary(t)})")
     }
 
     try {
@@ -390,7 +390,7 @@ private fun probeReflectionSurface(context: Context): String {
             results.add("PROBE: SSB_MTEXT = FAIL (array mismatch)")
         }
     } catch (t: Throwable) {
-        results.add("PROBE: SSB_MTEXT = BLOCKED (${t.javaClass.simpleName}: ${t.message})")
+        results.add("PROBE: SSB_MTEXT = BLOCKED (${dev.luksandroid.Trace.throwableSummary(t)})")
     }
 
     try {
@@ -411,13 +411,13 @@ private fun probeReflectionSurface(context: Context): String {
                 val undoMethods = methods.filter { it.contains("undo", ignoreCase = true) }
                 results.add("PROBE: EDITOR_METHODS_UNDO = ${undoMethods.ifEmpty { listOf("NONE_MATCHED") }.joinToString(", ")}")
             } catch (t: Throwable) {
-                results.add("PROBE: EDITOR_FIELDS = BLOCKED (${t.javaClass.simpleName}: ${t.message})")
+                results.add("PROBE: EDITOR_FIELDS = BLOCKED (${dev.luksandroid.Trace.throwableSummary(t)})")
             }
         } else {
             results.add("PROBE: TEXTVIEW_MEDITOR = BLOCKED (mEditor null)")
         }
     } catch (t: Throwable) {
-        results.add("PROBE: TEXTVIEW_MEDITOR = BLOCKED (${t.javaClass.simpleName}: ${t.message})")
+        results.add("PROBE: TEXTVIEW_MEDITOR = BLOCKED (${dev.luksandroid.Trace.throwableSummary(t)})")
     }
 
     return results.joinToString("\n")

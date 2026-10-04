@@ -295,6 +295,27 @@ class TransferEngineTest {
         assertEquals(1, ran.get())
     }
 
+    /** F6.6: whatever a job throws, the item's error text is a mapped string, never the throwable's text. */
+    @Test
+    fun f6_itemErrorNeverCarriesThrowableText() = runBlocking {
+        val vol = FatalVolume()
+        unlocked(vol)
+        val secret = "/Volumes/secret-folder/tax-return.pdf"
+        val throwables = listOf<Throwable>(
+            dev.luksandroid.LuksException("no such file or directory: $secret", dev.luksandroid.LuksException.NOT_FOUND),
+            java.io.FileNotFoundException(secret),
+            java.io.IOException(secret),
+            IllegalStateException(secret),
+        )
+        for (t in throwables) {
+            val id = TransferManager.startJob("job", TransferType.IMPORT, writes = false) { _, _ -> throw t }
+            awaitState(id, TransferState.FAILED)
+            val error = TransferManager.getTransfer(id)?.error
+            assertTrue("no error text for ${t.javaClass.simpleName}", !error.isNullOrBlank())
+            assertFalse("${t.javaClass.simpleName}: $error", error!!.contains("secret-folder") || error.contains("tax-return"))
+        }
+    }
+
     @Test
     fun c6_aNonFatalFailureLeavesWritesAlive() = runBlocking {
         val vol = FatalVolume()

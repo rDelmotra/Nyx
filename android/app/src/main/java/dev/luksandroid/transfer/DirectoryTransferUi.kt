@@ -169,9 +169,10 @@ internal fun defaultFormatBytes(bytes: Long): String = when {
 /**
  * The sentence shown when a transfer stops before finishing.
  *
- * Names how far it got and where it stopped, because "N of M, stopped at
- * <path>" is the information whose absence made the 2026-08-23 failure
- * indistinguishable from a completed copy. §5.2 keeps everything already
+ * Names how far it got ("N of M"), because its absence made the 2026-08-23
+ * failure indistinguishable from a completed copy. It does not name the file
+ * it stopped at: this text is the item's error string and must stay free of
+ * names (F6.6); the stopping point travels in [TransferOutcome.stoppedAtPath]. §5.2 keeps everything already
  * written, so this deliberately says what was kept rather than implying a
  * rollback that did not happen.
  */
@@ -196,7 +197,6 @@ fun stoppedSummary(outcome: TransferOutcome, filesTotal: Int): String {
     val lead = if (cancelled) "Cancelled after" else "Stopped after"
     return buildString {
         append("$lead ${outcome.filesCopied} of $filesTotal files")
-        outcome.stoppedAtPath?.let { append(", at “$it”") }
         append(". Everything already copied has been kept.")
         if (!cancelled) {
             safeFailureText(outcome.failure)?.let { append("\n$it") }

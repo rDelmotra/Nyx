@@ -103,6 +103,7 @@ import dev.luksandroid.LuksDevice
 import dev.luksandroid.LuksException
 import dev.luksandroid.PartitionInfo
 import dev.luksandroid.Trace
+import dev.luksandroid.ui.UiErrorMessage
 import dev.luksandroid.UsbMassStorage
 import dev.luksandroid.biometricKeyFor
 import dev.luksandroid.formatSize
@@ -198,7 +199,7 @@ fun DevicesScreen(
             deviceStates.forEach { (k, v) ->
                 if (v is DeviceItemState.Opened && (k !in validKeys || !v.device.isOpen)) {
                     if (v.device !== sessionDev) {
-                        runCatching { v.device.close() }
+                        Trace.cleanup("devices_close_stale") { v.device.close() }
                     }
                 }
             }
@@ -257,11 +258,11 @@ fun DevicesScreen(
             context.registerReceiver(receiver, filter)
         }
         onDispose {
-            runCatching { context.unregisterReceiver(receiver) }
+            Trace.cleanup("devices_unregister_receiver") { context.unregisterReceiver(receiver) }
             val sessionDev = LuksSession.device as? LuksDevice
             deviceStates.values.forEach { state ->
                 if (state is DeviceItemState.Opened && state.device !== sessionDev) {
-                    runCatching { state.device.close() }
+                    Trace.cleanup("devices_close_on_dispose") { state.device.close() }
                 }
             }
         }
@@ -1676,21 +1677,22 @@ private suspend fun openTarget(
         Trace.i("DevicesScreen: opened ${target.label} successfully")
         DeviceItemState.Opened(device)
     } catch (e: CancellationException) {
-        runCatching { device?.close() }
+        closeAfterFailedOpen(device, e)
         throw e
-    } catch (e: LuksException) {
-        runCatching { device?.close() }
-        Trace.err(e.code, "open_target")
-        Trace.e("DevicesScreen: open failed [${e.code}]")
-        DeviceItemState.Failed("[${e.code}] ${e.message}")
     } catch (e: Exception) {
-        if (e is CancellationException) {
-            runCatching { device?.close() }
-            throw e
-        }
-        runCatching { device?.close() }
-        Trace.err(-1, "open_target")
-        Trace.e("DevicesScreen: open failed: ${Trace.throwableSummary(e)}")
-        DeviceItemState.Failed(e.message ?: e.toString())
+        // LuksException included: the card shows the mapped message, never the native text.
+        closeAfterFailedOpen(device, e)
+        Trace.e("DevicesScreen: open_target failed: ${Trace.throwableSummary(e)}")
+        DeviceItemState.Failed(UiErrorMessage.getUserMessage(e, "Opening the drive"))
+    }
+}
+
+/** Closes a half-opened device after [failure]; a close error is attached to it and logged, not dropped. */
+private fun closeAfterFailedOpen(device: LuksDevice?, failure: Throwable) {
+    try {
+        device?.close()
+    } catch (c: Exception) {
+        failure.addSuppressed(c)
+        Trace.e("DevicesScreen: open_target cleanup close failed: ${Trace.throwableSummary(c)}")
     }
 }

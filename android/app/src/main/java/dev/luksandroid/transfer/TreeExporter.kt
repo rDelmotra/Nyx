@@ -1,5 +1,6 @@
 package dev.luksandroid.transfer
 
+import dev.luksandroid.Trace
 import java.io.OutputStream
 
 /**
@@ -234,7 +235,7 @@ object TreeExporter {
             } catch (t: Throwable) {
                 // R5r: a document that failed, was cancelled, or did not verify is not left behind
                 // truncated. (§5.2's "keep what landed" still holds for every file that finished.)
-                createdDoc?.let { doc -> runCatching { destination.delete(doc.id) } }
+                createdDoc?.let { doc -> Trace.cleanup("export_delete_partial") { destination.delete(doc.id) } }
                 return stop(entry.relativePath, t)
             }
 

@@ -113,7 +113,8 @@ internal object NativeCancelTokens : CancelTokens {
     override fun close(token: Long) {
         try {
             LuksNative.nativeCloseCancelToken(token)
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            Trace.e("TransferManager: nativeCloseCancelToken failed: ${Trace.throwableSummary(t)}")
         }
     }
 }
@@ -377,8 +378,9 @@ open class TransferController {
             }
         } catch (e: CancellationException) {
             throw e
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
             // No unlocked session: teardown commits natively.
+            Trace.e("TransferManager: drain commit lease failed: ${Trace.throwableSummary(t)}")
         }
         return ok
     }
@@ -1033,11 +1035,11 @@ open class TransferController {
         } catch (t: Throwable) {
             failFrom(transferId, t, "Export", volume)
         } finally {
-            runCatching { output?.close() }
+            Trace.cleanup("export_close_output") { output?.close() }
             // The destination is deleted unless the export finished AND stayed finished: a cancel
             // that raced a completion keeps the cancelled state, and then so must the delete.
             if (!succeeded) target.discard()
-            if (file != 0L) runCatching { volume.closeFile(file) }
+            if (file != 0L) Trace.cleanup("export_close_file") { volume.closeFile(file) }
             if (ownsJob) activeJobs.remove(transferId)
         }
         transferId
@@ -1142,7 +1144,7 @@ open class TransferController {
             try {
                 buffer?.zeroEntireCapacity()
             } finally {
-                runCatching { writer?.close() }
+                Trace.cleanup("import_close_writer") { writer?.close() }
                 if (ownsJob) activeJobs.remove(transferId)
             }
         }
@@ -1158,7 +1160,8 @@ open class TransferController {
             volume.statFs()
         } catch (e: CancellationException) {
             throw e
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            Trace.e("TransferManager: statFs before import failed: ${Trace.throwableSummary(e)}")
             return
         }
         val block = fs.blockSize.toLong().coerceAtLeast(1L)

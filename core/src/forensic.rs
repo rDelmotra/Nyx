@@ -432,15 +432,18 @@ pub fn dump_structural_counts_summary() -> String {
 }
 
 /// Helper to record a panic event.
-pub fn record_panic(file: &str, line: u32, col: u32, message: &str) {
-    // Sanitize any potential drive paths in panic messages
-    let sanitized_msg = sanitize_message(message);
-    let sanitized_file = sanitize_file_path(file);
+///
+/// `message` is `&'static str` on purpose: a panic payload is formatted from
+/// whatever the panicking code held (a path, a name), and the previous
+/// word-prefix sanitizer only caught `/`-led words. A literal cannot carry
+/// runtime data, so the compiler now enforces what the sanitizer only
+/// approximated. The source location is the diagnostic.
+pub fn record_panic(file: &str, line: u32, col: u32, message: &'static str) {
     record(ForensicEvent::Panic(PanicEvent {
-        file: sanitized_file,
+        file: sanitize_file_path(file),
         line,
         col,
-        message: sanitized_msg,
+        message: message.to_string(),
     }));
 }
 
@@ -455,23 +458,6 @@ fn sanitize_file_path(path: &str) -> String {
     } else {
         path.to_string()
     }
-}
-
-fn sanitize_message(msg: &str) -> String {
-    // Strip absolute paths or suspicious segments
-    let mut out = String::with_capacity(msg.len());
-    let words = msg.split_whitespace();
-    for (i, word) in words.enumerate() {
-        if i > 0 {
-            out.push(' ');
-        }
-        if word.starts_with('/') || word.starts_with('\\') {
-            out.push_str("<redacted_path>");
-        } else {
-            out.push_str(word);
-        }
-    }
-    out
 }
 
 /// Take an in-memory chronological snapshot of the ring buffer records.

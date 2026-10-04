@@ -133,3 +133,10 @@ class LuksException(message: String, val code: Int) : Exception(message) {
         const val FILE_CHANGED = 23
     }
 }
+
+/**
+ * A call on a closed native handle, or on a session that is locking or not
+ * unlocked. A distinct type so the UI can classify it without reading the
+ * message text (see `UiErrorMessage`).
+ */
+class SessionClosedException(message: String) : IllegalStateException(message)

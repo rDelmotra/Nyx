@@ -146,11 +146,13 @@ fn test_panic_trace_sanitization() {
     let _guard = TEST_LOCK.lock().unwrap();
     clear();
 
+    // The message is `&'static str`: runtime data (a path in a panic
+    // payload) cannot be passed at all, so only the file path needs scrubbing.
     record_panic(
         "/home/developer/workspace/project/core/src/fs/btrfs/mod.rs",
         123,
         45,
-        "failed to read /media/usb/private/keyfile.bin: corrupted header",
+        "panic (payload withheld)",
     );
 
     let text_dump = dump_text();
@@ -158,8 +160,7 @@ fn test_panic_trace_sanitization() {
 
     assert!(text_dump.contains("PANIC at src/fs/btrfs/mod.rs:123:45"));
     assert!(!text_dump.contains("/home/developer"));
-    assert!(!text_dump.contains("/media/usb/private/keyfile.bin"));
-    assert!(text_dump.contains("<redacted_path>"));
+    assert!(text_dump.contains("panic (payload withheld)"));
 
     assert!(json_dump.contains("src/fs/btrfs/mod.rs"));
     assert!(!json_dump.contains("/home/developer"));

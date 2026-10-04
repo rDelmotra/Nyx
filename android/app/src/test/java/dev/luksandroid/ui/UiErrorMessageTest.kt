@@ -125,4 +125,18 @@ class UiErrorMessageTest {
         val unknownMsg = UiErrorMessage.getUserMessage(unknown, "Operation")
         assertEquals("Operation failed: An unexpected error occurred.", unknownMsg)
     }
+
+    /**
+     * Closed-handle failures are classified by type. Matching on message text
+     * meant any exception whose text happened to contain "closed" (or a path
+     * containing it) was reported as a dead handle.
+     */
+    @Test
+    fun closedHandleIsClassifiedByTypeNotByMessageText() {
+        val typed = UiErrorMessage.getUserMessage(dev.luksandroid.SessionClosedException("volume is closed"), "Read")
+        assertEquals("Read failed: " + UiErrorMessage.getBaseMessage(LuksException.BAD_HANDLE), typed)
+
+        val lookalike = UiErrorMessage.getUserMessage(IllegalStateException("volume is closed"), "Read")
+        assertEquals("Read failed: An unexpected error occurred.", lookalike)
+    }
 }

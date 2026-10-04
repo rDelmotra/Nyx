@@ -7,6 +7,7 @@ import dev.luksandroid.LuksDevice
 import dev.luksandroid.LuksException
 import dev.luksandroid.LuksVolume
 import dev.luksandroid.PartitionInfo
+import dev.luksandroid.SessionClosedException
 import dev.luksandroid.Trace
 import dev.luksandroid.UnlockService
 import dev.luksandroid.security.SecurePassphraseBuffer
@@ -281,11 +282,11 @@ open class SessionController(
      */
     suspend fun <T> withLease(block: suspend (LuksVolume) -> T): T {
         if (isLocking.get()) {
-            throw IllegalStateException("Session is currently locking")
+            throw SessionClosedException("Session is currently locking")
         }
         val currentVol = mutex.withLock {
             if (isLocking.get()) {
-                throw IllegalStateException("Session is currently locking")
+                throw SessionClosedException("Session is currently locking")
             }
             val s = _state.value
             if (s !is SessionState.Unlocked) {
@@ -298,7 +299,7 @@ open class SessionController(
                 // was just refused access to it. Callers that legitimately need the
                 // reason read `state` directly; a refusal only needs to say it was
                 // refused.
-                throw IllegalStateException("Session is not unlocked (state: ${s::class.simpleName})")
+                throw SessionClosedException("Session is not unlocked (state: ${s::class.simpleName})")
             }
             val v = volume ?: s.volume
             _activeLeases.update { it + 1 }
@@ -379,7 +380,7 @@ open class SessionController(
             this.activeUsbDevice = null
             closeProduced(producedVolume)
             Trace.err(e.code, "unlock")
-            Trace.e("LuksSession: unlock failed [${e.code}]")
+            Trace.e("LuksSession: unlock failed: ${Trace.throwableSummary(e)}")
             // "wrong passphrase" is matched by the devices screen; everything else is code-only.
             val msg = if (e.isWrongPassword) "wrong passphrase" else codeOnlyMessage(e.code)
             val failed = SessionState.Failed(msg, partition)
@@ -464,7 +465,7 @@ open class SessionController(
             this.activeUsbDevice = null
             closeProduced(producedVolume)
             Trace.err(e.code, "open_plain")
-            Trace.e("LuksSession: openPlain failed [${e.code}]")
+            Trace.e("LuksSession: openPlain failed: ${Trace.throwableSummary(e)}")
             val failed = SessionState.Failed(codeOnlyMessage(e.code), partition)
             _state.value = failed
             failed
@@ -545,7 +546,7 @@ open class SessionController(
                 Trace.i("LuksSession: detach ignored, nothing is open")
                 return
             }
-            Trace.i("LuksSession: device detached ($message)")
+            Trace.i("LuksSession: device detached")
             isLocking.set(false)
             val h = takeHandles()
             _state.value = SessionState.Detached(message)

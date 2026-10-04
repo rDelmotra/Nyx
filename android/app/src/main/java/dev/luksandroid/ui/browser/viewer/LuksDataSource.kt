@@ -231,7 +231,7 @@ class LuksDataSource(
         val v = fileVolume
         file = 0L
         fileVolume = null
-        if (f != 0L) runCatching { v?.closeFile(f) }
+        if (f != 0L) dev.luksandroid.Trace.cleanup("data_source_close_file") { v?.closeFile(f) }
     }
 
     fun release() {

@@ -1,6 +1,7 @@
 package dev.luksandroid.transfer
 
 import dev.luksandroid.LuksVolume
+import dev.luksandroid.Trace
 
 /**
  * Pass 3 of notes/feature-directory-transfer.md: turns a [TransferPlan] into
@@ -198,7 +199,7 @@ object TreeImporter {
                             // temp entry so a failed replace leaves no orphan behind,
                             // and the original file is untouched because it was never
                             // in the rename's path in the first place.
-                            runCatching { volume.deleteFile(childPath(parentDir, tempName)) }
+                            Trace.cleanup("import_delete_temp") { volume.deleteFile(childPath(parentDir, tempName)) }
                             return stop(entry.relativePath, t)
                         }
                         destination.recordCreatedFile(parentDir, name)

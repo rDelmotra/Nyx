@@ -26,8 +26,13 @@ object Trace {
         }
     }
 
+    /** Test seam: sees every line the debug build would write, after formatting. */
+    @Volatile
+    internal var testSink: ((String) -> Unit)? = null
+
     private fun appendToFile(level: String, tag: String, text: String) {
         if (!BuildConfig.DEBUG) return
+        testSink?.invoke(text)
         synchronized(logLock) {
             val cur = sessionLogFile ?: return
             val prev = sessionOldLogFile
@@ -159,6 +164,22 @@ object Trace {
     fun throwableSummary(t: Throwable): String {
         val code = (t as? LuksException)?.code
         return if (code != null) "${t.javaClass.simpleName}[code=$code]" else t.javaClass.simpleName
+    }
+
+    /**
+     * Runs best-effort cleanup (close, delete, unregister). A failure is logged
+     * with its [stage] and exception class, never rethrown, never its text:
+     * cleanup must not mask the failure the caller is already handling, and
+     * must not vanish either. Cancellation always propagates.
+     */
+    inline fun cleanup(stage: String, block: () -> Unit) {
+        try {
+            block()
+        } catch (c: kotlinx.coroutines.CancellationException) {
+            throw c
+        } catch (t: Throwable) {
+            e("$stage: cleanup failed: ${throwableSummary(t)}")
+        }
     }
 
     /**

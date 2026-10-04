@@ -83,7 +83,7 @@ class UsbDetachReceiver(
 
         fun unregister(context: Context) {
             registeredReceiver?.let {
-                runCatching { context.unregisterReceiver(it) }
+                Trace.cleanup("detach_unregister_receiver") { context.unregisterReceiver(it) }
                 registeredReceiver = null
             }
         }

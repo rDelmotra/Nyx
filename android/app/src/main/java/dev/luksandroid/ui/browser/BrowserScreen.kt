@@ -853,9 +853,9 @@ fun BrowserScreen(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Throwable) {
-                Trace.err(-1, "prepare_directory_transfer")
+                Trace.e("prepare_directory_transfer failed: ${Trace.throwableSummary(e)}")
                 snackbarHostState.showSnackbar(
-                    "Could not read that folder: ${e.message ?: e::class.simpleName}",
+                    UiErrorMessage.getUserMessage(e, "Reading that folder"),
                 )
             } finally {
                 preparingDirection = null

@@ -1,9 +1,7 @@
-{"t":1790000060000,"seq":1,"sid":"-","src":"kt","ev":"process_start","n":4222}
-{"t":1790000060100,"seq":2,"sid":"-","src":"kt","ev":"unlock_fail","exc":"WrongPassword","code":2,"stage":"keyslot"}
-{this line is not json
-{"t":1790000070000,"seq":3,"sid":"e5f60718","src":"kt","ev":"session_header","app":"0.9.0-debug","git":"d60ee82","model":"Pixel 7","sdk":34,"vid":1921,"pid":21889,"dev_bytes":500107862016,"sector":512,"flush":true,"max_xfer":1048576,"fs":"btrfs","cipher":"aes-xts-plain64","key_bits":512,"write":true}
-{"t":1790000074000,"seq":4,"sid":"e5f60718","src":"kt","ev":"unlock","ms":3900}
-{"t":1790000074100,"seq":5,"sid":"e5f60718","src":"kt","ev":"health","verdict":"leaks","reason":"orphan_extents","ms":120}
-{"t":1790000074101,"seq":6,"sid":"e5f60718","src":"kt","ev":"health_finding","kind":"leaked_extent","n":3}
-{"t":1790000074500,"seq":7,"sid":"e5f60718","src":"kt","ev":"trace","lvl":"I","msg":"mounted"}
-{"t":1790000080000,"seq":8,"sid":"e5f60718","src":"kt","ev":"lock","reason":"user"}
+{"t":1790003660098,"seq":14,"sid":"0a1b2c3d","src":"rs","ev":"native_ring","xfer":2,"kind":"usb_submit","gen":4,"nseq":99,"nt":1790003664990,"bytes":1048576,"count":1,"ep":129}
+{"t":1790003660105,"seq":15,"sid":"0a1b2c3d","src":"rs","ev":"native_ring","xfer":2,"kind":"scsi_command","nseq":100,"nt":1790003664995,"blocks":2048,"data_len":1048576,"lba":204800,"tag":9,"opcode":40,"direction":"in"}
+{"t":1790003660112,"seq":16,"sid":"0a1b2c3d","src":"rs","ev":"native_ring","xfer":2,"kind":"usb_timeout","active_urbs":1,"gen":4,"nseq":101,"nt":1790003665000,"elapsed_ms":5000,"ep":129}
+{"t":1790003660119,"seq":17,"sid":"0a1b2c3d","src":"kt","ev":"detach","reason":"usb_detach"}
+{"t":1790003660133,"seq":18,"sid":"-","src":"kt","ev":"dropped","n":5}
+{"t":1790003660126,"seq":19,"sid":"0a1b2c3d","src":"kt","ev":"trace","lvl":"E","msg":"luks_err: [tid=12] code=7 op=export"}
+{"t":1790003670000,"seq":99,"sid":"-","src":"kt","ev":"xfer_end","xfe

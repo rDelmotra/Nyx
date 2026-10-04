@@ -15,8 +15,16 @@ Output is deterministic: times are UTC, no wall-clock or path-of-run data.
 Exit 0 unless the input is unreadable (exit 2).
 
 Native events: a line is "native" when ev is native / native_ring, or src is
-"rs". Its name is the `kind` field when ev is native/native_ring and `kind`
-is present, otherwise the ev itself (e.g. usb_timeout, scsi_result).
+"rs". Its name is the `kind` field (what EventLogger really writes:
+ev:"native", kind:"usb_timeout"); a bare ev is accepted as a fallback.
+Native lines carry two clocks: `t` is when Kotlin wrote the line (up to one
+2 s drain tick late), `nt` is when Rust recorded the event. Failure context is
+ordered by min(nt, t) so causes come before the failure that drained them, and
+`nt` is shown on every native line.
+Value names are the real ones: scsi_result status is a string ("passed",
+"failed", "not_ready", ...), usb_reset has reset_kind, usb_state_transition has
+from/to, panic has `at`. xfer_end state is completed|failed|cancelled; a
+native_err with code 19 is a cancellation, not a failure.
 """
 import json
 import re
@@ -24,7 +32,14 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-CONTEXT = 20
+CONTEXT = 20          # preceding Kotlin lines per failure
+NATIVE_CONTEXT = 40   # plus up to this many preceding native lines from the same window
+CANCELLED_CODE = 19
+HOT = {"usb_submit", "usb_reap", "scsi_command", "btrfs_write_chunk", "btrfs_begin_file",
+       "btrfs_block_cowed", "btrfs_block_reused", "btrfs_height_grew", "btrfs_interior_split",
+       "btrfs_leaf_split", "btrfs_node_removed", "btrfs_root_collapsed",
+       "btrfs_converge_rounds", "ext4_begin_file"}
+OK_STATES = ("completed",)
 REQUIRED = ("t", "seq", "ev")
 BAD_HEALTH = ("corrupt", "leaks", "unknown")
 FILE_RE = re.compile(r"^events\.(\d+)\.jsonl$")
@@ -130,6 +145,15 @@ def analyse(recs):
         r["_idx"] = idx
         segs.setdefault(r["_seg"], []).append(r)
 
+    # causal order inside a process: native lines by min(nt, t), file order breaks ties
+    order = {}
+    for sg, rs_ in segs.items():
+        lst = sorted(rs_, key=lambda r: (min(r["nt"], r["t"]) if is_native(r)
+                                         and isinstance(r.get("nt"), int) else r["t"], r["_idx"]))
+        for pos, r in enumerate(lst):
+            r["_pos"] = pos
+        order[sg] = lst
+
     processes, gaps, anomalies = [], [], []
     dropped_kt = dropped_rs = 0
     for s in sorted(segs):
@@ -178,6 +202,8 @@ def analyse(recs):
             s["header"] = {k2: r[k2] for k2 in HEADER_KEYS if k2 in r}
         elif r["ev"] == "unlock":
             s["unlock_ms"] = r.get("ms")
+        elif r["ev"] == "unlock_fail":
+            s["end"] = "unlock_fail"
         elif r["ev"] in ("lock", "detach"):
             s["end"] = "%s:%s" % (r["ev"], r.get("reason", "?"))
         elif r["ev"] == "idle_lock":
@@ -237,7 +263,9 @@ def analyse(recs):
         e = r["ev"]
         if e == "xfer_end":
             return r.get("state") == "failed"
-        if e in ("unlock_fail", "uncaught", "native_err"):
+        if e == "native_err":
+            return r.get("code") != CANCELLED_CODE
+        if e in ("unlock_fail", "uncaught"):
             return True
         if e == "health":
             return r.get("verdict") in BAD_HEALTH
@@ -252,10 +280,27 @@ def analyse(recs):
     for r in recs:
         if not is_failure(r):
             continue
-        pre = [x for x in segs[r["_seg"]] if x["_idx"] < r["_idx"] and x["ev"] != "native_ring"]
+        lst = order[r["_seg"]]
+        kt_n = nat_n = 0
+        pre = []
+        for x in reversed(lst[:r["_pos"]]):  # bounded: stops at the caps
+            if x["ev"] == "native_ring":
+                continue
+            if is_native(x):
+                if native_name(x) in HOT or nat_n >= NATIVE_CONTEXT:
+                    continue
+                nat_n += 1
+            else:
+                if kt_n >= CONTEXT:
+                    break
+                kt_n += 1
+            pre.append(x)
+            if kt_n >= CONTEXT and nat_n >= NATIVE_CONTEXT:
+                break
+        pre.reverse()
         f = {"ev": r["ev"], "seg": r["_seg"], "seq": r["seq"], "t": r["t"],
              "sid": r.get("sid", "-"), "xfer": r.get("xfer"), "record": r,
-             "context": pre[-CONTEXT:], "ring": [], "ring_ref": None}
+             "context": pre, "ring": [], "ring_ref": None}
         if r["ev"] == "health":
             f["findings"] = next((h["findings"] for h in health if h["idx"] == r["_idx"]), [])
         failures.append(f)
@@ -275,10 +320,16 @@ def analyse(recs):
             attached.add(key)
     orphans = sum(len(v) for k, v in rings.items() if k not in attached)
 
+    cancelled = {"xfer_cancelled": sum(1 for t in xfers if t["state"] == "cancelled"),
+                 "native_err_code19": sum(1 for r in recs
+                                          if r["ev"] == "native_err" and r.get("code") == CANCELLED_CODE)}
+
     # native summary
     nat = {"counts": {}, "usb_timeout": 0, "usb_reset": 0, "scsi_reset": 0,
-           "scsi_nonzero_status": {}, "scsi_sense_keys": {}, "fs_errors": {},
-           "panics": 0, "ring_lines": 0, "dropped": dropped_rs}
+           "fs_errors": {},
+           "panics": 0, "ring_lines": 0, "dropped": dropped_rs,
+           "usb_reset_kinds": {}, "usb_transitions": {}, "scsi_status": {}, "panic_at": {},
+           "usb_drain_aborted": 0, "ext4_left_dirty": {}, "flush_failed": 0}
     for r in recs:
         if not is_native(r):
             continue
@@ -291,26 +342,36 @@ def analyse(recs):
             nat["usb_timeout"] += 1
         elif n == "usb_reset":
             nat["usb_reset"] += 1
+            k = "%s status=%s" % (r.get("reset_kind", "?"), r.get("status", "?"))
+            nat["usb_reset_kinds"][k] = nat["usb_reset_kinds"].get(k, 0) + 1
+        elif n == "usb_state_transition":
+            k = "%s->%s" % (r.get("from", "?"), r.get("to", "?"))
+            nat["usb_transitions"][k] = nat["usb_transitions"].get(k, 0) + 1
+        elif n == "usb_drain_aborted":
+            nat["usb_drain_aborted"] += 1
         elif n == "scsi_reset":
             nat["scsi_reset"] += 1
         elif n == "panic":
             nat["panics"] += 1
+            k = "%s:%s" % (r.get("at", "?"), r.get("line", "?"))
+            nat["panic_at"][k] = nat["panic_at"].get(k, 0) + 1
         elif n in ("ext4_error", "btrfs_error"):
             key = "%s stage=%s code=%s" % (n, r.get("stage", "?"), r.get("code", "?"))
             nat["fs_errors"][key] = nat["fs_errors"].get(key, 0) + 1
+        elif n == "ext4_left_dirty":
+            k = "resync_ok=%s cleanup_code=%s" % (val(r.get("resync_ok")), r.get("cleanup_code", "-"))
+            nat["ext4_left_dirty"][k] = nat["ext4_left_dirty"].get(k, 0) + 1
+        elif n == "ext4_flush" and r.get("ok") is False:
+            nat["flush_failed"] += 1
         elif n == "scsi_result":
-            if r.get("sense_key") is not None:
-                key = "sense_key=%s" % r["sense_key"]
-                if r.get("asc") is not None:
-                    key += " asc=%s" % r["asc"]
-                nat["scsi_sense_keys"][key] = nat["scsi_sense_keys"].get(key, 0) + 1
-            if r.get("status") not in (None, 0):
-                key = "status=%s" % r["status"]
-                nat["scsi_nonzero_status"][key] = nat["scsi_nonzero_status"].get(key, 0) + 1
+            st = r.get("status")
+            if st != "passed" or r.get("sense_key") is not None:
+                k = "status=%s sense_key=%s" % (st, r.get("sense_key", "-"))
+                nat["scsi_status"][k] = nat["scsi_status"].get(k, 0) + 1
 
     return {"processes": processes, "sessions": sess_out, "transfers": xfers,
             "failures": failures, "health": health, "native": nat, "seq_gaps": gaps,
-            "seq_anomalies": anomalies,
+            "seq_anomalies": anomalies, "cancelled": cancelled,
             "dropped": {"kt": dropped_kt, "rs": dropped_rs,
                         "lost_to_seq_gaps": sum(g["lost"] for g in gaps)},
             "orphan_ring_lines": orphans}
@@ -350,9 +411,12 @@ def to_text(rep, meta):
     if rep["processes"]:
         a("span=%s .. %s UTC" % (fmt_t(rep["processes"][0]["start_t"], True),
                                  fmt_t(max(p["end_t"] for p in rep["processes"]), True)))
-    xf_bad = [t for t in rep["transfers"] if t["state"] not in ("done", "ok", "success", "completed")]
-    a("verdict: %s" % ("%d failure event(s), %d transfer(s) not ok" % (nf, len(xf_bad))
+    xf_bad = [t for t in rep["transfers"] if t["state"] not in OK_STATES + ("cancelled",)]
+    c = rep["cancelled"]
+    a("verdict: %s" % ("%d failure event(s), %d transfer(s) failed/unfinished" % (nf, len(xf_bad))
                        if nf or xf_bad else "no failure events"))
+    a("cancelled (not failures): transfers=%d native_err_code19=%d" % (
+        c["xfer_cancelled"], c["native_err_code19"]))
 
     a("")
     a("== PROCESSES ==")
@@ -396,7 +460,7 @@ def to_text(rep, meta):
     a("== HEALTH ==")
     for h in rep["health"]:
         a("P%d %s sid=%s verdict=%s reason=%s ms=%s findings=%s" % (
-            h["seg"], fmt_t(h["t"]), h["sid"], h["verdict"], h["reason"], h["ms"],
+            h["seg"], fmt_t(h["t"]), h["sid"], h["verdict"], h["reason"] or "-", h["ms"],
             ",".join("%s:%s" % (f["kind"], f["n"]) for f in h["findings"]) or "-"))
     if not rep["health"]:
         a("none")
@@ -416,11 +480,11 @@ def to_text(rep, meta):
         prev = next((g for g in reversed(rep["failures"][:i - 1])
                      if g["seg"] == f["seg"] and g["record"]["_idx"] in [c["_idx"] for c in ctx]), None)
         if prev is not None:
-            ctx = [c for c in ctx if c["_idx"] > prev["record"]["_idx"]]
+            ctx = [c for c in ctx if c["_pos"] > prev["record"]["_pos"]]
             a("  preceding lines: same as F%d up to and including it (#%d), then %d more:" % (
                 rep["failures"].index(prev) + 1, prev["seq"], len(ctx)))
         else:
-            a("  preceding %d line(s) of P%d:" % (len(ctx), f["seg"]))
+            a("  preceding %d line(s) of P%d (native ordered by min(nt,t)):" % (len(ctx), f["seg"]))
         for x in ctx:
             a("   | " + render(x))
         if f["ring"]:
@@ -438,8 +502,11 @@ def to_text(rep, meta):
     a("usb_timeout=%d usb_reset=%d scsi_reset=%d panics=%d native_dropped=%d ring_lines=%d orphan_ring_lines=%d" % (
         n["usb_timeout"], n["usb_reset"], n["scsi_reset"], n["panics"], n["dropped"],
         n["ring_lines"], rep["orphan_ring_lines"]))
-    a("scsi sense: " + kv(n["scsi_sense_keys"]))
-    a("scsi non-good status: " + kv(n["scsi_nonzero_status"]))
+    a("usb reset kinds: " + kv(n["usb_reset_kinds"]))
+    a("usb state transitions: " + kv(n["usb_transitions"]) + "; drain_aborted=%d" % n["usb_drain_aborted"])
+    a("scsi not-passed / sense: " + kv(n["scsi_status"]))
+    a("ext4 left dirty: " + kv(n["ext4_left_dirty"]) + "; flush_failed=%d" % n["flush_failed"])
+    a("panics at: " + kv(n["panic_at"]))
     a("fs errors: " + kv(n["fs_errors"]))
     a("all native: " + kv(n["counts"]))
 

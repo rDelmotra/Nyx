@@ -326,6 +326,14 @@ private fun CompletedTransferCard(
                     color = MaterialTheme.colorScheme.error,
                 )
             }
+
+            StoppedAtLabel.label(item)?.let { label ->
+                Text(
+                    text = label,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
     }
 }

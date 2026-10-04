@@ -465,6 +465,11 @@ path = "tests/ext4/ext4_deferred_alloc.rs"
 required-features = ["dangerous-write-support"]
 
 [[test]]
+name = "ext4_generation"
+path = "tests/ext4/ext4_generation.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
 name = "btrfs_batch_ack_durability"
 path = "tests/txn_batch/btrfs_batch_ack_durability.rs"
 required-features = ["dangerous-write-support"]

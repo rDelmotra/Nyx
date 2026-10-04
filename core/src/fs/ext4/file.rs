@@ -88,6 +88,9 @@ struct Run {
 /// lifetime of an unlocked LUKS volume (and therefore its master key).
 pub struct FileWriter {
     ino: u64,
+    /// `i_generation` for the inode, chosen at begin so the extent leaf
+    /// checksum (written before the inode record) and the record agree.
+    generation: u32,
     extents: Vec<Extent>,
     runs: Vec<Run>,
     seed: Seed,
@@ -169,6 +172,24 @@ fn runs_from(extents: &[Extent], max_runs: usize) -> Result<Vec<Run>> {
 }
 
 impl<D: WriteAt> Ext4<D> {
+    /// A fresh `i_generation` for an inode about to be written.
+    ///
+    /// Kernel-compatible: the kernel keeps a per-superblock counter seeded
+    /// from random at mount (`s_next_generation`) and stamps `i_generation`
+    /// from it for every new inode (it is what NFS file handles use to tell a
+    /// reused inode number from the file that held it). Zero is skipped so a
+    /// stamped inode is never confused with one written before this driver
+    /// stamped anything. Not `eh_generation`, which is an unrelated extent
+    /// header field and stays 0.
+    pub(super) fn next_generation(&mut self) -> u32 {
+        loop {
+            self.next_generation = self.next_generation.wrapping_add(1);
+            if self.next_generation != 0 {
+                return self.next_generation;
+            }
+        }
+    }
+
     /// Reserve an inode and blocks for a file of `size`, before its bytes are
     /// available. Call [`write_chunk`](Self::write_chunk), then either
     /// [`finish_file`](Self::finish_file) or [`abandon_file`](Self::abandon_file).
@@ -218,6 +239,7 @@ impl<D: WriteAt> Ext4<D> {
         }
         Ok(FileWriter {
             ino,
+            generation: self.next_generation(),
             extents,
             runs,
             seed,
@@ -239,6 +261,7 @@ impl<D: WriteAt> Ext4<D> {
         let ino = self.reserve_inode()?;
         Ok(FileWriter {
             ino,
+            generation: self.next_generation(),
             extents: Vec::new(),
             runs: Vec::new(),
             seed,
@@ -404,6 +427,7 @@ impl<D: WriteAt> Ext4<D> {
                 &writer.runs,
                 writer.leaf_block,
                 &writer.seed,
+                writer.generation,
             )?;
             fs.flush()?;
             fs.link_file(dir_ino, name, writer.ino, file_type)?;
@@ -462,7 +486,7 @@ impl<D: WriteAt> Ext4<D> {
             writer.tail.clear();
         }
         if let Some(lb) = writer.leaf_block {
-            self.write_extent_leaf_block(lb, writer.ino, &writer.runs, &writer.seed)?;
+            self.write_extent_leaf_block(lb, writer.ino, writer.generation, &writer.runs, &writer.seed)?;
         }
         // No flush here. Every data write above precedes `dirty_window`'s
         // dirty-mark, and that mark ends in a flush before any bitmap,
@@ -619,6 +643,7 @@ impl<D: WriteAt> Ext4<D> {
         let blocks_needed = (data.len() as u64).div_ceil(bs.max(1));
 
         let ino = self.alloc_inode(false).map_err(inode_alloc_aborted)?;
+        let generation = self.next_generation();
 
         // One call, not one per block. The allocator commits its bookkeeping
         // once per group it touches instead of once per block, which is the
@@ -654,7 +679,7 @@ impl<D: WriteAt> Ext4<D> {
             return Err(self.rollback_file(e, ino, &extents));
         }
         if let Some(lb) = leaf_block {
-            if let Err(e) = self.write_extent_leaf_block(lb, ino, &runs, &seed) {
+            if let Err(e) = self.write_extent_leaf_block(lb, ino, generation, &runs, &seed) {
                 return Err(self.rollback_file(e, ino, &extents));
             }
         }
@@ -666,7 +691,7 @@ impl<D: WriteAt> Ext4<D> {
             return Err(self.rollback_file(e, ino, &extents));
         }
 
-        if let Err(e) = self.write_inode_record(ino, data.len() as u64, blocks_needed, &runs, leaf_block, &seed)
+        if let Err(e) = self.write_inode_record(ino, data.len() as u64, blocks_needed, &runs, leaf_block, &seed, generation)
         {
             return Err(self.rollback_file(e, ino, &extents));
         }
@@ -703,6 +728,7 @@ impl<D: WriteAt> Ext4<D> {
         &mut self,
         leaf_block: u64,
         ino: u64,
+        generation: u32,
         runs: &[Run],
         seed: &Seed,
     ) -> Result<()> {
@@ -724,7 +750,7 @@ impl<D: WriteAt> Ext4<D> {
             put32(e, 8, r.physical as u32);
         }
 
-        if let Some(csum) = seed.extent_block(ino, 0, &block) {
+        if let Some(csum) = seed.extent_block(ino, generation, &block) {
             let tail = &mut block[bs - 4..bs];
             put32(tail, 0, csum);
         }
@@ -741,6 +767,7 @@ impl<D: WriteAt> Ext4<D> {
         runs: &[Run],
         leaf_block: Option<u64>,
         seed: &Seed,
+        generation: u32,
     ) -> Result<()> {
         let isize_ = self.sb.inode_size as usize;
         let mut raw = vec![0u8; isize_];
@@ -759,6 +786,7 @@ impl<D: WriteAt> Ext4<D> {
         let sectors_per_block = self.sb.block_size / 512;
         put32(&mut raw, 0x1C, total_blocks as u32 * sectors_per_block); // i_blocks_lo
         put32(&mut raw, 0x20, FL_EXTENTS); // i_flags
+        put32(&mut raw, 0x64, generation); // i_generation
 
         write_extent_tree(&mut raw[0x28..0x28 + 60], runs, leaf_block)?;
 
@@ -922,6 +950,7 @@ impl<D: WriteAt> Ext4<D> {
         ino: u64,
         block_phys: u64,
         seed: &Seed,
+        generation: u32,
     ) -> Result<()> {
         let isize_ = self.sb.inode_size as usize;
         let mut raw = vec![0u8; isize_];
@@ -939,6 +968,7 @@ impl<D: WriteAt> Ext4<D> {
         let sectors_per_block = self.sb.block_size / 512;
         put32(&mut raw, 0x1C, sectors_per_block); // i_blocks_lo
         put32(&mut raw, 0x20, FL_EXTENTS); // i_flags
+        put32(&mut raw, 0x64, generation); // i_generation
 
         let runs = [Run {
             logical: 0,
@@ -1025,6 +1055,7 @@ impl<D: WriteAt> Ext4<D> {
         name: &str,
     ) -> std::result::Result<u32, Aborted> {
         let ino = self.alloc_inode(true).map_err(inode_alloc_aborted)?;
+        let generation = self.next_generation();
         let ino_u32 = ino as u32;
 
         let extents = match self.alloc_blocks_tracked(0, 1) {
@@ -1065,7 +1096,7 @@ impl<D: WriteAt> Ext4<D> {
             put16(&mut block, tail_off + 4, DIR_TAIL_SIZE as u16);
             block[tail_off + 6] = 0;
             block[tail_off + 7] = 0xDE;
-            if let Some(csum) = seed.dir_block(ino, 0, &block) {
+            if let Some(csum) = seed.dir_block(ino, generation, &block) {
                 put32(&mut block, bs - 4, csum);
             }
         }
@@ -1078,7 +1109,7 @@ impl<D: WriteAt> Ext4<D> {
             return Err(self.rollback_dir(e, ino, &extents, None));
         }
 
-        if let Err(e) = self.write_directory_inode_record(ino, block_phys, seed) {
+        if let Err(e) = self.write_directory_inode_record(ino, block_phys, seed, generation) {
             return Err(self.rollback_dir(e, ino, &extents, None));
         }
 

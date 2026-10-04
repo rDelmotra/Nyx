@@ -31,6 +31,7 @@ class LuksException(message: String, val code: Int) : Exception(message) {
     val isDirectoryNotEmpty: Boolean get() = code == DIRECTORY_NOT_EMPTY
     val isWriteSessionFenced: Boolean get() = code == WRITE_SESSION_FENCED
     val isReadOnlyVolume: Boolean get() = code == READ_ONLY_VOLUME
+    val isFileChanged: Boolean get() = code == FILE_CHANGED
 
     /**
      * Whether this failure means no further write on this volume can be
@@ -123,5 +124,12 @@ class LuksException(message: String, val code: Int) : Exception(message) {
          * The UI's answer is a confirmation prompt, not an error.
          */
         const val READ_ONLY_VOLUME = 22
+
+        /**
+         * A file open for reading was deleted, replaced or modified since it was opened. The
+         * read was refused instead of returning another file's bytes. Re-list and start the
+         * transfer again; retrying the same read cannot succeed.
+         */
+        const val FILE_CHANGED = 23
     }
 }

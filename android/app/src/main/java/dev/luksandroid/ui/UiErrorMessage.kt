@@ -44,6 +44,9 @@ object UiErrorMessage {
         LuksException.WRITE_SESSION_FENCED ->
             "A previous write left the drive's state unknown, so further writes are blocked. " +
                 "Lock and unlock the volume again to continue."
+        LuksException.FILE_CHANGED ->
+            "The file was changed or replaced while it was being read, so the copy was stopped. " +
+                "Refresh the folder and try again."
         else -> "An unexpected error occurred (code $code)."
     }
 

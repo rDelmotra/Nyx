@@ -33,14 +33,28 @@ pub enum MountedFs<D: ReadAt> {
 /// 1 GiB file in 1 MiB chunks would otherwise re-resolve the path a thousand
 /// times, and each resolution is a directory walk — over USB, that is a
 /// thousand round trips to answer a question already answered.
+///
+/// # Identity, not a snapshot
+///
+/// What this holds is the inode as it was when opened, used as an **identity
+/// to check**, never as data to read with. Every read re-reads the inode (one
+/// small read) and refuses with [`LuksError::FileChanged`] unless it is still
+/// the same file: same number, same generation, same type, size and times. So
+/// a delete, a rename-over, or a delete-and-create that reuses the inode
+/// number between two reads can never feed another file's bytes into the
+/// stream (N3), and nothing here pins a btrfs tree root that a later commit
+/// may free (R3r).
 pub enum OpenFile {
     Ext4(ext4::Inode),
-    /// The tree comes along because an inode number alone does not identify a
-    /// file on btrfs.
-    Btrfs { tree: u64, inode: btrfs::Inode },
+    /// The subvolume's **objectid**, not its root bytenr: the root moves on
+    /// every commit, and an inode number alone does not identify a file on
+    /// btrfs (each subvolume numbers from 256).
+    Btrfs { subvol: u64, inode: btrfs::Inode },
 }
 
 impl OpenFile {
+    /// Size when opened. Equal to the size at any later successful read, since
+    /// a size change fails the identity check.
     pub fn size(&self) -> u64 {
         match self {
             OpenFile::Ext4(i) => i.info().size,
@@ -140,7 +154,7 @@ impl<D: ReadAt> MountedFs<D> {
             MountedFs::Btrfs(fs) => {
                 let found = fs.resolve_no_follow(fs.fs_tree(), path)?;
                 Ok(OpenFile::Btrfs {
-                    tree: found.tree.bytenr,
+                    subvol: found.tree.objectid,
                     inode: found.inode,
                 })
             }
@@ -148,10 +162,54 @@ impl<D: ReadAt> MountedFs<D> {
     }
 
     pub fn read_open(&self, file: &OpenFile, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        self.read_open_covered(file, offset, buf).map(|(n, _)| n)
+    }
+
+    /// [`read_open`](Self::read_open), also reporting how many of the bytes
+    /// returned were checksum-verified (btrfs data with a stored checksum) and
+    /// how many were not (ext4 has no data checksums; a btrfs `NODATASUM`
+    /// file opts out). Returns [`LuksError::FileChanged`] if the file is no
+    /// longer the one that was opened.
+    pub fn read_open_covered(
+        &self,
+        file: &OpenFile,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> Result<(usize, btrfs::ReadCoverage)> {
         match (self, file) {
-            (MountedFs::Ext4(fs), OpenFile::Ext4(inode)) => fs.read_inode_data(inode, offset, buf),
-            (MountedFs::Btrfs(fs), OpenFile::Btrfs { tree, inode }) => {
-                fs.read_inode_data(*tree, inode, offset, buf)
+            (MountedFs::Ext4(fs), OpenFile::Ext4(opened)) => {
+                let now = match fs.read_inode(opened.number) {
+                    Ok(now) => now,
+                    // An inode number that no longer resolves is a file that
+                    // is gone.
+                    Err(LuksError::BadInode(_)) => return Err(LuksError::FileChanged),
+                    Err(e) => return Err(e),
+                };
+                if !opened.same_file_as(&now) {
+                    return Err(LuksError::FileChanged);
+                }
+                let n = fs.read_inode_data(&now, offset, buf)?;
+                Ok((
+                    n,
+                    btrfs::ReadCoverage { verified_bytes: 0, unverified_bytes: n as u64 },
+                ))
+            }
+            (MountedFs::Btrfs(fs), OpenFile::Btrfs { subvol, inode: opened }) => {
+                // The CURRENT root of the subvolume, looked up now: a commit
+                // since the file was opened has moved it (R3r). A subvolume
+                // that is gone takes its files with it.
+                let Some(tree) = fs.current_tree(*subvol)? else {
+                    return Err(LuksError::FileChanged);
+                };
+                let now = match fs.read_inode(tree.bytenr, opened.objectid) {
+                    Ok(now) => now,
+                    Err(LuksError::BadInode(_)) => return Err(LuksError::FileChanged),
+                    Err(e) => return Err(e),
+                };
+                if !opened.same_file_as(&now) {
+                    return Err(LuksError::FileChanged);
+                }
+                fs.read_inode_data_covered(tree.bytenr, &now, offset, buf)
             }
             // Only reachable by handing a file opened on one volume to another,
             // which no caller does — but returning an error beats a panic on a

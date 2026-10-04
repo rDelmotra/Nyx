@@ -44,7 +44,16 @@ class LuksDataSourceTest {
     ) : LuksVolume(0L) {
         var chunkReadCount = 0
 
+        /** Path-based stats. A handle-based open must never need one (F4 follow-up). */
+        var pathStatCalls = 0
+
+        override fun fileSizeOf(file: Long): Long {
+            val path = openHandles[file] ?: throw IllegalStateException("size of a handle that is not open: $file")
+            return (fileDataMap[path] ?: throw IllegalArgumentException("File not found: $path")).size.toLong()
+        }
+
         override fun fileInfo(path: String): FileInfo {
+            pathStatCalls++
             val data = fileDataMap[path] ?: throw IllegalArgumentException("File not found: $path")
             return FileInfo(
                 path = path,
@@ -62,8 +71,27 @@ class LuksDataSourceTest {
 
         val returnedChunks = mutableListOf<ByteArray>()
 
-        override fun readChunk(path: String, offset: Long, len: Int): ByteArray {
+        /** Open read handles: id -> path. Reads are by handle, never by path (F4 B5). */
+        val openHandles = mutableMapOf<Long, String>()
+        var opensTotal = 0
+        var closesTotal = 0
+        private var nextHandle = 1L
+
+        override fun openFile(path: String): Long {
+            opensTotal++
+            val id = nextHandle++
+            openHandles[id] = path
+            return id
+        }
+
+        override fun closeFile(file: Long) {
+            closesTotal++
+            openHandles.remove(file)
+        }
+
+        override fun readAt(file: Long, offset: Long, len: Int): ByteArray {
             chunkReadCount++
+            val path = openHandles[file] ?: throw IllegalStateException("read on a handle that is not open: $file")
             val data = fileDataMap[path] ?: return ByteArray(0)
             if (offset >= data.size) return ByteArray(0)
             val end = minOf(data.size.toLong(), offset + len).toInt()
@@ -120,6 +148,7 @@ class LuksDataSourceTest {
             totalRead += read
         }
         assertEquals(8000, totalRead)
+        assertEquals("the size must come from the open handle, not a second path lookup", 0, testVolume.pathStatCalls)
 
         // 8000 bytes within a 32 KiB block should only trigger 1 chunk read on storage!
         assertEquals(1, testVolume.chunkReadCount)

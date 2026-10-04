@@ -47,6 +47,8 @@ static READ_FILE_RACE_HOOK: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new
 /// stays navigable in read-only builds and while Pass 2b grows this boundary.
 #[cfg(feature = "dangerous-write-support")]
 mod writer;
+mod reader;
+pub use reader::OpenFileHandle;
 
 // ---------------------------------------------------------------- error codes
 
@@ -129,6 +131,10 @@ pub mod code {
     /// unsupported format would tell the user their drive is incompatible
     /// when it is one tap from writable.
     pub const READ_ONLY_VOLUME: i32 = 22;
+    /// A file open for reading was deleted, replaced, or modified since it was
+    /// opened. The read was refused instead of returning another file's bytes.
+    /// The remedy is to re-list and start the transfer again.
+    pub const FILE_CHANGED: i32 = 23;
 }
 
 pub fn error_code(e: &LuksError) -> i32 {
@@ -151,6 +157,7 @@ pub fn error_code(e: &LuksError) -> i32 {
         | UnsupportedFs(_)
         | AmbiguousFs => code::UNSUPPORTED,
         ReadOnlyVolume => code::READ_ONLY_VOLUME,
+        FileChanged => code::FILE_CHANGED,
         FsNeedsRecovery => code::NEEDS_FSCK,
         FilesystemFull | NoFreeInodes => code::NO_SPACE,
         BtrfsItemTooLarge { .. } => code::ITEM_TOO_LARGE,
@@ -250,10 +257,20 @@ impl SharedDevice {
         }
     }
 
-    /// A poisoned lock means some earlier call panicked mid-read. The device
-    /// itself has no invariant we can corrupt — reads are stateless apart from
-    /// the SCSI tag counter — so recovering the guard is better than turning
-    /// every later call into a panic.
+    /// Whether a panic ever unwound through the device lock. Poison is never
+    /// cleared (`lock` recovers the guard without clearing it), so this is a
+    /// permanent latch: a volume on this device fences its write session on it
+    /// (T3 / F4-A6).
+    pub fn is_poisoned(&self) -> bool {
+        self.inner.is_poisoned()
+    }
+
+    /// A poisoned lock means some earlier call panicked inside a device call.
+    /// Reads are stateless apart from the SCSI tag counter, so the guard is
+    /// still recovered rather than turning every later call into a panic. But
+    /// a panic mid-write may have left a CBW/data/CSW sequence half done, so
+    /// the poison stays set (never cleared) and write sessions fence on it
+    /// (see [`SharedDevice::is_poisoned`]).
     // The `+ 'static` is not decoration: inside `Arc<Mutex<dyn ..>>` the elided
     // object lifetime defaults to 'static, but in a `MutexGuard<'_, dyn ..>`
     // return type it defaults to the guard's own lifetime. Spelling it out keeps
@@ -334,6 +351,8 @@ pub struct Handle {
 pub enum Payload {
     Device(DeviceHandle),
     Volume(VolumeHandle),
+    /// An open read handle: a file pinned by identity (F4 Part B).
+    File(OpenFileHandle),
     #[cfg(feature = "dangerous-write-support")]
     Writer(WriterHandle),
 }
@@ -385,12 +404,62 @@ pub enum FileWriterEnum {
     Btrfs(luks_core::fs::btrfs::write::file::BtrfsFileWriter),
 }
 
-/// Opaque streaming state. It deliberately owns neither a device nor a volume.
+/// The JNI-side name of an open writer. It carries **no writer state**: that
+/// lives only in the owning volume's registry (`VolumeHandle::writers`), so
+/// closing or dropping the volume reaches every open writer (F4-A1).
 #[cfg(feature = "dangerous-write-support")]
 pub struct WriterHandle {
     pub volume_handle: i64,
     pub volume_id: u64,
-    pub writer: Mutex<Option<FileWriterEnum>>,
+    pub writer_id: u64,
+}
+
+/// Open writers of one volume, keyed by id. See [`VolumeHandle::writers`].
+#[cfg(feature = "dangerous-write-support")]
+#[derive(Default)]
+pub struct WriterTable {
+    next: u64,
+    /// Set by `close()`; nothing may register after it.
+    closed: bool,
+    map: HashMap<u64, FileWriterEnum>,
+}
+
+/// Failure of an operation that names a writer.
+#[cfg(feature = "dangerous-write-support")]
+#[derive(Debug)]
+pub enum WriterError {
+    /// The id/handle is unknown: finished, closed, released by a volume close,
+    /// or never issued. Maps to `BAD_HANDLE`. Nothing is leaked by it.
+    BadHandle(&'static str),
+    Luks(LuksError),
+}
+
+#[cfg(feature = "dangerous-write-support")]
+impl WriterError {
+    /// The JNI error code this maps to.
+    pub fn code(&self) -> i32 {
+        match self {
+            WriterError::BadHandle(_) => code::BAD_HANDLE,
+            WriterError::Luks(e) => error_code(e),
+        }
+    }
+}
+
+#[cfg(feature = "dangerous-write-support")]
+impl From<LuksError> for WriterError {
+    fn from(e: LuksError) -> Self {
+        WriterError::Luks(e)
+    }
+}
+
+#[cfg(feature = "dangerous-write-support")]
+impl std::fmt::Display for WriterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WriterError::BadHandle(m) => f.write_str(m),
+            WriterError::Luks(e) => e.fmt(f),
+        }
+    }
 }
 
 pub struct DeviceHandle {
@@ -480,11 +549,22 @@ pub struct VolumeHandle {
         allow(dead_code, reason = "only the write path consults it")
     )]
     plain_writes_armed: std::sync::atomic::AtomicBool,
+    /// Every open file writer of this volume (F4-A1). The only owner of writer
+    /// state, so `close()` / `Drop` can release them regardless of what the
+    /// Java side does. **Lock order: `fs` before `writers`**, everywhere.
+    #[cfg(feature = "dangerous-write-support")]
+    writers: Mutex<WriterTable>,
 }
 
 impl Drop for VolumeHandle {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering;
+        // Best-effort final close: release writers, publish an unfenced btrfs
+        // batch. The outcome is logged (code + stage only, no paths).
+        #[cfg(feature = "dangerous-write-support")]
+        if let Err(e) = self.close() {
+            crate::log::e(&format!("VolumeHandle drop: final close failed [{}] stage=drop", error_code(&e)));
+        }
         if self.holds_writer.load(Ordering::Acquire) {
             self.device_writer.store(false, Ordering::Release);
         }
@@ -536,10 +616,34 @@ impl VolumeHandle {
         {
             return Err(LuksError::ReadOnlyVolume);
         }
+        // Poison latches the fence (F4-A6 / T3): a panic under the `fs` lock or
+        // inside a device call leaves state unknown. A poisoned `fs` keeps
+        // reporting `SessionPoisoned` (MUTEX_POISONED) so the diagnosis stays
+        // distinguishable; a poisoned device lock reports as a fence.
+        #[cfg(feature = "dangerous-write-support")]
+        {
+            if self.fs.is_poisoned() {
+                self.latch_fence("filesystem lock poisoned: a write panicked");
+                return Err(LuksError::SessionPoisoned);
+            }
+            if self.dev.is_poisoned() {
+                self.latch_fence("device lock poisoned: a panic unwound through a device call");
+            }
+        }
         if let Some(reason) = self.fence_reason() {
             return Err(LuksError::WriteSessionFenced(reason));
         }
-        let guard = self.fs.lock().map_err(|_| LuksError::SessionPoisoned)?;
+        let guard = match self.fs.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                // Poisoned between the check above and the lock. Release the
+                // guard before latching: `latch_fence` takes this same lock.
+                drop(poisoned);
+                #[cfg(feature = "dangerous-write-support")]
+                self.latch_fence("filesystem lock poisoned: a write panicked");
+                return Err(LuksError::SessionPoisoned);
+            }
+        };
         if let Some(reason) = self.fence_reason() {
             return Err(LuksError::WriteSessionFenced(reason));
         }
@@ -607,7 +711,12 @@ impl VolumeHandle {
         // the one write-side action that is still safe after a panic, and
         // leaving the batch live is precisely what this exists to prevent.
         let mut fs = self.fs.lock().unwrap_or_else(|p| p.into_inner());
+        self.fence_writes_locked(&mut fs, reason);
+    }
 
+    /// `fence_writes` for a caller that already holds the `fs` lock.
+    #[cfg(feature = "dangerous-write-support")]
+    fn fence_writes_locked(&self, fs: &mut MountedFs, reason: impl std::fmt::Display) {
         let mut fence = self.write_fence.lock().unwrap_or_else(|p| p.into_inner());
         if fence.is_some() {
             return;
@@ -615,8 +724,16 @@ impl VolumeHandle {
         *fence = Some(reason.to_string());
         drop(fence);
 
-        if let MountedFs::Btrfs(btrfs) = &mut *fs {
+        if let MountedFs::Btrfs(btrfs) = fs {
             btrfs.discard_active_batch();
+        }
+    }
+
+    /// Fence for a poison detected without holding `fs` (no-op if already fenced).
+    #[cfg(feature = "dangerous-write-support")]
+    fn latch_fence(&self, reason: &str) {
+        if self.fence_reason().is_none() {
+            self.fence_writes(reason);
         }
     }
 
@@ -949,6 +1066,8 @@ impl DeviceHandle {
             dev: self.dev.clone(),
             write_fence: Mutex::new(None),
             holds_writer: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "dangerous-write-support")]
+            writers: Mutex::new(WriterTable::default()),
             // Irrelevant when encrypted; armed so the gate is a no-op here.
             plain_writes_armed: std::sync::atomic::AtomicBool::new(true),
         })
@@ -987,6 +1106,8 @@ impl DeviceHandle {
             dev: self.dev.clone(),
             write_fence: Mutex::new(None),
             holds_writer: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "dangerous-write-support")]
+            writers: Mutex::new(WriterTable::default()),
             // Default-closed: a plain volume mounts read-only until the user
             // explicitly consents. See `plain_writes_armed`.
             plain_writes_armed: std::sync::atomic::AtomicBool::new(false),
@@ -1199,7 +1320,8 @@ impl VolumeHandle {
     ///
     /// The cap is not paranoia: the result becomes a Java `byte[]`, and a
     /// gigabyte file would blow the app heap long before the read finished.
-    /// Anything large goes through [`read_chunk`](Self::read_chunk) instead.
+    /// Anything large goes through [`open_file`](Self::open_file) and
+    /// [`read_at`](Self::read_at) instead.
     ///
     /// # Load-bearing: one lock, not two
     ///
@@ -1220,7 +1342,7 @@ impl VolumeHandle {
         if info.size > max_bytes {
             return Err(LuksError::UnsupportedFsFeature(format!(
                 "file is {} bytes, over the {} byte limit for a single read; \
-                 use readChunk",
+                 use openFile/readAt",
                 info.size, max_bytes
             )));
         }
@@ -1238,21 +1360,11 @@ impl VolumeHandle {
         if data.len() as u64 > max_bytes {
             return Err(LuksError::UnsupportedFsFeature(format!(
                 "file is {} bytes, over the {} byte limit for a single read; \
-                 use readChunk",
+                 use openFile/readAt",
                 data.len(), max_bytes
             )));
         }
         Ok(data)
-    }
-
-    /// Fill `buf` from `offset`, returning how many bytes were written.
-    /// A short return means end of file.
-    pub fn read_chunk(&self, path: &str, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        let file = self.fs_for_reading().open(path)?;
-        if !file.file_type().is_file() {
-            return Err(LuksError::IsADirectory(path.to_string()));
-        }
-        self.fs_for_reading().read_open(&file, offset, buf)
     }
 
     /// Stream a file to an `io::Write` destination in chunks, checking for cancellation between chunks.
@@ -1533,6 +1645,7 @@ pub fn device_ref(handle: i64) -> std::result::Result<DeviceHandleRef, &'static 
     match &h.payload {
         Payload::Device(_) => Ok(DeviceHandleRef(h)),
         Payload::Volume(_) => Err("handle is a volume, not a device"),
+        Payload::File(_) => Err("handle is an open file, not a device"),
         #[cfg(feature = "dangerous-write-support")]
         Payload::Writer(_) => Err("handle is a file writer, not a device"),
     }
@@ -1543,6 +1656,7 @@ pub fn volume_ref(handle: i64) -> std::result::Result<VolumeHandleRef, &'static 
     match &h.payload {
         Payload::Volume(_) => Ok(VolumeHandleRef(h)),
         Payload::Device(_) => Err("handle is a device, not a volume"),
+        Payload::File(_) => Err("handle is an open file, not a volume"),
         #[cfg(feature = "dangerous-write-support")]
         Payload::Writer(_) => Err("handle is a file writer, not a volume"),
     }
@@ -1561,6 +1675,7 @@ pub fn writer_ref(handle: i64) -> std::result::Result<WriterHandleRef, &'static 
 enum HandleKind {
     Device,
     Volume,
+    File,
     #[cfg(feature = "dangerous-write-support")]
     Writer,
 }
@@ -1578,6 +1693,7 @@ fn drop_handle(handle: i64, want: HandleKind) {
         let kind = match &entry.payload {
             Payload::Device(_) => HandleKind::Device,
             Payload::Volume(_) => HandleKind::Volume,
+            Payload::File(_) => HandleKind::File,
             #[cfg(feature = "dangerous-write-support")]
             Payload::Writer(_) => HandleKind::Writer,
         };
@@ -1585,13 +1701,43 @@ fn drop_handle(handle: i64, want: HandleKind) {
     } else {
         false
     };
-    if should_remove {
-        map.remove(&id);
-    }
+    // Remove under the lock, but drop the Arc only after releasing it: the
+    // last reference runs `VolumeHandle::drop`, whose final commit does device
+    // I/O and must not block every other handle lookup (H1).
+    let removed = if should_remove { map.remove(&id) } else { None };
+    drop(lock);
+    drop(removed);
 }
 
 pub fn drop_device(handle: i64) {
     drop_handle(handle, HandleKind::Device)
+}
+
+pub fn drop_file(handle: i64) {
+    drop_handle(handle, HandleKind::File)
+}
+
+/// A reference to an open-file handle in the registry. Keeps the entry alive
+/// for the duration of a call even if another thread closes it meanwhile.
+#[derive(Clone)]
+pub struct FileHandleRef(Arc<Handle>);
+
+impl std::ops::Deref for FileHandleRef {
+    type Target = OpenFileHandle;
+    fn deref(&self) -> &OpenFileHandle {
+        match &self.0.payload {
+            Payload::File(f) => f,
+            _ => unreachable!("FileHandleRef invariant violated"),
+        }
+    }
+}
+
+pub fn file_ref(handle: i64) -> std::result::Result<FileHandleRef, &'static str> {
+    let h = handle_ref(handle)?;
+    match &h.payload {
+        Payload::File(_) => Ok(FileHandleRef(h)),
+        _ => Err("handle is not an open file"),
+    }
 }
 
 pub fn drop_volume(handle: i64) {
@@ -1601,6 +1747,43 @@ pub fn drop_volume(handle: i64) {
 #[cfg(feature = "dangerous-write-support")]
 pub fn drop_writer(handle: i64) {
     drop_handle(handle, HandleKind::Writer)
+}
+
+/// F4-A5: end the volume's session, then drop its handle. Returns the final
+/// close result (open-writer release + btrfs commit) so Java learns whether
+/// acknowledged files reached the medium. The handle is dropped either way.
+/// An unknown/already-closed handle is `Ok` (idempotent).
+pub fn close_volume(handle: i64) -> Result<()> {
+    let outcome = match volume_ref(handle) {
+        #[cfg(feature = "dangerous-write-support")]
+        Ok(vol) => vol.close(),
+        #[cfg(not(feature = "dangerous-write-support"))]
+        Ok(_) => Ok(()),
+        Err(_) => Ok(()),
+    };
+    drop_volume(handle);
+    outcome
+}
+
+/// F4-A4: `nativeCloseWriter`. The global writer handle is always removed.
+/// * unknown writer handle -> `BadHandle` (nothing to leak);
+/// * volume already gone -> `Ok`: its close released the writer (A5);
+/// * writer already finished/released inside a live volume -> `Ok`.
+#[cfg(feature = "dangerous-write-support")]
+pub fn close_writer_handle(volume: i64, writer: i64) -> std::result::Result<(), WriterError> {
+    let wh = writer_ref(writer).map_err(WriterError::BadHandle)?;
+    if wh.volume_handle != volume {
+        return Err(WriterError::BadHandle("writer belongs to another volume"));
+    }
+    let outcome = match volume_ref(volume) {
+        Ok(vol) if vol.id == wh.volume_id => match vol.abandon_file(wh.writer_id) {
+            Err(WriterError::BadHandle(_)) => Ok(()),
+            other => other,
+        },
+        _ => Ok(()),
+    };
+    drop_writer(writer);
+    outcome
 }
 
 #[cfg(test)]
@@ -1730,11 +1913,13 @@ mod tests {
     }
 
     #[test]
-    fn read_chunk_reads_from_the_middle_and_stops_at_eof() {
+    fn read_at_reads_from_the_middle_and_stops_at_eof() {
         let vol = unlock_fixture();
+        let file = vol.open_file("/proof.txt").unwrap();
         let mut buf = [0u8; 64];
-        let got = vol.read_chunk("/proof.txt", 6, &mut buf).unwrap();
+        let got = vol.read_at(&file, 6, &mut buf).unwrap();
         assert_eq!(&buf[..got], b"disk stack works\n");
+        assert_eq!(vol.read_at(&file, 1 << 20, &mut buf).unwrap(), 0, "past EOF reads nothing");
     }
 
     #[test]
@@ -1805,7 +1990,17 @@ mod tests {
         use std::sync::mpsc;
         use std::time::Duration;
 
+        /// Deletes the scratch image on drop, including during panic unwind.
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                if let Err(e) = std::fs::remove_file(&self.0) {
+                    eprintln!("scratch cleanup failed: {e}");
+                }
+            }
+        }
         let scratch_path = std::env::temp_dir().join("luks-jni-read-file-race.img");
+        let _scratch_guard = Scratch(scratch_path.clone());
         std::fs::copy(
             concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -1875,8 +2070,6 @@ mod tests {
              against, not bytes read from a file that changed size after \
              the check ran under a separate lock acquisition"
         );
-
-        let _ = std::fs::remove_file(&scratch_path);
     }
 
     /// `sha256_json` streams; `read_file` slurps. They must agree, or the
@@ -2401,6 +2594,9 @@ mod tests {
         std::fs::write(&fat32_path, &fat32_buf).expect("write FAT32 scratch image");
         let fs_dev = luks_core::device::FileDevice::open(&fat32_path).expect("open FAT32 scratch");
         let fs_len = fs_dev.len().unwrap();
+        // Unlink now: the open fd keeps the image alive, and nothing is left in
+        // $TMPDIR even if an assertion below panics.
+        std::fs::remove_file(&fat32_path).expect("unlink FAT32 scratch");
         let disk = TestMbrDisk::new(fs_dev, 0x0C);
         let total_blocks = (512 + fs_len) / 512;
         let dev = DeviceHandle::new(disk, 512, total_blocks, "TEST".into(), "FAT32".into())
@@ -2422,6 +2618,9 @@ mod tests {
         let fs_len = std::fs::metadata(&scratch).unwrap().len();
         let fs_dev = luks_core::device::FileDevice::open_writable(&scratch, fs_len)
             .expect("open scratch writable");
+        // Unlink now: the open fd keeps the image alive, and nothing is left in
+        // $TMPDIR even if the test panics.
+        std::fs::remove_file(&scratch).expect("unlink scratch");
         let disk = TestMbrDisk::new(fs_dev, 0x83);
         let dev = DeviceHandle::new(disk, 512, (512 + fs_len) / 512, "T".into(), "E".into())
             .expect("scan MBR disk");

@@ -375,6 +375,26 @@ impl<D: ReadAt> Btrfs<D> {
         }))
     }
 
+    /// The **current** root of the tree with this objectid, as of now.
+    ///
+    /// A tree's root bytenr moves on every commit (copy-on-write), so a root
+    /// captured earlier may point at blocks a later transaction has freed and
+    /// reused. Anything held across a lock release must hold the objectid and
+    /// call this on each use (R3r). Sees the active batch, like `fs_tree`.
+    ///
+    /// `Ok(None)` means the subvolume no longer exists (deleted since the
+    /// caller last looked); the top-level tree always exists.
+    pub fn current_tree(&self, objectid: u64) -> Result<Option<TreeRoot>> {
+        let target = self.target_tree();
+        if target.objectid == objectid {
+            return Ok(Some(target));
+        }
+        if objectid == tree::FS_TREE_OBJECTID {
+            return Ok(Some(self.fs_tree()));
+        }
+        self.find_tree_root(objectid)
+    }
+
     pub fn fs_tree(&self) -> TreeRoot {
         #[cfg(feature = "dangerous-write-support")]
         if let Some(ref batch) = self.active_batch {

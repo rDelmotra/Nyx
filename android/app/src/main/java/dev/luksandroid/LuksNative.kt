@@ -105,8 +105,30 @@ internal object LuksNative {
     /** Whole file. Throws rather than exceeding [maxBytes], which must fit the heap. */
     external fun nativeReadFile(handle: Long, path: String, maxBytes: Long): ByteArray
 
-    /** Up to [len] bytes at [offset]. A short result means end of file. */
-    external fun nativeReadChunk(handle: Long, path: String, offset: Long, len: Int): ByteArray
+    /**
+     * Resolves [path] once and returns a read handle that pins the file by identity (inode
+     * number plus generation). Close it with [nativeCloseFile].
+     */
+    external fun nativeOpenFile(handle: Long, path: String): Long
+
+    /**
+     * Up to [len] bytes at [offset] of an open file, read by inode and never by path. A short
+     * result means end of file. Throws [LuksException.FILE_CHANGED] if the file was deleted,
+     * replaced or modified since [nativeOpenFile]; it never returns another file's bytes.
+     */
+    external fun nativeReadAt(volume: Long, file: Long, offset: Long, len: Int): ByteArray
+
+    /**
+     * Size of an open file, from the handle: identity-checked, no second path lookup. Throws
+     * [LuksException.FILE_CHANGED] if the file is no longer the one that was opened.
+     */
+    external fun nativeFileSize(volume: Long, file: Long): Long
+
+    /** `[verified, unverified]` bytes [nativeReadAt] has returned on [file] so far. */
+    external fun nativeFileCoverage(file: Long): LongArray
+
+    /** Releases an open-file handle. Idempotent; safe from a `finally`. */
+    external fun nativeCloseFile(file: Long)
 
     /**
      * Streams the file through SHA-256 without materialising it, returning JSON

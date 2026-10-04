@@ -8,10 +8,15 @@ import java.io.InputStream
  * source [TreeImporter] reads from: `sourceId` here is the absolute volume
  * path, exactly what [VolumeChildSource] puts in [RawChild.id].
  *
- * Reads through [LuksVolume.readChunk] rather than [LuksVolume.readFile],
- * which caps at a few MiB by default and would quietly truncate anything
+ * Reads through an [LuksVolume.openFile] handle and [LuksVolume.readAt] rather than
+ * [LuksVolume.readFile], which caps at a few MiB by default and would quietly truncate anything
  * larger. Streaming also keeps peak memory at one chunk regardless of file
  * size, which matters on a phone exporting a video.
+ *
+ * The path is resolved once, when the stream first reads. Every chunk then reads by
+ * identity, so a file deleted or replaced mid-export fails the stream with
+ * [dev.luksandroid.LuksException.FILE_CHANGED] instead of splicing another file's bytes into
+ * the copy.
  */
 class VolumeSourceBytes(
     private val volume: LuksVolume,
@@ -35,6 +40,8 @@ private class VolumeInputStream(
 ) : InputStream() {
 
     private var offset = 0L
+    private var file = 0L
+    private var closed = false
     private var buffer = ByteArray(0)
     private var bufferPos = 0
 
@@ -48,7 +55,9 @@ private class VolumeInputStream(
      */
     private fun fill(): Boolean {
         if (bufferPos < buffer.size) return true
-        val chunk = volume.readChunk(path, offset, chunkBytes)
+        if (closed) throw java.io.IOException("stream is closed")
+        if (file == 0L) file = volume.openFile(path)
+        val chunk = volume.readAt(file, offset, chunkBytes)
         if (chunk.isEmpty()) return false
         buffer = chunk
         bufferPos = 0
@@ -71,4 +80,14 @@ private class VolumeInputStream(
     }
 
     override fun available(): Int = buffer.size - bufferPos
+
+    override fun close() {
+        if (closed) return
+        closed = true
+        buffer = ByteArray(0)
+        bufferPos = 0
+        val f = file
+        file = 0L
+        if (f != 0L) volume.closeFile(f)
+    }
 }

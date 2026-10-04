@@ -593,49 +593,56 @@ open class TransferController {
                 throw IllegalStateException("Cannot determine file size for export")
             }
 
-            val stream = context.contentResolver.openOutputStream(targetUri)
-                ?: throw IllegalStateException("Could not open destination URI for writing")
+            // Resolved once. Each chunk reads by identity, so a delete or replace of the source
+            // between chunks fails the export (FILE_CHANGED) instead of splicing another
+            // file's bytes into the copy.
+            val file = volume.openFile(path)
+            try {
+                val stream = context.contentResolver.openOutputStream(targetUri)
+                    ?: throw IllegalStateException("Could not open destination URI for writing")
+                stream.use { out ->
+                    while (done < totalBytes && currentCoroutineContext().isActive) {
+                        if (isTransferCancelled(transferId)) {
+                            throw CancellationException("Transfer cancelled")
+                        }
 
-            stream.use { out ->
-                while (done < totalBytes && currentCoroutineContext().isActive) {
-                    if (isTransferCancelled(transferId)) {
-                        throw CancellationException("Transfer cancelled")
-                    }
+                        val toRead = (totalBytes - done).coerceAtMost(CHUNK_SIZE.toLong()).toInt()
+                        val chunk = volume.readAt(file, done, toRead)
+                        if (chunk.isEmpty()) break
 
-                    val toRead = (totalBytes - done).coerceAtMost(CHUNK_SIZE.toLong()).toInt()
-                    val chunk = volume.readChunk(path, done, toRead)
-                    if (chunk.isEmpty()) break
+                        try {
+                            out.write(chunk)
+                        } finally {
+                            java.util.Arrays.fill(chunk, 0.toByte())
+                        }
+                        done += chunk.size
 
-                    try {
-                        out.write(chunk)
-                    } finally {
-                        java.util.Arrays.fill(chunk, 0.toByte())
-                    }
-                    done += chunk.size
+                        val now = System.currentTimeMillis()
+                        val dt = now - lastUpdateMs
+                        if (dt >= 200 || done >= totalBytes) {
+                            val speed = if (dt > 0) ((done - lastUpdateBytes) * 1000L) / dt else 0L
+                            val totalElapsedSec = (now - started) / 1000.0
+                            val avgSpeed = if (totalElapsedSec > 0) (done / totalElapsedSec).toLong() else speed
+                            val currentSpeed = if (speed > 0) speed else avgSpeed
+                            val remainingBytes = (totalBytes - done).coerceAtLeast(0L)
+                            val eta = if (currentSpeed > 0) remainingBytes / currentSpeed else 0L
 
-                    val now = System.currentTimeMillis()
-                    val dt = now - lastUpdateMs
-                    if (dt >= 200 || done >= totalBytes) {
-                        val speed = if (dt > 0) ((done - lastUpdateBytes) * 1000L) / dt else 0L
-                        val totalElapsedSec = (now - started) / 1000.0
-                        val avgSpeed = if (totalElapsedSec > 0) (done / totalElapsedSec).toLong() else speed
-                        val currentSpeed = if (speed > 0) speed else avgSpeed
-                        val remainingBytes = (totalBytes - done).coerceAtLeast(0L)
-                        val eta = if (currentSpeed > 0) remainingBytes / currentSpeed else 0L
+                            lastUpdateMs = now
+                            lastUpdateBytes = done
 
-                        lastUpdateMs = now
-                        lastUpdateBytes = done
-
-                        updateTransfer(transferId) {
-                            it.copy(
-                                transferredBytes = done,
-                                speedBytesPerSec = currentSpeed,
-                                etaSeconds = eta,
-                            )
+                            updateTransfer(transferId) {
+                                it.copy(
+                                    transferredBytes = done,
+                                    speedBytesPerSec = currentSpeed,
+                                    etaSeconds = eta,
+                                )
+                            }
                         }
                     }
+                    out.flush()
                 }
-                out.flush()
+            } finally {
+                runCatching { volume.closeFile(file) }
             }
 
             if (isTransferCancelled(transferId)) {

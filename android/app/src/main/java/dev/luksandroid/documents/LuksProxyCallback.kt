@@ -50,6 +50,17 @@ open class LuksProxyCallback(
     /** The offset the next [onWrite] must arrive with -- see the class doc for why. */
     private var expectedNextOffset: Long = 0L
 
+    /**
+     * The read handle for [documentId], opened on the first [onRead] and closed in
+     * [onRelease]; 0 when none is open. One path resolution per proxy rather than one per
+     * read, and every read is by identity: a file deleted or replaced under an open proxy
+     * fails with EIO ([LuksException.FILE_CHANGED]) instead of serving another file's bytes.
+     */
+    private var readFile: Long = 0L
+
+    /** The volume [readFile] was opened on, so it can be closed without a session lease. */
+    private var readVolume: LuksVolume? = null
+
     /** Whether this callback currently holds [TransferManager]'s SAF write lock. */
     private var writeLockHeld: Boolean = false
 
@@ -70,10 +81,12 @@ open class LuksProxyCallback(
         if (mode == "w" || mode == "wt") {
             return expectedNextOffset
         }
+        // The size comes from the read handle (identity-checked), not from a second path
+        // lookup that could name a different file than the one onRead is pinned to.
         return try {
             runBlocking {
                 session.withLease { volume ->
-                    volume.fileInfo(documentId).size
+                    volume.fileSizeOf(ensureReadHandle(volume))
                 }
             }
         } catch (e: ErrnoException) {
@@ -89,7 +102,7 @@ open class LuksProxyCallback(
         return try {
             runBlocking {
                 session.withLease { volume ->
-                    val chunk = volume.readChunk(documentId, offset, size.toLong())
+                    val chunk = volume.readAt(ensureReadHandle(volume), offset, size)
                     if (chunk.isEmpty()) {
                         0
                     } else {
@@ -207,9 +220,10 @@ open class LuksProxyCallback(
     }
 
     override fun onRelease() {
+        closeReadHandle()
         if (mode != "w" && mode != "wt") {
-            // Read-mode proxies never own a pending entry or the transfer lock -- nothing to
-            // release here. (Kept as an explicit early return, rather than folding into the
+            // Read-mode proxies never own a pending entry or the transfer lock -- nothing but
+            // the read handle (closed above) to release here. (Kept as an explicit early return, rather than folding into the
             // logic below, so the DEFECT 3 materialization path below can never accidentally
             // run for a read proxy.)
             return
@@ -322,6 +336,26 @@ open class LuksProxyCallback(
             PendingDocuments.remove(documentId)
             releaseWriteLockIfHeld()
         }
+    }
+
+    /** Opens the read handle on first use (one path resolution per proxy). */
+    private fun ensureReadHandle(volume: LuksVolume): Long {
+        if (readFile == 0L) {
+            readFile = volume.openFile(documentId)
+            readVolume = volume
+        }
+        return readFile
+    }
+
+    /** Closes the read handle if one was opened. Needs no lease: only the native id. */
+    private fun closeReadHandle() {
+        val f = readFile
+        val v = readVolume
+        if (f == 0L) return
+        readFile = 0L
+        readVolume = null
+        runCatching { checkNotNull(v).closeFile(f) }
+            .onFailure { Trace.e("LuksProxyCallback: closing the read handle failed: ${throwableSummary(it)}") }
     }
 
     /** Discards the in-progress writer and every trace of this write attempt. */

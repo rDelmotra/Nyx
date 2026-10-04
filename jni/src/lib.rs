@@ -82,6 +82,16 @@ impl From<LuksError> for Fail {
     }
 }
 
+#[cfg(feature = "dangerous-write-support")]
+impl From<bridge::WriterError> for Fail {
+    fn from(e: bridge::WriterError) -> Self {
+        match e {
+            bridge::WriterError::BadHandle(m) => Fail::Msg(bridge::code::BAD_HANDLE, m.to_string()),
+            bridge::WriterError::Luks(e) => Fail::Luks(e),
+        }
+    }
+}
+
 impl Fail {
     fn parts(&self) -> (i32, String) {
         match self {
@@ -305,8 +315,9 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeCloseVolume<'l>(
 ) {
     guard(&mut env, (), |_env| {
         log::i("nativeCloseVolume");
-        bridge::drop_volume(handle);
-        Ok(())
+        // Throws LuksException if the final close (open-writer release or the
+        // btrfs batch commit) failed; the handle is dropped either way.
+        Ok(bridge::close_volume(handle)?)
     })
 }
 
@@ -550,32 +561,123 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeReadFile<'l>(
     })
 }
 
-/// Read up to `len` bytes at `offset`. A shorter result means end of file.
+/// Pin the file at `path` by identity and return a read handle (F4 B1).
 ///
-/// Returns a fresh array rather than filling a caller-supplied one: writing into
-/// a Java array from Rust means handing out a `&mut [i8]` aliasing JVM memory,
-/// and the copy is not the bottleneck at USB speeds.
+/// The path is resolved exactly once, here. Reads go through
+/// [`nativeReadAt`](Java_dev_luksandroid_LuksNative_nativeReadAt) by inode and
+/// are refused with `FILE_CHANGED` if the file is deleted, replaced or modified
+/// after this call. Close with `nativeCloseFile`.
 #[no_mangle]
-pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeReadChunk<'l>(
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeOpenFile<'l>(
     mut env: JNIEnv<'l>,
     _class: JClass<'l>,
     handle: jlong,
     path: JString<'l>,
+) -> jlong {
+    guard(&mut env, 0, |env| {
+        let vol = bridge::volume_ref(handle).map_err(bad_handle)?;
+        let path = jstr(env, &path)?;
+        let file = vol.open_file(&path)?;
+        Ok(bridge::into_raw(bridge::Payload::File(file)))
+    })
+}
+
+/// Read up to `len` bytes at `offset` of an open file. A shorter result means
+/// end of file.
+///
+/// Returns a fresh array rather than filling a caller-supplied one: writing into
+/// a Java array from Rust means handing out a `&mut [i8]` aliasing JVM memory,
+/// and the copy is not the bottleneck at USB speeds.
+///
+/// Failures name the offset and the handle, never a path.
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeReadAt<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    volume: jlong,
+    file: jlong,
     offset: jlong,
     len: jint,
 ) -> jbyteArray {
     guard(&mut env, std::ptr::null_mut(), |env| {
-        let vol = bridge::volume_ref(handle).map_err(bad_handle)?;
-        let path = jstr(env, &path)?;
+        let vol = bridge::volume_ref(volume).map_err(bad_handle)?;
+        let fh = bridge::file_ref(file).map_err(bad_handle)?;
+        if fh.volume_id() != vol.id {
+            return Err(bad_handle("file belongs to another volume"));
+        }
         if offset < 0 || len <= 0 {
             return Err(Fail::Msg(
                 bridge::code::GENERIC,
-                format!("bad chunk request offset={offset} len={len}"),
+                format!("bad read request file={file} offset={offset} len={len}"),
             ));
         }
         let mut buf = vec![0u8; (len as usize).min(16 * 1024 * 1024)];
-        let got = vol.read_chunk(&path, offset as u64, &mut buf)?;
+        let got = vol.read_at(&fh, offset as u64, &mut buf).map_err(|e| {
+            Fail::Msg(
+                bridge::error_code(&e),
+                format!("read of file handle {file} at offset {offset} failed: {e}"),
+            )
+        })?;
         out_bytes(env, &buf[..got])
+    })
+}
+
+/// Size of an open file, taken from the handle (identity-checked), not from a
+/// second path lookup. `FILE_CHANGED` if the file is no longer the one opened.
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeFileSize<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    volume: jlong,
+    file: jlong,
+) -> jlong {
+    guard(&mut env, 0, |_env| {
+        let vol = bridge::volume_ref(volume).map_err(bad_handle)?;
+        let fh = bridge::file_ref(file).map_err(bad_handle)?;
+        if fh.volume_id() != vol.id {
+            return Err(bad_handle("file belongs to another volume"));
+        }
+        let size = vol.file_size(&fh).map_err(|e| {
+            Fail::Msg(
+                bridge::error_code(&e),
+                format!("size of file handle {file} failed: {e}"),
+            )
+        })?;
+        Ok(size as jlong)
+    })
+}
+
+/// Cumulative `[verified, unverified]` bytes `nativeReadAt` has returned on
+/// this handle. Verified = matched against a stored data checksum (btrfs).
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeFileCoverage<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    file: jlong,
+) -> jni::sys::jlongArray {
+    guard(&mut env, std::ptr::null_mut(), |env| {
+        let fh = bridge::file_ref(file).map_err(bad_handle)?;
+        let (verified, unverified) = fh.coverage();
+        let arr = env.new_long_array(2).map_err(|e| {
+            Fail::Msg(bridge::code::GENERIC, format!("jni: new long[2] failed: {e}"))
+        })?;
+        env.set_long_array_region(&arr, 0, &[verified as jlong, unverified as jlong])
+            .map_err(|e| Fail::Msg(bridge::code::GENERIC, format!("jni: set long[] failed: {e}")))?;
+        Ok(arr.into_raw())
+    })
+}
+
+/// Release an open-file handle. Idempotent: an unknown or already-closed
+/// handle is not an error (a close must be safe to call from a `finally`).
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeCloseFile<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    file: jlong,
+) {
+    guard(&mut env, (), |_env| {
+        bridge::drop_file(file);
+        Ok(())
     })
 }
 
@@ -760,12 +862,12 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeBeginFile<'l>(
         let vol = bridge::volume_ref(volume).map_err(bad_handle)?;
         let size = u64::try_from(size)
             .map_err(|_| Fail::Msg(bridge::code::GENERIC, "negative file size".into()))?;
-        let writer = vol.begin_file(size)?;
+        let writer_id = vol.begin_file(size)?;
         Ok(bridge::into_raw(bridge::Payload::Writer(
             bridge::WriterHandle {
                 volume_handle: volume,
                 volume_id: vol.id,
-                writer: std::sync::Mutex::new(Some(writer)),
+                writer_id,
             },
         )))
     })
@@ -780,12 +882,12 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeBeginFileStreaming<
 ) -> jlong {
     guard(&mut env, 0, |_env| {
         let vol = bridge::volume_ref(volume).map_err(bad_handle)?;
-        let writer = vol.begin_file_streaming()?;
+        let writer_id = vol.begin_file_streaming()?;
         Ok(bridge::into_raw(bridge::Payload::Writer(
             bridge::WriterHandle {
                 volume_handle: volume,
                 volume_id: vol.id,
-                writer: std::sync::Mutex::new(Some(writer)),
+                writer_id,
             },
         )))
     })
@@ -823,11 +925,7 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeWriteChunk<'l>(
         }
 
         let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-        let mut slot = wh.writer.lock().unwrap_or_else(|p| p.into_inner());
-        let state = slot
-            .as_mut()
-            .ok_or_else(|| bad_handle("writer is finished or closed"))?;
-        Ok(vol.write_file_chunk(state, slice)?)
+        Ok(vol.write_file_chunk(wh.writer_id, slice)?)
     })
 }
 
@@ -864,12 +962,8 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeWriteChunkWithCance
         }
 
         let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-        let mut slot = wh.writer.lock().unwrap_or_else(|p| p.into_inner());
-        let state = slot
-            .as_mut()
-            .ok_or_else(|| bad_handle("writer is finished or closed"))?;
         let token = if cancel_token > 0 { cancel_token as u64 } else { 0 };
-        Ok(vol.write_file_chunk_with_cancel(state, slice, token)?)
+        Ok(vol.write_file_chunk_with_cancel(wh.writer_id, slice, token)?)
     })
 }
 
@@ -891,14 +985,10 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeFinishFile<'l>(
         }
         let parent_path = jstr(env, &parent_path)?;
         let name = jstr(env, &name)?;
-        let state = wh
-            .writer
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .take()
-            .ok_or_else(|| bad_handle("writer is finished or closed"))?;
         let start = std::time::Instant::now();
-        let result = vol.finish_file(state, &parent_path, &name);
+        // The volume releases the writer on every error path (F4-A3); the
+        // global handle is spent either way.
+        let result = vol.finish_file(wh.writer_id, &parent_path, &name);
         bridge::drop_writer(writer);
         let ino = result?;
         log::i(&format!("nativeFinishFile: file finished in {} ms", start.elapsed().as_millis()));
@@ -931,19 +1021,8 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeCloseWriter<'l>(
     writer: jlong,
 ) {
     guard(&mut env, (), |_env| {
-        let vol = bridge::volume_ref(volume).map_err(bad_handle)?;
-        let wh = bridge::writer_ref(writer).map_err(bad_handle)?;
-        if wh.volume_id != vol.id {
-            return Err(bad_handle("writer belongs to another volume"));
-        }
-        let abandon_res = if let Some(state) = wh.writer.lock().unwrap_or_else(|p| p.into_inner()).take() {
-            vol.abandon_file(state)
-        } else {
-            Ok(())
-        };
-        bridge::drop_writer(writer);
-        abandon_res?;
-        Ok(())
+        // Idempotent after the volume is gone (F4-A4): see `close_writer_handle`.
+        Ok(bridge::close_writer_handle(volume, writer)?)
     })
 }
 

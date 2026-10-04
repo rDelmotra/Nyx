@@ -308,6 +308,15 @@ pub enum LuksError {
 
     #[error("cannot write to read-only plain volume")]
     ReadOnlyVolume,
+
+    /// A file that was open for reading is no longer the file it was opened
+    /// as: deleted, replaced by another file that reused its inode number, or
+    /// modified in place. The read is refused rather than answered with
+    /// whatever now lives there (INV-4: never another file's bytes).
+    ///
+    /// Carries no path: the caller holds a handle, and error text reaches logs.
+    #[error("the file changed or was replaced while it was open")]
+    FileChanged,
 }
 
 impl LuksError {

@@ -487,6 +487,27 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
         }
         Ok(())
     }
+
+    /// Release a writer's in-memory state on a session that must not touch the
+    /// medium again (fenced or poisoned). **Never commits**, unlike
+    /// [`abandon_file`](Self::abandon_file), which commits earlier pending files
+    /// as a courtesy. Clears `has_open_writer` and, if a batch still exists,
+    /// returns the writer's runs to its ledger. A fence normally discards the
+    /// batch already, in which case there is nothing to return.
+    ///
+    /// The result reports a ledger disagreement (W16) for the caller to log; it
+    /// is never a reason to keep the writer.
+    pub fn forget_writer(&mut self, writer: BtrfsFileWriter) -> Result<()> {
+        self.has_open_writer = false;
+        crate::forensic::record_btrfs(crate::forensic::BtrfsEvent::AbandonFile {
+            runs_count: writer.data_runs.len(),
+            total_bytes: writer.written_bytes,
+        });
+        match self.active_batch.as_mut() {
+            Some(batch) => release_runs(batch, &writer.data_runs),
+            None => Ok(()),
+        }
+    }
 }
 
 /// Release every run from the batch's reservation ledger. All runs are

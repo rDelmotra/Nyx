@@ -33,8 +33,6 @@ RED=(
   "W6|$KT '*TransferIntegrityRedTest.w6_*'"
   "C1|$KT '*TransferIntegrityRedTest.c1_*'"
   "C5|$KT '*TransferIntegrityRedTest.c5_cancelRecorded*'"
-  "N3-ext4|$JNI n3_export_chunks_never_stitch_another_file_ext4"
-  "N3-btrfs|$JNI n3_export_chunks_never_stitch_another_file_btrfs"
 )
 
 LOGDIR="$(mktemp -d -t known-red)"

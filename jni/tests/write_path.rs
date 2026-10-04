@@ -511,8 +511,8 @@ fn a_streaming_writer_closed_before_finish_leaves_no_orphan_behind() {
     let path = scratch("streaming-abandon");
     {
         let vol = unlock(&path);
-        let mut writer = vol.begin_file(1024).expect("begin");
-        vol.write_file_chunk(&mut writer, b"halfway there").expect("chunk");
+        let writer = vol.begin_file(1024).expect("begin");
+        vol.write_file_chunk(writer, b"halfway there").expect("chunk");
         vol.abandon_file(writer).expect("abandon"); // explicitly abandon before finish
     }
 
@@ -546,12 +546,12 @@ fn a_streaming_writer_that_collides_on_finish_rolls_back_cleanly() {
         let vol = unlock(&path);
         vol.write_file("/", "existing.txt", b"already here").expect("first");
 
-        let mut writer = vol.begin_file(1024).expect("begin");
-        vol.write_file_chunk(&mut writer, &vec![0u8; 1024]).expect("chunk");
+        let writer = vol.begin_file(1024).expect("begin");
+        vol.write_file_chunk(writer, &vec![0u8; 1024]).expect("chunk");
         let err = vol.finish_file(writer, "/", "existing.txt").expect_err("finish duplicate");
         
         assert_eq!(
-            error_code(&err),
+            err.code(),
             code::ALREADY_EXISTS,
             "collision must report ALREADY_EXISTS, not corruption: {err}"
         );
@@ -593,11 +593,11 @@ fn a_streaming_write_of_unknown_size_is_readable_by_the_kernel() {
 
     let ino = {
         let vol = unlock(&path);
-        let mut writer = vol.begin_file_streaming().expect("begin_file_streaming");
+        let writer = vol.begin_file_streaming().expect("begin_file_streaming");
         // Write in pieces, as a transfer whose total length is not known
         // upfront would arrive.
-        vol.write_file_chunk(&mut writer, &content[..10]).expect("chunk 1");
-        vol.write_file_chunk(&mut writer, &content[10..]).expect("chunk 2");
+        vol.write_file_chunk(writer, &content[..10]).expect("chunk 1");
+        vol.write_file_chunk(writer, &content[10..]).expect("chunk 2");
         vol.finish_file(writer, "/", "unknown-size.txt").expect("finish")
     };
     assert!(ino > 0, "expected a real inode/objectid, got {ino}");
@@ -643,7 +643,7 @@ fn a_second_writer_is_refused_while_a_streaming_writer_is_live() {
     let first = handle.unlock(offset, PASSWORD).expect("first unlock");
     let second = handle.unlock(offset, PASSWORD).expect("second unlock");
 
-    let mut writer = first.begin_file_streaming().expect("begin_file_streaming");
+    let writer = first.begin_file_streaming().expect("begin_file_streaming");
     let err = second
         .begin_file_streaming()
         .err()
@@ -657,7 +657,7 @@ fn a_second_writer_is_refused_while_a_streaming_writer_is_live() {
     // The second volume can still read while the first holds the writer.
     second.list_dir_json("/").expect("the second volume must still read");
 
-    first.write_file_chunk(&mut writer, b"still holding the claim").expect("chunk");
+    first.write_file_chunk(writer, b"still holding the claim").expect("chunk");
     first.abandon_file(writer).expect("abandon");
 }
 
@@ -671,8 +671,8 @@ fn an_abandoned_streaming_writer_leaves_no_orphan_behind() {
     let path = scratch("streaming-unknown-abandon");
     {
         let vol = unlock(&path);
-        let mut writer = vol.begin_file_streaming().expect("begin_file_streaming");
-        vol.write_file_chunk(&mut writer, b"never finished").expect("chunk");
+        let writer = vol.begin_file_streaming().expect("begin_file_streaming");
+        vol.write_file_chunk(writer, b"never finished").expect("chunk");
         vol.abandon_file(writer).expect("abandon"); // explicitly abandon before finish
     }
 
@@ -1196,11 +1196,11 @@ fn cancellation_token_halts_streaming_sha256_and_chunk_writes() {
     assert_eq!(error_code(&err_sha), code::CANCELLED);
 
     // 2. Test streaming chunk write cancellation
-    let mut writer = vol.begin_file(1024).expect("begin_file");
+    let writer = vol.begin_file(1024).expect("begin_file");
     let err_write = vol
-        .write_file_chunk_with_cancel(&mut writer, &[0x42u8; 128], token)
+        .write_file_chunk_with_cancel(writer, &[0x42u8; 128], token)
         .unwrap_err();
-    assert_eq!(error_code(&err_write), code::CANCELLED);
+    assert_eq!(err_write.code(), code::CANCELLED);
     vol.abandon_file(writer).expect("abandon");
 
     // 3. Test read_file_stream cancellation

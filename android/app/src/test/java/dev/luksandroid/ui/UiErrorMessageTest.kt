@@ -37,9 +37,10 @@ class UiErrorMessageTest {
             LuksException.MUTEX_POISONED to "Drive state was compromised",
             LuksException.CANCELLED to "cancelled",
             LuksException.WRITE_SESSION_FENCED to "Lock and unlock the volume again",
+            LuksException.FILE_CHANGED to "changed or replaced",
         )
 
-        assertEquals("Must test exactly 20 error codes", 20, codes.size)
+        assertEquals("Must test exactly 21 error codes", 21, codes.size)
 
         for ((code, keyword) in codes) {
             val msg = UiErrorMessage.getBaseMessage(code)

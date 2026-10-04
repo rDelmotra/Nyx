@@ -289,12 +289,12 @@ fn test_concurrent_writer_and_drop_volume_or_writer() {
 
     let vol_h = into_raw(Payload::Volume(vol));
     let vol_ref = volume_ref(vol_h).expect("valid volume handle");
-    let writer_enum = vol_ref.begin_file(1024).expect("begin file");
+    let writer_id = vol_ref.begin_file(1024).expect("begin file");
 
     let writer_h = into_raw(Payload::Writer(WriterHandle {
         volume_handle: vol_h,
         volume_id: vol_ref.id,
-        writer: std::sync::Mutex::new(Some(writer_enum)),
+        writer_id,
     }));
 
     let stop_signal = Arc::new(AtomicBool::new(false));
@@ -310,14 +310,8 @@ fn test_concurrent_writer_and_drop_volume_or_writer() {
         while !stop.load(Ordering::Relaxed) {
             match (volume_ref(vol_h), writer_ref(writer_h)) {
                 (Ok(v), Ok(w)) => {
-                    let mut guard = w.writer.lock().unwrap();
-                    if let Some(state) = guard.as_mut() {
-                        let res = v.write_file_chunk(state, &chunk);
-                        if res.is_ok() {
-                            success.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            failed.fetch_add(1, Ordering::Relaxed);
-                        }
+                    if v.write_file_chunk(w.writer_id, &chunk).is_ok() {
+                        success.fetch_add(1, Ordering::Relaxed);
                     } else {
                         failed.fetch_add(1, Ordering::Relaxed);
                     }

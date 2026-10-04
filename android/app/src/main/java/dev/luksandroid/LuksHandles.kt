@@ -337,20 +337,51 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
     }
 
     /**
-     * Up to [len] bytes at [offset]. A result shorter than [len] means end of
-     * file; an empty result means there was nothing left.
-     *
-     * This is the only way to move a large file: [readFile] has to materialise
-     * the whole thing as a Java `byte[]`, which the app heap will not survive
-     * for a multi-gigabyte file.
+     * Pins the file at [path] by identity and returns a read handle (never 0). The path is
+     * resolved here, once; every [readAt] on the handle reads by inode. Pair with [closeFile].
      */
-    open fun readChunk(path: String, offset: Long, len: Int): ByteArray {
+    open fun openFile(path: String): Long {
         check(handle != 0L) { "volume is closed" }
-        return LuksNative.nativeReadChunk(handle, path, offset, len)
+        return LuksNative.nativeOpenFile(handle, path)
     }
 
-    open fun readChunk(path: String, offset: Long, len: Long): ByteArray =
-        readChunk(path, offset, len.coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
+    /**
+     * Up to [len] bytes at [offset] of the file [file] was opened as. A result shorter than
+     * [len] means end of file; an empty result means there was nothing left.
+     *
+     * Throws [LuksException] with [LuksException.FILE_CHANGED] if the file was deleted,
+     * replaced or modified since [openFile]: it never returns another file's bytes.
+     *
+     * This is the only way to move a large file: [readFile] has to materialise the whole
+     * thing as a Java `byte[]`, which the app heap will not survive for a multi-gigabyte file.
+     */
+    open fun readAt(file: Long, offset: Long, len: Int): ByteArray {
+        check(handle != 0L) { "volume is closed" }
+        return LuksNative.nativeReadAt(handle, file, offset, len)
+    }
+
+    /**
+     * Size of the file [file] was opened as, from the handle (identity-checked; never a second
+     * path lookup). Throws [LuksException.FILE_CHANGED] if it changed since [openFile].
+     */
+    open fun fileSizeOf(file: Long): Long {
+        check(handle != 0L) { "volume is closed" }
+        return LuksNative.nativeFileSize(handle, file)
+    }
+
+    /** Cumulative `(verified, unverified)` bytes [readAt] has returned on [file]. */
+    open fun fileCoverage(file: Long): Pair<Long, Long> {
+        val c = LuksNative.nativeFileCoverage(file)
+        return c[0] to c[1]
+    }
+
+    /**
+     * Releases a [openFile] handle. Idempotent, and does not need the volume to be open, so
+     * it is safe in a `finally` after the session went away.
+     */
+    open fun closeFile(file: Long) {
+        LuksNative.nativeCloseFile(file)
+    }
 
     /** [sha256] result: digest plus the throughput it was measured at. */
     data class Digest(val sha256: String, val bytes: Long, val elapsedMs: Long, val bytesPerSec: Long)
@@ -625,11 +656,23 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
     /** Dropping this zeroes the master key held on the Rust side. */
     open override fun close() {
         if (handle != 0L) {
-            activeWriters.toList().forEach { it.close() }
+            // F4: the native close releases every open writer and publishes the
+            // final btrfs batch, and THROWS if that commit failed. A failing
+            // writer close must not skip the volume close, and the volume close
+            // must not leave this object holding a dead handle.
+            var failure: Throwable? = null
+            activeWriters.toList().forEach {
+                try { it.close() } catch (e: LuksException) { failure = failure ?: e }
+            }
             try {
                 LuksNative.nativeCloseVolume(handle)
-            } catch (_: UnsatisfiedLinkError) {}
-            handle = 0
+            } catch (_: UnsatisfiedLinkError) {
+            } catch (e: LuksException) {
+                failure = failure ?: e
+            } finally {
+                handle = 0
+            }
+            failure?.let { throw it }
         }
     }
 }

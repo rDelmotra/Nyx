@@ -459,6 +459,25 @@ pub struct Inode {
 }
 
 impl Inode {
+    /// Whether `now` (a fresh read of the same inode number) is still the file
+    /// this value was read as. A freed inode, a reused inode number and an
+    /// in-place modification all answer no.
+    ///
+    /// Identity is (number, `i_generation`, type, size, ctime, mtime). The
+    /// generation is the part that survives delete-and-reuse of the inode
+    /// number; on a file written before the driver stamped generations
+    /// (generation 0) the times and size carry the check.
+    pub fn same_file_as(&self, now: &Inode) -> bool {
+        now.links != 0
+            && now.mode != 0
+            && self.number == now.number
+            && self.generation == now.generation
+            && self.mode & 0xF000 == now.mode & 0xF000
+            && self.size == now.size
+            && self.ctime == now.ctime
+            && self.mtime == now.mtime
+    }
+
     pub fn file_type(&self) -> FileType {
         match self.mode & 0xF000 {
             0x8000 => FileType::Regular,
@@ -495,6 +514,17 @@ impl Inode {
     }
 }
 
+/// 32 bits of OS randomness without a dependency: `RandomState` is seeded from
+/// the OS RNG per process and per instance, and std documents it as such.
+#[cfg(feature = "dangerous-write-support")]
+fn random_seed_u32() -> u32 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u8(0x47);
+    let v = h.finish();
+    (v ^ (v >> 32)) as u32
+}
+
 /// A mounted, read-only ext2/3/4 filesystem.
 ///
 /// Owns its device. `D` is usually a reference (`&LuksVolume<..>`) via the
@@ -523,6 +553,11 @@ pub struct Ext4<D: ReadAt> {
     /// [`Ext4::take_cleanup_failure`].
     #[cfg(feature = "dangerous-write-support")]
     cleanup_failure: Option<LuksError>,
+    /// Next `i_generation` to hand out. Per-mount counter seeded from OS
+    /// randomness, like the kernel's `s_next_generation`. See
+    /// [`Ext4::next_generation`].
+    #[cfg(feature = "dangerous-write-support")]
+    next_generation: u32,
 }
 
 impl<D: ReadAt> Ext4<D> {
@@ -566,6 +601,8 @@ impl<D: ReadAt> Ext4<D> {
             reserved_inodes: std::collections::BTreeSet::new(),
             #[cfg(feature = "dangerous-write-support")]
             cleanup_failure: None,
+            #[cfg(feature = "dangerous-write-support")]
+            next_generation: random_seed_u32(),
         })
     }
 

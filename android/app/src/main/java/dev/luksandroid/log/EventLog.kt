@@ -199,6 +199,9 @@ object EventLog {
         sidValue = "-"
     }
 
+    /** Deterministic session id for fixture generation. */
+    internal fun setSidForTest(id: String) { sidValue = id }
+
     fun invalidCount(): Long = logger?.invalidTotal?.get() ?: 0L
 
     @PublishedApi internal fun noteInvalid() {
@@ -233,9 +236,9 @@ object EventLog {
      * A native event drained from Rust (C4). Only numbers, booleans and stage-grammar strings
      * survive; anything else is dropped and counted. `ev` becomes `kind`, native time `t` becomes `nt`.
      */
-    fun nativeEvent(ev: Ev, raw: JSONObject, xfer: Long? = null, sid: String? = null) {
-        if (!BuildConfig.DEBUG) return
-        val l = logger ?: return
+    fun nativeEvent(ev: Ev, raw: JSONObject, xfer: Long? = null, sid: String? = null, offerTimeoutMs: Long = 0): Boolean {
+        if (!BuildConfig.DEBUG) return true
+        val l = logger ?: return true
         require(ev.native) { "not a native event" }
         val fields = ArrayList<Field>(raw.length() + 1)
         val seen = HashSet<String>()
@@ -256,8 +259,15 @@ object EventLog {
             if (fields.size >= 32) { bad += raw.length(); break }
         }
         if (bad > 0) { l.invalidPending.addAndGet(bad); l.invalidTotal.addAndGet(bad) }
-        l.offer(Entry(l.now(), sid ?: sidValue, "rs", ev.wire, fields, mirror = true, urgent = false))
+        val e = Entry(l.now(), sid ?: sidValue, "rs", ev.wire, fields, mirror = true, urgent = false)
+        // The drain thread may wait for queue room (backpressure); callers pass 0 to never wait.
+        if (offerTimeoutMs > 0) return l.offerBlocking(e, offerTimeoutMs)
+        l.offer(e)
+        return true
     }
+
+    /** Lines a producer gave up on without offering (reported by the writer as `dropped{n}`). */
+    fun noteDropped(n: Long) { logger?.noteDropped(n) }
 
     private fun sanitize(key: String, v: Any?): Any? {
         val type = FIXED_TYPES[key]

@@ -186,7 +186,13 @@ open class TransferController {
 
     /** Marks [stage] as the one [id] is in now, so a failure inside it is attributed to it. */
     private fun enter(id: Long, stage: String) {
+        // Only for a transfer that is live: an entry for an ended one would never be removed.
+        if (!xferStartNs.containsKey(id)) return
         xferStage[id] = stage
+        // finish and commit are where a kill leaves the drive dirty: log entry as well as completion.
+        if (stage == "finish" || stage == "commit") {
+            EventLog.ev(Ev.XFER_PHASE) { xfer(id); stage(stage); state("enter") }
+        }
     }
 
     /** One finished per-file phase line. Never per chunk. */
@@ -196,6 +202,35 @@ open class TransferController {
             if (bytes != null) bytes(bytes)
             if (ino != null) ino(ino)
         }
+        // Pull the native timeline right after the phases a kill would otherwise erase it from.
+        if (stage == "finish" || stage == "commit") nativeDrain.requestDrain()
+    }
+
+    // ---- logged operations that are not queue jobs (browser mutators, SAF provider writes) ----
+
+    /** Allocates a log id for an operation outside the queue and logs `xfer_queued` + `xfer_start`. */
+    fun beginLoggedOp(op: String, bytes: Long = -1L): Long {
+        val id = nextTransferId.getAndIncrement()
+        EventLog.ev(Ev.XFER_QUEUED) { xfer(id); op(op); n(1); if (bytes >= 0L) bytes(bytes) }
+        noteStart(id)
+        enter(id, op)
+        return id
+    }
+
+    /** A per-file phase of a logged operation, with entry lines for finish/commit. */
+    fun enterLoggedPhase(id: Long, stage: String) = enter(id, stage)
+
+    fun phaseLogged(id: Long, stage: String, ms: Long, bytes: Long? = null, ino: Long? = null) =
+        phase(id, stage, ms, bytes, ino)
+
+    /**
+     * Ends a logged operation: `native_err` for a LuksException, `xfer_end`, and on failure the native ring
+     * dump tagged with [id]. Safe to call once per id; a second call logs a second `xfer_end` without a duration.
+     */
+    fun endLoggedOp(id: Long, state: TransferState, cause: Throwable? = null, bytes: Long? = null) {
+        if (cause != null && state == TransferState.FAILED) nativeErr(xferStage[id] ?: "op", cause, id)
+        logEnd(id, state, null, cause, bytes)
+        if (state == TransferState.FAILED) nativeDrain.onTransferFailure(id)
     }
 
     /** Runs [block] as phase [stage] of [id]: marks it entered, logs `xfer_phase` with its duration when it completes. */
@@ -397,18 +432,23 @@ open class TransferController {
      * rethrown after the lock is released.
      */
     suspend fun <T> withExclusiveWrite(op: String? = null, block: suspend (LuksVolume) -> T): T {
-        if (op == null) return exclusiveWrite(null, block)
+        if (op == null) {
+            // Unlabelled mutator: no id, but a failure still gets its native_err and the ring dump.
+            try {
+                return exclusiveWrite(null, block)
+            } catch (t: Throwable) {
+                if (t !is CancellationException) nativeDrain.onTransferFailure(null)
+                throw t
+            }
+        }
         // F9: a browser mutation has no queue entry, so it gets a log id of its own.
-        val id = nextTransferId.getAndIncrement()
-        EventLog.ev(Ev.XFER_QUEUED) { xfer(id); op(op); n(1) }
-        noteStart(id)
-        enter(id, op)
+        val id = beginLoggedOp(op)
         try {
             val r = exclusiveWrite(id, block)
-            logEnd(id, TransferState.COMPLETED, null, null)
+            endLoggedOp(id, TransferState.COMPLETED)
             return r
         } catch (t: Throwable) {
-            logEnd(id, if (t is CancellationException) TransferState.CANCELLED else TransferState.FAILED, null, t)
+            endLoggedOp(id, if (t is CancellationException) TransferState.CANCELLED else TransferState.FAILED, t)
             throw t
         }
     }
@@ -447,7 +487,8 @@ open class TransferController {
             LuksSession.healthMonitor.noteIdle()
         }
         thrown?.let {
-            nativeErr(xferStage[id ?: -1L] ?: "mutator", it, id)
+            // Labelled mutators get their native_err from endLoggedOp; this covers the unlabelled ones.
+            if (id == null) nativeErr("mutator", it, null)
             throw it
         }
         @Suppress("UNCHECKED_CAST")
@@ -486,6 +527,7 @@ open class TransferController {
         val e = (t as? LuksException) ?: LuksException("commit failed", LuksException.GENERIC)
         Trace.err(e.code, "commit")
         nativeErr("commit", t)
+        nativeDrain.onTransferFailure(null)
         _commitFailure.value = e
         noteFatal(volume, t)
         false
@@ -652,7 +694,7 @@ open class TransferController {
     }
 
     /** `xfer_end`: state, code, stage it was in, exception class, duration, bytes and files. Never a name or a message. */
-    private fun logEnd(id: Long, state: TransferState, item: TransferItem?, cause: Throwable?) {
+    private fun logEnd(id: Long, state: TransferState, item: TransferItem?, cause: Throwable?, bytesOverride: Long? = null) {
         val ms = msSinceStart(id)
         val stage = xferStage.remove(id)
         xferStartNs.remove(id)
@@ -664,6 +706,7 @@ open class TransferController {
             if (state != TransferState.COMPLETED && stage != null) stage(stage)
             if (cause != null) exc(cause)
             if (ms != null) ms(ms)
+            if (bytesOverride != null) bytes(bytesOverride)
             if (item != null) {
                 bytes(item.transferredBytes)
                 if (item.filesTotal > 0 || item.filesDone > 0) n(item.filesDone)
@@ -1023,7 +1066,17 @@ open class TransferController {
         _transfers.update { list ->
             list.filter { it.state == TransferState.RUNNING || it.state == TransferState.QUEUED }
         }
+        pruneLogMaps()
     }
+
+    /** Drops log bookkeeping for ids that are no longer tracked as live items (belt and braces for [logEnd]). */
+    private fun pruneLogMaps() {
+        val live = _transfers.value.filter { !it.state.isTerminal() }.map { it.id }.toSet()
+        for (id in xferStartNs.keys.toList()) if (id !in live && !activeJobs.containsKey(id)) { xferStartNs.remove(id); xferStage.remove(id) }
+    }
+
+    /** Test seam: sizes of the per-transfer log maps. */
+    internal fun logMapSizes(): Pair<Int, Int> = xferStartNs.size to xferStage.size
 
     fun clearHistory() {
         clearCompleted()
@@ -1033,6 +1086,7 @@ open class TransferController {
         _transfers.update { list ->
             list.filterNot { it.id == id && it.state != TransferState.RUNNING && it.state != TransferState.QUEUED }
         }
+        if (_transfers.value.none { it.id == id }) { xferStartNs.remove(id); xferStage.remove(id) }
     }
 
     fun isTransferCancelled(id: Long): Boolean {

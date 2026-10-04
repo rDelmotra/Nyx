@@ -359,6 +359,75 @@ class EventLogTest {
         assertEquals(131072, d.maxTransfer)
     }
 
+    @Test
+    fun aRotationThatFailsHalfwayLosesNoFileAndTheNextWriteRetries() {
+        val failures = java.util.concurrent.atomic.AtomicInteger(1)
+        val triggered = java.util.concurrent.atomic.AtomicBoolean(false)
+        var reported = false
+        val dirR = File(tmp.root, "rot")
+        val r = EventLogger(
+            dirR, clock = { now++ }, maxFileBytes = 300, startThread = false,
+            move = { from, to ->
+                // Fail the second move of the first rotation attempt only.
+                if (from.name == "events.2.jsonl" && failures.getAndDecrement() > 0) { triggered.set(true); throw IOException("rename refused") }
+                java.nio.file.Files.move(from.toPath(), to.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+            },
+        )
+        EventLog.installForTest(r)
+        fun live() = dirR.listFiles()!!.map { it.name }.toSet()
+        var maxSeen = 0
+        repeat(400) {
+            EventLog.ev(Ev.XFER_START) { xfer(it.toLong()) }
+            r.pump()
+            maxSeen = maxOf(maxSeen, live().size)
+            if (triggered.get() && !reported) {
+                EventLog.ev(Ev.XFER_START) { xfer(-1) }
+                r.pump()
+                reported = (4 downTo 0).map { File(dirR, "events.$it.jsonl") }.filter { it.exists() }
+                    .flatMap { it.readLines() }.any { it.contains("log_io_failed") }
+            }
+        }
+        assertTrue("the failed rotation was reported", reported)
+        val all = (4 downTo 0).map { File(dirR, "events.$it.jsonl") }.filter { it.exists() }.flatMap { it.readLines() }.map { JSONObject(it) }
+        assertEquals(5, live().size)
+        // The failure is reported, and apart from the one lost line no seq is missing inside the kept window.
+        val seqs = all.map { it.getLong("seq") }
+        assertEquals(seqs.sorted(), seqs)
+        assertTrue("newest lines survived", seqs.last() >= 400)
+        // The reporting lines themselves are written too; what matters is that rotation resumed and nothing is torn.
+        assertTrue("only the single failed line may be missing", (seqs.last() - seqs.first() + 1) - seqs.size <= 1)
+    }
+
+    @Test
+    fun readTailDuringRotationNeverTearsALineOrThrows() {
+        val dirT = File(tmp.root, "tail")
+        val t = EventLogger(dirT, maxFileBytes = 4_000, startThread = true)
+        EventLog.installForTest(t)
+        val stop = java.util.concurrent.atomic.AtomicBoolean(false)
+        val producer = Thread { var i = 0L; while (!stop.get()) { EventLog.ev(Ev.XFER_START) { xfer(i++) }; if (i % 50 == 0L) Thread.sleep(1) } }
+        producer.start()
+        try {
+            repeat(60) {
+                val text = t.readTail(6_000)
+                for (line in text.lineSequence().filter { it.isNotEmpty() }) JSONObject(line)
+            }
+        } finally {
+            stop.set(true); producer.join(); t.shutdown()
+        }
+    }
+
+    @Test
+    fun tailReadsOnlyTheTailOfAHugeFile() {
+        val huge = File(tmp.root, "huge").apply { mkdirs() }
+        File(huge, "events.0.jsonl").bufferedWriter().use { w -> repeat(200_000) { w.write("""{"t":1,"seq":$it,"sid":"-","src":"kt","ev":"xfer_start","xfer":$it}""" + "\n") } }
+        val t = EventLogger(huge, startThread = false)
+        val tail = t.readTail(1_000)
+        assertTrue(tail.length <= 1_000)
+        assertTrue(tail.trimEnd().endsWith("\"xfer\":199999}"))
+        assertFalse(tail.startsWith("{\"t\":1,\"seq\":0,"))
+        for (line in tail.lineSequence().filter { it.isNotEmpty() }) JSONObject(line)
+    }
+
     @Suppress("unused")
     private fun unused(o: OutputStream) = o
 }

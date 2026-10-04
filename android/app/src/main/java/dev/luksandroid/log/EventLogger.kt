@@ -48,6 +48,11 @@ class EventLogger internal constructor(
     private val mirror: ((isError: Boolean, line: String) -> Unit)? = null,
     private val sidProvider: () -> String = { "-" },
     private val openStream: (File) -> OutputStream = { f -> java.io.BufferedOutputStream(java.io.FileOutputStream(f, true), 64 * 1024) },
+    queueCapacity: Int = QUEUE_CAPACITY,
+    /** Seam for rotation failures; replaces the destination if it exists. */
+    private val move: (File, File) -> Unit = { from, to ->
+        java.nio.file.Files.move(from.toPath(), to.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+    },
 ) {
     companion object {
         const val QUEUE_CAPACITY = 4096
@@ -57,7 +62,7 @@ class EventLogger internal constructor(
         private const val BATCH = 256
     }
 
-    private val queue = ArrayBlockingQueue<Any>(QUEUE_CAPACITY)
+    private val queue = ArrayBlockingQueue<Any>(queueCapacity)
     private val dropped = AtomicLong(0)
     internal val invalidPending = AtomicLong(0)
     internal val invalidTotal = AtomicLong(0)
@@ -86,6 +91,26 @@ class EventLogger internal constructor(
 
     internal fun offer(e: Entry) {
         if (!queue.offer(e)) dropped.incrementAndGet()
+    }
+
+    /**
+     * Backpressure for the native drain thread only (never a transfer or JNI thread): waits up to
+     * [timeoutMs] for room. Returns false on timeout; the line is then counted as dropped.
+     */
+    internal fun offerBlocking(e: Entry, timeoutMs: Long): Boolean {
+        val ok = try {
+            queue.offer(e, timeoutMs, TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+        if (!ok) dropped.incrementAndGet()
+        return ok
+    }
+
+    /** Lines the caller gave up on before offering them (counted in the next `dropped{n}`). */
+    internal fun noteDropped(n: Long) {
+        if (n > 0) dropped.addAndGet(n)
     }
 
     private fun loop() {
@@ -192,12 +217,16 @@ class EventLogger internal constructor(
         return openStream(f).also { stream = it }
     }
 
+    /**
+     * Shifts `.N` to `.N+1` oldest first, each move replacing its destination, so no file is deleted
+     * ahead of the move that supersedes it. A failure partway leaves every file still present (the
+     * unmoved ones keep their names), is counted by the caller, and the next write retries.
+     */
     private fun rotate() {
         closeStream()
-        file(maxFiles - 1).delete()
         for (i in maxFiles - 2 downTo 0) {
             val from = file(i)
-            if (from.exists() && !from.renameTo(file(i + 1))) throw IOException("rotate failed")
+            if (from.exists()) move(from, file(i + 1))
         }
         curBytes = 0L
     }
@@ -251,19 +280,28 @@ class EventLogger internal constructor(
         curBytes = 0L
     }
 
-    /** The newest [maxBytes] of log text, oldest line first, cut at a line boundary. */
+    /**
+     * The newest [maxBytes] of log text, oldest line first, cut at a line boundary. Reads only the tail of
+     * each file (seek, not whole-file), and holds the writer lock so a rotation cannot move files underneath it.
+     */
     fun readTail(maxBytes: Int): String {
         flushBlocking(2_000)
         val chunks = ArrayList<ByteArray>()
         var total = 0
-        for (i in 0 until maxFiles) {
-            val f = file(i)
-            if (!f.exists()) continue
-            val bytes = f.readBytes()
-            val take = minOf(bytes.size, maxBytes - total)
-            chunks.add(0, bytes.copyOfRange(bytes.size - take, bytes.size))
-            total += take
-            if (total >= maxBytes) break
+        synchronized(pumpLock) {
+            for (i in 0 until maxFiles) {
+                val f = file(i)
+                if (!f.exists()) continue
+                java.io.RandomAccessFile(f, "r").use { raf ->
+                    val take = minOf(raf.length(), (maxBytes - total).toLong()).toInt()
+                    val buf = ByteArray(take)
+                    raf.seek(raf.length() - take)
+                    raf.readFully(buf)
+                    chunks.add(0, buf)
+                    total += take
+                }
+                if (total >= maxBytes) break
+            }
         }
         val all = ByteArray(total)
         var p = 0

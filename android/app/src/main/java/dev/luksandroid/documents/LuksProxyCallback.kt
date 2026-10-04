@@ -13,6 +13,7 @@ import dev.luksandroid.session.SessionController
 import dev.luksandroid.session.SessionNotice
 import dev.luksandroid.session.WriteHold
 import dev.luksandroid.session.TransferManager
+import dev.luksandroid.session.TransferState
 import kotlinx.coroutines.runBlocking
 
 /**
@@ -72,10 +73,26 @@ open class LuksProxyCallback(
      */
     private var writeHold: WriteHold? = null
 
+    /** F9: log id of this stream's write (0 = none open). Phases and the end line carry it; never a name. */
+    private var logId: Long = 0L
+    private var writtenBytes: Long = 0L
+
     private fun markWriteLockHeld() {
         writeLockHeld = true
         writeHold = session.acquireWriteHold()
+        writtenBytes = 0L
+        logId = TransferManager.beginLoggedOp("saf_write")
     }
+
+    /** Ends the logged write once (native_err + ring dump on failure). Idempotent. */
+    private fun endLog(state: TransferState, cause: Throwable? = null) {
+        val id = logId
+        if (id == 0L) return
+        logId = 0L
+        TransferManager.endLoggedOp(id, state, cause, writtenBytes)
+    }
+
+    private fun nowMs() = System.nanoTime() / 1_000_000L
 
     override fun onGetSize(): Long {
         // A write-mode proxy answers from the write cursor, never from the volume.
@@ -186,12 +203,17 @@ open class LuksProxyCallback(
                 throw ErrnoException("pwrite", OsConstants.EROFS)
             }
 
+            val beginStart = nowMs()
             writer = try {
+                TransferManager.enterLoggedPhase(logId, "begin")
                 runBlocking { session.withLease { it.beginFileStreaming() } }
+                    .also { TransferManager.phaseLogged(logId, "begin", nowMs() - beginStart) }
             } catch (e: ErrnoException) {
+                endLog(TransferState.FAILED)
                 releaseWriteLockIfHeld()
                 throw e
             } catch (t: Throwable) {
+                endLog(TransferState.FAILED, t)
                 releaseWriteLockIfHeld()
                 Trace.e("LuksProxyCallback: beginFileStreaming failed: ${throwableSummary(t)}")
                 throw ErrnoException("pwrite", OsConstants.EIO)
@@ -211,12 +233,15 @@ open class LuksProxyCallback(
         return try {
             runBlocking { session.withLease { volume -> volume.writeChunk(activeWriter, data, 0, size) } }
             expectedNextOffset += size
+            writtenBytes += size
             size
         } catch (e: ErrnoException) {
             abandonWrite()
             throw e
         } catch (t: Throwable) {
             Trace.e("LuksProxyCallback: write failed at offset $offset size $size: ${throwableSummary(t)}")
+            if (logId != 0L) TransferManager.enterLoggedPhase(logId, "write")
+            endLog(TransferState.FAILED, t)
             abandonWrite()
             throw ErrnoException("pwrite", OsConstants.EIO)
         }
@@ -355,12 +380,21 @@ open class LuksProxyCallback(
                 // killed client, so whatever arrived is published, as POSIX does for a killed
                 // writer on any filesystem. A finish that fails is not silent (W12): the client
                 // already saw its close() succeed, so the user is told via the notice below.
-                runBlocking { session.withLease { it.finishFile(activeWriter, pending.parentPath, pending.name) } }
+                TransferManager.enterLoggedPhase(logId, "finish")
+                val finishStart = nowMs()
+                val ino = runBlocking { session.withLease { it.finishFile(activeWriter, pending.parentPath, pending.name) } }
+                TransferManager.phaseLogged(logId, "finish", nowMs() - finishStart, bytes = writtenBytes, ino = ino)
                 session.noteFilesFinished()
                 notifyMaterialized(pending.parentPath)
                 // Commit policy (c): btrfs finish only queues the file into a batch that
                 // otherwise waits for a threshold or a later mutator. Failure is reported inside.
-                runBlocking { session.commitAndReport(forFinish = true) }
+                TransferManager.enterLoggedPhase(logId, "commit")
+                val commitStart = nowMs()
+                val commitFailure = runBlocking { session.commitAndReport(forFinish = true) }
+                TransferManager.phaseLogged(logId, "commit", nowMs() - commitStart)
+                // The file is on the drive either way; a failed commit is reported by commitAndReport and
+                // by this end line (failed, with the commit's own error), so the log does not say "completed".
+                if (commitFailure == null) endLog(TransferState.COMPLETED) else endLog(TransferState.FAILED, commitFailure)
             } else {
                 // The pending entry vanished underneath us (session lock/detach cleared the
                 // registry -- see PendingDocuments.clear) -- there is nothing left to finish
@@ -374,9 +408,11 @@ open class LuksProxyCallback(
             } else {
                 Trace.e("LuksProxyCallback: finish failed, abandoning: ${throwableSummary(e)}")
             }
+            endLog(TransferState.FAILED, e)
             Trace.cleanup("abandon_writer") { runBlocking { session.withLease { it.abandonFile(activeWriter) } } }
             reportFinishFailure()
         } catch (t: Throwable) {
+            endLog(TransferState.FAILED, t)
             Trace.e("LuksProxyCallback: finish failed, abandoning: ${throwableSummary(t)}")
             Trace.cleanup("abandon_writer") { runBlocking { session.withLease { it.abandonFile(activeWriter) } } }
             reportFinishFailure()
@@ -424,6 +460,8 @@ open class LuksProxyCallback(
     }
 
     private fun releaseWriteLockIfHeld() {
+        // Any path that reaches here without having ended its log line failed or was abandoned.
+        endLog(TransferState.FAILED)
         writeHold?.release()
         writeHold = null
         if (writeLockHeld) {

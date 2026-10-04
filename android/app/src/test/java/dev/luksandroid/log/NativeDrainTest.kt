@@ -209,6 +209,35 @@ class NativeDrainTest {
     }
 
     @Test
+    fun backpressureOnTheDrainThreadCountsExactlyWhatItGaveUpOn() {
+        val tiny = EventLogger(File(tmp.root, "tiny"), clock = { now++ }, startThread = false, queueCapacity = 2)
+        EventLog.installForTest(tiny)
+        val five = (1..5).joinToString(",") { """{"nseq":$it,"ev":"usb_reset"}""" }
+        // Nobody pumps, so the queue (2) fills; the third line waits out the timeout and the other two are not even tried.
+        val d = NativeDrain(FakeSource({ """{"dropped":0,"events":[$five]}""" }), executor = { it.run() }, offerTimeoutMs = 30)
+        val t0 = System.nanoTime()
+        d.drainNow()
+        assertTrue("one bounded wait, not one per line", (System.nanoTime() - t0) / 1_000_000 < 1_000)
+        tiny.pump()
+        val l = File(tmp.root, "tiny/events.0.jsonl").readLines().map { JSONObject(it) }
+        assertEquals("dropped", l[0].getString("ev"))
+        assertEquals(3L, l[0].getLong("n"))
+        assertEquals(listOf(1L, 2L), l.filter { it.getString("ev") == "native" }.map { it.getLong("nseq") })
+    }
+
+    @Test
+    fun drainRequestsAreCoalescedUntilTheQueuedOneRuns() {
+        val queued = mutableListOf<Runnable>()
+        val src = FakeSource({ """{"dropped":0,"events":[]}""" })
+        val d = NativeDrain(src, executor = { queued += it })
+        repeat(50) { d.requestDrain() }
+        assertEquals(1, queued.size)
+        queued.single().run()
+        d.requestDrain()
+        assertEquals(2, queued.size)
+    }
+
+    @Test
     fun requestDrainRunsThroughTheExecutorNotTheCallerThread() {
         val queued = mutableListOf<Runnable>()
         val src = FakeSource({ """{"dropped":0,"events":[]}""" })

@@ -55,8 +55,10 @@ class TransferForegroundControllerTest {
 
     @Test
     fun queueNonEmpty_shows_updatesCount_andHidesWhenDrained() = runBlocking {
-        busy.value = true
+        // queue before busy: (2, not busy) maps to 0 and is suppressed, so the first emission is show(2).
+        // The other order let the collector see (0, busy) -> show(1) first.
         queue.value = 2
+        busy.value = true
         awaitCalls(listOf("show(2)"))
         queue.value = 1
         awaitCalls(listOf("show(2)", "show(1)"))

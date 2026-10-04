@@ -243,7 +243,9 @@ class EventSitesTest {
         val data = ByteArray(5000) { 1 }
         val id = runBlocking { c.importFileWithProgress(ctx, DstVolume(), "/", uri!!, source = Src("tax-return.pdf", data.size.toLong(), data)) }
         val e = awaitEvents { l -> l.ev("xfer_end").isNotEmpty() }.filter { it.optLong("xfer", -1) == id }
-        val phases = e.ev("xfer_phase")
+        // finish and commit also log an entry line (state=enter) before their completion line.
+        assertEquals(listOf("finish", "commit"), e.ev("xfer_phase").filter { it.has("state") }.map { it.getString("stage") })
+        val phases = e.ev("xfer_phase").filter { !it.has("state") }
         assertEquals(listOf("begin", "write", "finish", "commit"), phases.map { it.getString("stage") })
         assertEquals(5000L, phases[1].getLong("bytes"))
         assertEquals(9L, phases[2].getLong("ino"))
@@ -295,8 +297,10 @@ class EventSitesTest {
         val c = TransferController().also { it.nativeDrain = syncDrain(RecordingSource()) }
         val id = runBlocking { c.exportFileWithProgress(ctx, SrcVolume(ByteArray(3000) { 2 }), "/tax-return.pdf", uri!!, target = Target()) }
         val e = awaitEvents { l -> l.ev("xfer_end").isNotEmpty() }.filter { it.optLong("xfer", -1) == id }
-        assertEquals(listOf("read", "verify", "commit"), e.ev("xfer_phase").map { it.getString("stage") })
-        assertEquals(3000L, e.ev("xfer_phase")[0].getLong("bytes"))
+        val done = e.ev("xfer_phase").filter { !it.has("state") }
+        assertEquals(listOf("read", "verify", "commit"), done.map { it.getString("stage") })
+        assertEquals(listOf("commit"), e.ev("xfer_phase").filter { it.has("state") }.map { it.getString("stage") })
+        assertEquals(3000L, done[0].getLong("bytes"))
         assertEquals("completed", e.ev("xfer_end").single().getString("state"))
         assertNoLeak("export")
     }

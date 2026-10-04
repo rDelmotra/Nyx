@@ -76,6 +76,9 @@ open class SessionController(
     /** F9: native event drains (periodic while unlocked, final on teardown). Replaceable by tests. */
     internal var nativeDrain: NativeDrain = NativeDrain.default
     internal var drainPeriodMs: Long = NativeDrain.PERIOD_MS
+
+    /** Faster ticker while a write job or SAF writer is active: the window a kill can erase is this long. */
+    internal var activeDrainPeriodMs: Long = 250L
     private var drainJob: Job? = null
 
     /** Every [drainPeriodMs] while a session is open. Only exists when the event log does, so a bare controller stays inert. */
@@ -84,7 +87,8 @@ open class SessionController(
         drainJob?.cancel()
         drainJob = scope.launch(Dispatchers.IO) {
             while (isActive) {
-                delay(drainPeriodMs)
+                val writing = _writeHolds.value > 0 || !transferWritesIdle()
+                delay(if (writing) activeDrainPeriodMs else drainPeriodMs)
                 nativeDrain.requestDrain()
             }
         }
@@ -431,6 +435,7 @@ open class SessionController(
             startDrainLoop()
             unlocked
         } catch (e: CancellationException) {
+            EventLog.endSession()
             this.activeUsbDevice = null
             if (this.volume !== producedVolume) {
                 closeProduced(producedVolume)
@@ -523,6 +528,7 @@ open class SessionController(
             startDrainLoop()
             unlocked
         } catch (e: CancellationException) {
+            EventLog.endSession()
             this.activeUsbDevice = null
             if (this.volume !== producedVolume) {
                 closeProduced(producedVolume)
@@ -617,7 +623,9 @@ open class SessionController(
      * while the UI still claims the drive is unlocked. A detach with nothing open is ignored (C7).
      */
     suspend fun onDeviceDetached(message: String = "USB drive was disconnected", reason: String = "usb_detach") {
-        val handles = mutex.withLock {
+        // pendingClose is published inside the mutex, as failFatal does: an unlock that takes the mutex next
+        // must see it and wait, or this close's endSession() would land on the new session's id.
+        val (handles, done) = mutex.withLock {
             if (_state.value is SessionState.Locked) {
                 Trace.i("LuksSession: detach ignored, nothing is open")
                 return
@@ -626,10 +634,11 @@ open class SessionController(
             EventLog.ev(Ev.DETACH) { reason(reason) }
             isLocking.set(false)
             val h = takeHandles()
+            val d = CompletableDeferred<Unit>().also { pendingClose = it }
             _state.value = SessionState.Detached(message)
-            h
+            h to d
         }
-        closeOutsideMutex(handles, commit = true)
+        closeOutsideMutex(handles, commit = true, done = done)
     }
 
     fun notifyDeviceDetached(message: String = "USB drive was disconnected") {
@@ -672,6 +681,8 @@ open class SessionController(
             Trace.err(code, if (fenced) "write_session_fenced" else "write_poison")
             Trace.e("LuksSession: fatal write failure [code=$code], session failed")
             EventLog.ev(Ev.LOCK) { reason(if (fenced) "write_session_fenced" else "write_poison"); code(code) }
+            // The drive state is uncertain: keep the whole native ring (not only what was "notable").
+            nativeDrain.onTransferFailure(null)
             isLocking.set(false)
             val h = takeHandles()
             val d = CompletableDeferred<Unit>().also { pendingClose = it }
@@ -801,6 +812,9 @@ open class SessionController(
 
     @Volatile private var pendingClose: CompletableDeferred<Unit>? = null
 
+    /** Test seam: a detach/fatal close is published (and an unlock will wait for it). */
+    internal val hasPendingClose: Boolean get() = pendingClose != null
+
     /**
      * Commit (when [commit]), then close the volume, then the device. Never throws.
      *
@@ -913,6 +927,9 @@ open class SessionController(
     private fun logUnlockFail(stage: String, t: Throwable) {
         EventLog.nativeErr(stage, t, stage = stage)
         EventLog.ev(Ev.UNLOCK_FAIL) { stage(stage); exc(t) }
+        // The session never existed: its id must not leak onto whatever is logged next.
+        nativeDrain.requestDrain()
+        EventLog.endSession()
     }
 
     /**

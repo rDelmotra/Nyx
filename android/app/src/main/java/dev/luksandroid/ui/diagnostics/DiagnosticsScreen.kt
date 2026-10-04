@@ -305,8 +305,11 @@ fun DiagnosticsScreen(
                 ) {
                     Button(
                         onClick = {
-                            val dump = dev.luksandroid.Trace.readSessionLog()
-                            sessionLogText = if (dump.isBlank()) "(Empty log - no events recorded yet)" else dump
+                            // Disk I/O (and a bounded wait for the writer): never on the main thread.
+                            scope.launch {
+                                val dump = withContext(Dispatchers.IO) { dev.luksandroid.Trace.readSessionLog() }
+                                sessionLogText = if (dump.isBlank()) "(Empty log - no events recorded yet)" else dump
+                            }
                         },
                         shape = RoundedCornerShape(8.dp),
                     ) {
@@ -314,9 +317,11 @@ fun DiagnosticsScreen(
                     }
                     Button(
                         onClick = {
-                            val dump = dev.luksandroid.Trace.readSessionLog()
-                            if (dump.isNotBlank()) {
-                                clipboardManager.setText(AnnotatedString(dump))
+                            scope.launch {
+                                val dump = withContext(Dispatchers.IO) { dev.luksandroid.Trace.readSessionLog() }
+                                if (dump.isNotBlank()) {
+                                    clipboardManager.setText(AnnotatedString(dump))
+                                }
                             }
                         },
                         shape = RoundedCornerShape(8.dp),
@@ -325,8 +330,10 @@ fun DiagnosticsScreen(
                     }
                     Button(
                         onClick = {
-                            dev.luksandroid.Trace.clearSessionLog()
-                            sessionLogText = "(Log cleared)"
+                            scope.launch {
+                                withContext(Dispatchers.IO) { dev.luksandroid.Trace.clearSessionLog() }
+                                sessionLogText = "(Log cleared)"
+                            }
                         },
                         shape = RoundedCornerShape(8.dp),
                     ) {

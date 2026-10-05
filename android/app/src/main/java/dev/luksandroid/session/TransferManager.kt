@@ -1174,8 +1174,9 @@ open class TransferController {
                     if (totalBytes > free) throw LuksException("not enough space at the destination", LuksException.NO_SPACE)
                 }
 
+                val level = target.verifyLevel
                 val meter = Meter(transferId, totalBytes)
-                val digest = java.security.MessageDigest.getInstance("SHA-256")
+                val digest = if (level == VerifyLevel.FULL) java.security.MessageDigest.getInstance("SHA-256") else null
                 var done = 0L
                 val out = target.openOutput()
                 output = out
@@ -1190,7 +1191,7 @@ open class TransferController {
                     if (chunk.isEmpty()) break
                     try {
                         out.write(chunk)
-                        digest.update(chunk)
+                        digest?.update(chunk)
                     } finally {
                         java.util.Arrays.fill(chunk, 0.toByte())
                     }
@@ -1206,7 +1207,6 @@ open class TransferController {
                 if (isTransferCancelled(transferId)) throw CancellationException("Transfer cancelled")
                 if (done < totalBytes) throw TransferFailure("The file ended early, so the copy was stopped.")
 
-                val level = target.verifyLevel
                 updateActive(transferId) { it.copy(verifyLevel = level, verifying = true, transferredBytes = 0L, speedBytesPerSec = 0L) }
                 enter(transferId, "verify")
                 val verifyStartNs = System.nanoTime()
@@ -1217,7 +1217,7 @@ open class TransferController {
                         val outcome = verifyReadBack(
                             open = { target.openRead() },
                             expectedBytes = done,
-                            expectedSha256 = digest.digest(),
+                            expectedSha256 = digest?.digest() ?: ByteArray(0),
                             isCancelled = { isTransferCancelled(transferId) || !callJob.isActive },
                             onProgress = { verifyMeter.tick(it) },
                         )

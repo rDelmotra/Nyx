@@ -94,9 +94,9 @@ class PendingNameTargetTest {
     }
 
     @Test
-    fun `local authorities get full verification and the rest size only`() {
-        assertEquals(VerifyLevel.FULL, verifyLevelForAuthority("com.android.externalstorage.documents"))
-        assertEquals(VerifyLevel.FULL, verifyLevelForAuthority("com.android.providers.downloads.documents"))
+    fun `all authorities default to size verification to preserve export throughput`() {
+        assertEquals(VerifyLevel.SIZE, verifyLevelForAuthority("com.android.externalstorage.documents"))
+        assertEquals(VerifyLevel.SIZE, verifyLevelForAuthority("com.android.providers.downloads.documents"))
         assertEquals(VerifyLevel.SIZE, verifyLevelForAuthority("com.google.android.apps.docs.storage"))
         assertEquals(VerifyLevel.SIZE, verifyLevelForAuthority(null))
     }

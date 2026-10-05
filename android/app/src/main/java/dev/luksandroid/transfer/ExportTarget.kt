@@ -101,14 +101,18 @@ fun verifyReadBack(
     return if (MessageDigest.isEqual(digest.digest(), expectedSha256)) ReadBack.Verified else ReadBack.HashMismatch
 }
 
-/** Providers whose documents live on this device, so reading one back is cheap. */
+/** Providers whose documents live on this device. */
 val LOCAL_DOCUMENT_AUTHORITIES = setOf(
     "com.android.externalstorage.documents",
     "com.android.providers.downloads.documents",
 )
 
-fun verifyLevelForAuthority(authority: String?): VerifyLevel =
-    if (authority in LOCAL_DOCUMENT_AUTHORITIES) VerifyLevel.FULL else VerifyLevel.SIZE
+/**
+ * Verification level for exported documents.
+ * Defaults to [VerifyLevel.SIZE] to avoid reading back the entire file over Android's slow SAF layer,
+ * preserving maximum USB 3.0 / SSD export throughput (~100+ MiB/s).
+ */
+fun verifyLevelForAuthority(authority: String?): VerifyLevel = VerifyLevel.SIZE
 
 /** The document operations [PendingNameTarget] needs, over an opaque document handle [D]. */
 interface DocumentOps<D : Any> {

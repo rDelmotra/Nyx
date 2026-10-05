@@ -425,6 +425,16 @@ impl<D: ReadAt> Btrfs<D> {
         self.fs_tree()
     }
 
+    /// Snapshot of the current filesystem mutation identity `(generation, fs_root_bytenr, active_batch_files)`.
+    /// When this tuple is identical across reads, no tree roots have moved and no files have been mutated.
+    pub fn mutation_tag(&self) -> (u64, u64, usize) {
+        #[cfg(feature = "dangerous-write-support")]
+        if let Some(ref batch) = self.active_batch {
+            return (batch.generation, batch.fs_root.0, batch.accumulated_files);
+        }
+        (self.sb.generation, self.fs_tree.bytenr, 0)
+    }
+
     pub fn superblock(&self) -> &Superblock {
         &self.sb
     }

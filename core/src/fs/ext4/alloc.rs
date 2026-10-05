@@ -1077,6 +1077,7 @@ impl<D: WriteAt> Ext4<D> {
         &mut self,
         f: impl FnOnce(&mut Self) -> std::result::Result<T, Aborted>,
     ) -> Result<T> {
+        self.mutation_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.write_fs_state(false)?;
         match f(self) {
             Ok(v) => {

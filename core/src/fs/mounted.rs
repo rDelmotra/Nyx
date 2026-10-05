@@ -45,11 +45,24 @@ pub enum MountedFs<D: ReadAt> {
 /// stream (N3), and nothing here pins a btrfs tree root that a later commit
 /// may free (R3r).
 pub enum OpenFile {
-    Ext4(ext4::Inode),
+    Ext4 {
+        opened: ext4::Inode,
+        cached_inode: std::sync::RwLock<ext4::Inode>,
+        cached_instance: std::sync::atomic::AtomicU64,
+        cached_seq: std::sync::atomic::AtomicU64,
+    },
     /// The subvolume's **objectid**, not its root bytenr: the root moves on
     /// every commit, and an inode number alone does not identify a file on
     /// btrfs (each subvolume numbers from 256).
-    Btrfs { subvol: u64, inode: btrfs::Inode },
+    Btrfs {
+        subvol: u64,
+        opened: btrfs::Inode,
+        cached_tree: std::sync::atomic::AtomicU64,
+        cached_inode: std::sync::RwLock<btrfs::Inode>,
+        cached_gen: std::sync::atomic::AtomicU64,
+        cached_root: std::sync::atomic::AtomicU64,
+        cached_files: std::sync::atomic::AtomicUsize,
+    },
 }
 
 impl OpenFile {
@@ -57,15 +70,15 @@ impl OpenFile {
     /// a size change fails the identity check.
     pub fn size(&self) -> u64 {
         match self {
-            OpenFile::Ext4(i) => i.info().size,
-            OpenFile::Btrfs { inode, .. } => inode.size,
+            OpenFile::Ext4 { opened, .. } => opened.info().size,
+            OpenFile::Btrfs { opened, .. } => opened.size,
         }
     }
 
     pub fn file_type(&self) -> FileType {
         match self {
-            OpenFile::Ext4(i) => i.file_type(),
-            OpenFile::Btrfs { inode, .. } => inode.file_type(),
+            OpenFile::Ext4 { opened, .. } => opened.file_type(),
+            OpenFile::Btrfs { opened, .. } => opened.file_type(),
         }
     }
 }
@@ -150,12 +163,26 @@ impl<D: ReadAt> MountedFs<D> {
 
     pub fn open(&self, path: &str) -> Result<OpenFile> {
         match self {
-            MountedFs::Ext4(fs) => Ok(OpenFile::Ext4(fs.resolve(path)?)),
+            MountedFs::Ext4(fs) => {
+                let inode = fs.resolve(path)?;
+                Ok(OpenFile::Ext4 {
+                    opened: inode.clone(),
+                    cached_inode: std::sync::RwLock::new(inode),
+                    cached_instance: std::sync::atomic::AtomicU64::new(fs.instance_id()),
+                    cached_seq: std::sync::atomic::AtomicU64::new(fs.mutation_seq()),
+                })
+            }
             MountedFs::Btrfs(fs) => {
                 let found = fs.resolve_no_follow(fs.fs_tree(), path)?;
+                let tag = fs.mutation_tag();
                 Ok(OpenFile::Btrfs {
                     subvol: found.tree.objectid,
-                    inode: found.inode,
+                    opened: found.inode.clone(),
+                    cached_tree: std::sync::atomic::AtomicU64::new(found.tree.bytenr),
+                    cached_inode: std::sync::RwLock::new(found.inode),
+                    cached_gen: std::sync::atomic::AtomicU64::new(tag.0),
+                    cached_root: std::sync::atomic::AtomicU64::new(tag.1),
+                    cached_files: std::sync::atomic::AtomicUsize::new(tag.2),
                 })
             }
         }
@@ -177,39 +204,92 @@ impl<D: ReadAt> MountedFs<D> {
         buf: &mut [u8],
     ) -> Result<(usize, btrfs::ReadCoverage)> {
         match (self, file) {
-            (MountedFs::Ext4(fs), OpenFile::Ext4(opened)) => {
-                let now = match fs.read_inode(opened.number) {
-                    Ok(now) => now,
-                    // An inode number that no longer resolves is a file that
-                    // is gone.
-                    Err(LuksError::BadInode(_)) => return Err(LuksError::FileChanged),
-                    Err(e) => return Err(e),
+            (
+                MountedFs::Ext4(fs),
+                OpenFile::Ext4 {
+                    opened,
+                    cached_inode,
+                    cached_instance,
+                    cached_seq,
+                },
+            ) => {
+                use std::sync::atomic::Ordering;
+                let inst = cached_instance.load(Ordering::Acquire);
+                let seq = cached_seq.load(Ordering::Acquire);
+                let is_valid = inst == fs.instance_id() && seq == fs.mutation_seq();
+
+                let now = if is_valid {
+                    cached_inode.read().unwrap().clone()
+                } else {
+                    let fresh = match fs.read_inode(opened.number) {
+                        Ok(now) => now,
+                        // An inode number that no longer resolves is a file that
+                        // is gone.
+                        Err(LuksError::BadInode(_)) => return Err(LuksError::FileChanged),
+                        Err(e) => return Err(e),
+                    };
+                    if !opened.same_file_as(&fresh) {
+                        return Err(LuksError::FileChanged);
+                    }
+                    *cached_inode.write().unwrap() = fresh.clone();
+                    cached_instance.store(fs.instance_id(), Ordering::Release);
+                    cached_seq.store(fs.mutation_seq(), Ordering::Release);
+                    fresh
                 };
-                if !opened.same_file_as(&now) {
-                    return Err(LuksError::FileChanged);
-                }
+
                 let n = fs.read_inode_data(&now, offset, buf)?;
                 Ok((
                     n,
                     btrfs::ReadCoverage { verified_bytes: 0, unverified_bytes: n as u64 },
                 ))
             }
-            (MountedFs::Btrfs(fs), OpenFile::Btrfs { subvol, inode: opened }) => {
-                // The CURRENT root of the subvolume, looked up now: a commit
-                // since the file was opened has moved it (R3r). A subvolume
-                // that is gone takes its files with it.
-                let Some(tree) = fs.current_tree(*subvol)? else {
-                    return Err(LuksError::FileChanged);
+            (
+                MountedFs::Btrfs(fs),
+                OpenFile::Btrfs {
+                    subvol,
+                    opened,
+                    cached_tree,
+                    cached_inode,
+                    cached_gen,
+                    cached_root,
+                    cached_files,
+                },
+            ) => {
+                use std::sync::atomic::Ordering;
+                let tag = fs.mutation_tag();
+                let is_valid = tag.0 == cached_gen.load(Ordering::Acquire)
+                    && tag.1 == cached_root.load(Ordering::Acquire)
+                    && tag.2 == cached_files.load(Ordering::Acquire);
+
+                let (tree_bytenr, now) = if is_valid {
+                    (
+                        cached_tree.load(Ordering::Acquire),
+                        cached_inode.read().unwrap().clone(),
+                    )
+                } else {
+                    // The CURRENT root of the subvolume, looked up now: a commit
+                    // since the file was opened has moved it (R3r). A subvolume
+                    // that is gone takes its files with it.
+                    let Some(tree) = fs.current_tree(*subvol)? else {
+                        return Err(LuksError::FileChanged);
+                    };
+                    let fresh = match fs.read_inode(tree.bytenr, opened.objectid) {
+                        Ok(now) => now,
+                        Err(LuksError::BadInode(_)) => return Err(LuksError::FileChanged),
+                        Err(e) => return Err(e),
+                    };
+                    if !opened.same_file_as(&fresh) {
+                        return Err(LuksError::FileChanged);
+                    }
+                    cached_tree.store(tree.bytenr, Ordering::Release);
+                    *cached_inode.write().unwrap() = fresh.clone();
+                    cached_gen.store(tag.0, Ordering::Release);
+                    cached_root.store(tag.1, Ordering::Release);
+                    cached_files.store(tag.2, Ordering::Release);
+                    (tree.bytenr, fresh)
                 };
-                let now = match fs.read_inode(tree.bytenr, opened.objectid) {
-                    Ok(now) => now,
-                    Err(LuksError::BadInode(_)) => return Err(LuksError::FileChanged),
-                    Err(e) => return Err(e),
-                };
-                if !opened.same_file_as(&now) {
-                    return Err(LuksError::FileChanged);
-                }
-                fs.read_inode_data_covered(tree.bytenr, &now, offset, buf)
+
+                fs.read_inode_data_covered(tree_bytenr, &now, offset, buf)
             }
             // Only reachable by handing a file opened on one volume to another,
             // which no caller does — but returning an error beats a panic on a

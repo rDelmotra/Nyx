@@ -1176,6 +1176,7 @@ open class TransferController {
 
                 val level = target.verifyLevel
                 val meter = Meter(transferId, totalBytes)
+                val stats = StatsRecorder()
                 val digest = if (level == VerifyLevel.FULL) java.security.MessageDigest.getInstance("SHA-256") else null
                 var done = 0L
                 val out = target.openOutput()
@@ -1187,10 +1188,10 @@ open class TransferController {
                     if (isTransferCancelled(transferId)) throw CancellationException("Transfer cancelled")
 
                     val toRead = (totalBytes - done).coerceAtMost(CHUNK_SIZE.toLong()).toInt()
-                    val chunk = volume.readAt(file, done, toRead)
+                    val chunk = stats.read { volume.readAt(file, done, toRead) }
                     if (chunk.isEmpty()) break
                     try {
-                        out.write(chunk)
+                        stats.write { out.write(chunk) }
                         digest?.update(chunk)
                     } finally {
                         java.util.Arrays.fill(chunk, 0.toByte())
@@ -1202,6 +1203,7 @@ open class TransferController {
                 out.close() // a close that fails means the bytes may not have landed
                 output = null
                 phase(transferId, "read", (System.nanoTime() - readStartNs) / 1_000_000L, bytes = done)
+                Trace.i(formatThroughput("export-single", done, stats.snapshot()))
 
                 currentCoroutineContext().ensureActive()
                 if (isTransferCancelled(transferId)) throw CancellationException("Transfer cancelled")

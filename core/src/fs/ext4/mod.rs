@@ -532,11 +532,18 @@ fn random_seed_u32() -> u32 {
 /// blanket `impl ReadAt for &D`, so `Ext4::mount(&volume)` still works; the
 /// owning form is what lets a JNI handle hold the whole stack. See the note on
 /// [`crate::luks::LuksVolume`].
+static NEXT_EXT4_INSTANCE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub struct Ext4<D: ReadAt> {
     device: D,
     /// Listing entries whose inode could not be read, over the life of this
     /// mount. See [`Ext4::listing_read_errors`].
     listing_read_errors: std::sync::atomic::AtomicU64,
+    /// Monotonically unique instance ID for this mount, distinguishing remounts.
+    instance_id: u64,
+    /// Incremented on every metadata or data mutation to detect when open file
+    /// identity checks can be safely skipped or must be re-evaluated.
+    pub(crate) mutation_seq: std::sync::atomic::AtomicU64,
     sb: Superblock,
     /// Every block group descriptor, parsed at mount.
     groups: Vec<GroupDesc>,
@@ -594,6 +601,8 @@ impl<D: ReadAt> Ext4<D> {
         Ok(Ext4 {
             device,
             listing_read_errors: std::sync::atomic::AtomicU64::new(0),
+            instance_id: NEXT_EXT4_INSTANCE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            mutation_seq: std::sync::atomic::AtomicU64::new(1),
             sb,
             groups,
             #[cfg(feature = "dangerous-write-support")]
@@ -641,6 +650,14 @@ impl<D: ReadAt> Ext4<D> {
 
     pub fn uuid(&self) -> [u8; 16] {
         self.sb.uuid
+    }
+
+    pub fn mutation_seq(&self) -> u64 {
+        self.mutation_seq.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn instance_id(&self) -> u64 {
+        self.instance_id
     }
 
     /// Blocks and inodes currently promised to open writers (always 0 in a

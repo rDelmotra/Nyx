@@ -14,8 +14,8 @@ use luks_core::usb::bot::{
     CommandBlockWrapper, CommandStatusWrapper, CswStatus, Direction, CBW_LEN, CBW_SIGNATURE,
     CSW_LEN, CSW_SIGNATURE,
 };
-use luks_core::usb::scsi::WriteCacheState;
-use luks_core::usb::ScsiBlockDevice;
+use luks_core::usb::scsi::{parse_vpd_block_limits, WriteCacheState};
+use luks_core::usb::{BulkTransport, ScsiBlockDevice};
 
 // --- Bulk-Only Transport wire format ---------------------------------------
 
@@ -928,3 +928,142 @@ fn write_cache_state_is_unknown_when_the_descriptor_overruns_the_response() {
 
     assert_eq!(dev.write_cache_state(), WriteCacheState::Unknown);
 }
+
+// --- SCSI VPD Page 0xB0 (Block Limits) & Dynamic Sizing -------------------
+
+#[test]
+fn parse_vpd_block_limits_tests() {
+    // 1. Valid buffer with optimal and max blocks
+    let mut buf = vec![0u8; 64];
+    buf[1] = 0xB0; // Block limits page code
+    // max_blocks = 2048 blocks (bytes 8..12) -> 2048 * 512 = 1 MiB
+    buf[8..12].copy_from_slice(&2048u32.to_be_bytes());
+    // opt_blocks = 1024 blocks (bytes 12..16) -> 1024 * 512 = 512 KiB
+    buf[12..16].copy_from_slice(&1024u32.to_be_bytes());
+    assert_eq!(
+        parse_vpd_block_limits(&buf, 512),
+        Some(512 * 1024),
+        "should choose minimum of max and opt: 512 KiB"
+    );
+
+    // 2. Only max_blocks set
+    let mut buf_max_only = vec![0u8; 64];
+    buf_max_only[1] = 0xB0;
+    buf_max_only[8..12].copy_from_slice(&512u32.to_be_bytes()); // 512 * 512 = 256 KiB
+    assert_eq!(
+        parse_vpd_block_limits(&buf_max_only, 512),
+        Some(256 * 1024)
+    );
+
+    // 3. Only opt_blocks set
+    let mut buf_opt_only = vec![0u8; 64];
+    buf_opt_only[1] = 0xB0;
+    buf_opt_only[12..16].copy_from_slice(&256u32.to_be_bytes()); // 256 * 512 = 128 KiB
+    assert_eq!(
+        parse_vpd_block_limits(&buf_opt_only, 512),
+        Some(128 * 1024)
+    );
+
+    // 4. Clamping to MAX_SCSI_TRANSFER (1 MiB)
+    let mut buf_huge = vec![0u8; 64];
+    buf_huge[1] = 0xB0;
+    buf_huge[8..12].copy_from_slice(&8192u32.to_be_bytes()); // 8192 * 512 = 4 MiB
+    assert_eq!(
+        parse_vpd_block_limits(&buf_huge, 512),
+        Some(1024 * 1024),
+        "must be clamped to 1 MiB"
+    );
+
+    // 5. Invalid page code
+    let mut buf_bad_page = vec![0u8; 64];
+    buf_bad_page[1] = 0x83; // Device ID page, not B0
+    buf_bad_page[8..12].copy_from_slice(&512u32.to_be_bytes());
+    assert_eq!(parse_vpd_block_limits(&buf_bad_page, 512), None);
+
+    // 6. Buffer too short (< 16 bytes)
+    assert_eq!(parse_vpd_block_limits(&buf[..15], 512), None);
+
+    // 7. Zero blocks or zero block size
+    let buf_zeroes = vec![0u8; 64];
+    assert_eq!(parse_vpd_block_limits(&buf_zeroes, 512), None);
+    assert_eq!(parse_vpd_block_limits(&buf, 0), None);
+}
+
+#[test]
+fn vpd_block_limits_clamps_scsi_device_max_transfer() {
+    let image = fixture("disks/gpt-luks.img");
+    // 512 blocks * 512 bytes = 256 KiB
+    let drive = MockUsbDrive::new(image)
+        .with_max_transfer(1024 * 1024)
+        .with_vpd_block_limits(512, 1024);
+    let dev = ScsiBlockDevice::open(drive).unwrap();
+
+    assert_eq!(dev.max_transfer(), 256 * 1024);
+    assert_eq!(dev.transport().max_transfer(), 256 * 1024);
+}
+
+#[test]
+fn vpd_block_limits_gracefully_ignored_on_rejection() {
+    let image = fixture("disks/gpt-luks.img");
+    let drive = MockUsbDrive::new(image)
+        .with_max_transfer(1024 * 1024)
+        .with_vpd_reject();
+    let dev = ScsiBlockDevice::open(drive).unwrap();
+
+    // Rejection of VPD Page 0xB0 must not fail open(), and max_transfer stays at default/transport cap
+    assert_eq!(dev.max_transfer(), 1024 * 1024);
+}
+
+#[test]
+fn dynamic_step_down_on_large_read_stall() {
+    let image = fixture("disks/gpt-luks.img");
+    let drive = MockUsbDrive::new(image.clone())
+        .with_max_transfer(1024 * 1024)
+        .with_stall_transfers_larger_than(128 * 1024);
+    let dev = ScsiBlockDevice::open(drive).unwrap();
+
+    assert_eq!(dev.max_transfer(), 1024 * 1024);
+
+    // Read 512 KiB (1024 blocks of 512 bytes)
+    let mut buf = vec![0u8; 512 * 1024];
+    let n = dev.read_blocks(0, 1024, &mut buf).expect("read should step down and succeed");
+    assert_eq!(n, 512 * 1024);
+    assert_eq!(&buf[..], &image[..512 * 1024]);
+
+    // max_transfer must have stepped down to 128 KiB
+    assert_eq!(dev.max_transfer(), 128 * 1024);
+    assert_eq!(dev.transport().max_transfer(), 128 * 1024);
+
+    // Subsequent read also succeeds without error
+    let mut buf2 = vec![0u8; 128 * 1024];
+    let n2 = dev.read_blocks(1024, 256, &mut buf2).unwrap();
+    assert_eq!(n2, 128 * 1024);
+    assert_eq!(&buf2[..], &image[512 * 1024..512 * 1024 + 128 * 1024]);
+}
+
+#[cfg(feature = "dangerous-write-support")]
+#[test]
+fn dynamic_step_down_on_large_write_stall() {
+    let image = fixture("disks/gpt-luks.img");
+    let drive = MockUsbDrive::new(image.clone())
+        .with_max_transfer(1024 * 1024)
+        .with_stall_transfers_larger_than(128 * 1024);
+    let dev = ScsiBlockDevice::open(drive).unwrap();
+
+    assert_eq!(dev.max_transfer(), 1024 * 1024);
+
+    // Write 512 KiB (1024 blocks of 512 bytes)
+    let payload = vec![0xA5u8; 512 * 1024];
+    let n = dev.write_blocks(0, 1024, &payload).expect("write should step down and succeed");
+    assert_eq!(n, 512 * 1024);
+
+    // max_transfer must have stepped down to 128 KiB
+    assert_eq!(dev.max_transfer(), 128 * 1024);
+    assert_eq!(dev.transport().max_transfer(), 128 * 1024);
+
+    // Verify written data matches
+    let mut verify_buf = vec![0u8; 512 * 1024];
+    dev.read_blocks(0, 1024, &mut verify_buf).unwrap();
+    assert_eq!(verify_buf, payload);
+}
+

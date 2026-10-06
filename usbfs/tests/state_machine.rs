@@ -23,6 +23,7 @@ fn set_errno(e: i32) {
 struct MockState {
     submitted_urbs: Vec<(u8, usize)>, // (endpoint, buffer_length)
     discarded_count: usize,
+    clear_halt_count: usize,
     poll_events: VecDeque<std::result::Result<libc::c_short, i32>>,
     reap_events: VecDeque<(c_int, usize)>, // (rc, usercontext_token)
     default_poll_err: Option<i32>,
@@ -64,6 +65,10 @@ impl MockRawUsbFs {
     fn discarded_count(&self) -> usize {
         self.state.lock().unwrap().discarded_count
     }
+
+    fn clear_halt_count(&self) -> usize {
+        self.state.lock().unwrap().clear_halt_count
+    }
 }
 
 impl RawUsbFs for MockRawUsbFs {
@@ -71,6 +76,7 @@ impl RawUsbFs for MockRawUsbFs {
         let req_submit = submit_urb_code() as u64;
         let req_discard = discard_urb_code() as u64;
         let req_reap = reap_urb_code() as u64;
+        let req_clear_halt = clear_halt_code() as u64;
 
         if req == req_submit {
             if let Some(e) = self.state.lock().unwrap().submit_errno {
@@ -78,10 +84,16 @@ impl RawUsbFs for MockRawUsbFs {
                 return -1;
             }
             let urb = unsafe { &mut *(arg as *mut UsbdevfsUrb) };
+            urb.actual_length = urb.buffer_length;
             self.state.lock().unwrap().submitted_urbs.push((urb.endpoint, urb.buffer_length as usize));
             0
         } else if req == req_discard {
             self.state.lock().unwrap().discarded_count += 1;
+            0
+        } else if req == req_clear_halt {
+            let mut state = self.state.lock().unwrap();
+            state.clear_halt_count += 1;
+            state.submit_errno = None;
             0
         } else if req == req_reap {
             let mut state = self.state.lock().unwrap();
@@ -347,3 +359,37 @@ fn a_size_the_kernel_refused_is_not_retried_and_the_limit_shrinks_from_the_attem
     }
     assert_eq!(t.max_transfer(), UsbFsTransport::MIN_MAX_TRANSFER);
 }
+
+#[test]
+fn dynamic_step_down_on_large_transfer_stall() {
+    let mock = Arc::new(MockRawUsbFs::new());
+    let t = transport(&mock).with_max_transfer(512 * 1024);
+    assert_eq!(t.max_transfer(), 512 * 1024);
+
+    // Initial submission stalls with EPIPE
+    mock.set_submit_errno(Some(libc::EPIPE));
+    // The retry at 128 KiB will poll and reap successfully
+    mock.push_poll(Ok(libc::POLLOUT));
+    mock.push_reap(0, 1);
+
+    let data = vec![0x42u8; 512 * 1024];
+    let written = t.write(&data).expect("write should recover and succeed after step-down");
+    assert_eq!(written, 128 * 1024);
+    assert_eq!(t.max_transfer(), 128 * 1024);
+    assert_eq!(mock.clear_halt_count(), 1);
+}
+
+#[test]
+fn endpoint_stall_at_or_below_128k_does_not_step_down_or_retry() {
+    let mock = Arc::new(MockRawUsbFs::new());
+    let t = transport(&mock).with_max_transfer(128 * 1024);
+
+    // A stall at 128 KiB or below is a command/device error, not an oversized transfer error
+    mock.set_submit_errno(Some(libc::EPIPE));
+    let data = vec![0x42u8; 128 * 1024];
+    let err = t.write(&data).unwrap_err();
+    assert!(matches!(err, LuksError::UsbErrno { errno, .. } if errno == libc::EPIPE));
+    assert_eq!(t.max_transfer(), 128 * 1024);
+    assert_eq!(mock.clear_halt_count(), 0);
+}
+

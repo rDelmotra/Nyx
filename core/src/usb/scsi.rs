@@ -11,7 +11,7 @@ use crate::usb::bot::{
     CommandBlockWrapper, CommandStatusWrapper, CswStatus, Direction, CSW_LEN, CSW_SIGNATURE,
 };
 use crate::usb::BulkTransport;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 // SCSI opcodes
 const OP_TEST_UNIT_READY: u8 = 0x00;
@@ -275,11 +275,43 @@ fn cdb_extent(cdb: &[u8]) -> (Option<u64>, Option<u32>) {
     }
 }
 
+/// Parse the Block Limits VPD page (0xB0).
+///
+/// Returns the transfer limit in bytes, or None if the page is invalid or contains no limits.
+pub fn parse_vpd_block_limits(buf: &[u8], block_size: u32) -> Option<usize> {
+    if buf.len() < 16 || buf[1] != 0xB0 {
+        return None;
+    }
+    // Bytes 8..12: Maximum transfer length (in logical blocks).
+    let max_blocks = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]) as u64;
+    // Bytes 12..16: Optimal transfer length (in logical blocks).
+    let opt_blocks = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]) as u64;
+
+    let chosen_blocks = match (max_blocks, opt_blocks) {
+        (0, 0) => return None,
+        (max, 0) => max,
+        (0, opt) => opt,
+        (max, opt) => opt.min(max),
+    };
+
+    if chosen_blocks == 0 || block_size == 0 {
+        return None;
+    }
+
+    let bytes = chosen_blocks.checked_mul(block_size as u64)?;
+    if bytes == 0 {
+        return None;
+    }
+
+    Some((bytes as usize).min(MAX_SCSI_TRANSFER))
+}
+
 /// A USB mass storage device presented as random-access bytes.
 pub struct ScsiBlockDevice<T: BulkTransport> {
     transport: T,
     capacity: Capacity,
     tag: AtomicU32,
+    max_transfer: AtomicUsize,
     /// Set once a drive has told us it implements neither form of
     /// SYNCHRONIZE CACHE. See [`ScsiBlockDevice::synchronize_cache`].
     #[cfg(feature = "dangerous-write-support")]
@@ -300,6 +332,7 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
                 block_size: 512,
             },
             tag: AtomicU32::new(1),
+            max_transfer: AtomicUsize::new(MAX_SCSI_TRANSFER),
             #[cfg(feature = "dangerous-write-support")]
             no_flush_command: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "dangerous-write-support")]
@@ -342,7 +375,51 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
         if dev.capacity.block_size == 0 || !dev.capacity.block_size.is_power_of_two() {
             return Err(LuksError::ScsiProtocol("implausible block size"));
         }
+
+        let mut max_transfer = dev.transport.max_transfer().min(MAX_SCSI_TRANSFER);
+        if let Ok(limit) = dev.probe_vpd_block_limits() {
+            max_transfer = max_transfer.min(limit);
+            dev.transport.set_max_transfer(max_transfer);
+        }
+        dev.max_transfer.store(max_transfer, Ordering::Relaxed);
+
         Ok(dev)
+    }
+
+    /// Probe SCSI Vital Product Data (VPD) Page 0xB0 (Block Limits).
+    pub fn probe_vpd_block_limits(&self) -> Result<usize> {
+        let mut cdb = vec![0u8; 6];
+        cdb[0] = OP_INQUIRY;
+        cdb[1] = 0x01; // EVPD = 1
+        cdb[2] = 0xB0; // Block Limits VPD page
+        cdb[4] = 64;   // Allocation length
+        let mut buf = [0u8; 64];
+        let n = self.command(cdb, Direction::In, &mut buf)?;
+        parse_vpd_block_limits(&buf[..n], self.capacity.block_size)
+            .ok_or(LuksError::ScsiProtocol("invalid or missing VPD block limits"))
+    }
+
+    pub fn max_transfer(&self) -> usize {
+        self.max_transfer
+            .load(Ordering::Relaxed)
+            .min(self.transport.max_transfer())
+    }
+
+    pub fn step_down_max_transfer(&self, bytes: usize) {
+        self.max_transfer.fetch_min(bytes, Ordering::Relaxed);
+        self.transport.set_max_transfer(bytes);
+    }
+
+    pub fn is_stall_error(&self, err: &LuksError) -> bool {
+        const LINUX_EPIPE: i32 = 32;
+        match err {
+            LuksError::UsbErrno { errno, .. } => *errno == LINUX_EPIPE,
+            LuksError::UsbTransfer(msg) => {
+                let m = msg.to_ascii_lowercase();
+                m.contains("stall") || m.contains("epipe") || m.contains("errno 32") || m.contains("broken pipe")
+            }
+            _ => false,
+        }
     }
 
     pub fn capacity(&self) -> Capacity {
@@ -764,16 +841,8 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
         Ok(Capacity { blocks, block_size })
     }
 
-    /// Read `count` blocks starting at `lba`, choosing READ(10) or READ(16).
-    pub fn read_blocks(&self, lba: u64, count: u32, buf: &mut [u8]) -> Result<usize> {
+    fn read_blocks_once(&self, lba: u64, count: u32, buf: &mut [u8]) -> Result<usize> {
         let expected = count as usize * self.capacity.block_size as usize;
-        if buf.len() < expected {
-            return Err(LuksError::ScsiProtocol("read buffer too small"));
-        }
-
-        // The 10-byte form must fit the *whole* range, not just its first
-        // block: `lba` within 32 bits but `lba + count` past them runs off
-        // the end of the 32-bit LBA space mid-transfer.
         let needs_16 = count as u64 > READ10_MAX_BLOCKS
             || lba
                 .checked_add(count as u64)
@@ -795,20 +864,44 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
         self.command(cdb, Direction::In, &mut buf[..expected])
     }
 
-    /// Write `count` blocks starting at `lba`, choosing WRITE(10) or WRITE(16).
-    ///
-    /// The mirror of [`ScsiBlockDevice::read_blocks`], and deliberately built
-    /// the same way: the CDB layout is identical, only the opcode and the
-    /// direction change. Divergence between the two would be a bug that shows
-    /// up as data landing at the wrong LBA.
-    #[cfg(feature = "dangerous-write-support")]
-    pub fn write_blocks(&self, lba: u64, count: u32, buf: &[u8]) -> Result<usize> {
+    /// Read `count` blocks starting at `lba`, choosing READ(10) or READ(16).
+    pub fn read_blocks(&self, lba: u64, count: u32, buf: &mut [u8]) -> Result<usize> {
         let expected = count as usize * self.capacity.block_size as usize;
         if buf.len() < expected {
-            return Err(LuksError::ScsiProtocol("write buffer too small"));
+            return Err(LuksError::ScsiProtocol("read buffer too small"));
         }
 
-        // Same whole-range condition as `read_blocks` — see the note there.
+        match self.read_blocks_once(lba, count, &mut buf[..expected]) {
+            Ok(n) => Ok(n),
+            Err(e) if expected > 128 * 1024 && self.is_stall_error(&e) => {
+                self.step_down_max_transfer(128 * 1024);
+                let _ = self.transport.clear_halt(true);
+                let _ = self.transport.clear_halt(false);
+                let bs = self.capacity.block_size as usize;
+                let max_sub_blocks = (128 * 1024 / bs).max(1) as u32;
+                let mut done = 0;
+                let mut cur_lba = lba;
+                let mut rem = count;
+                while rem > 0 {
+                    let c = rem.min(max_sub_blocks);
+                    let len = c as usize * bs;
+                    let n = self.read_blocks_once(cur_lba, c, &mut buf[done..done + len])?;
+                    if n < len {
+                        return Err(LuksError::ScsiProtocol("short data phase"));
+                    }
+                    done += n;
+                    cur_lba += c as u64;
+                    rem -= c;
+                }
+                Ok(done)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    #[cfg(feature = "dangerous-write-support")]
+    fn write_blocks_once(&self, lba: u64, count: u32, buf: &[u8]) -> Result<usize> {
+        let expected = count as usize * self.capacity.block_size as usize;
         let needs_16 = count as u64 > READ10_MAX_BLOCKS
             || lba
                 .checked_add(count as u64)
@@ -831,6 +924,47 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
         // already owns this command buffer, so passing it through is both safe
         // and bounded: no payload-sized copy exists merely to satisfy that ABI.
         self.command_out(cdb, &buf[..expected])
+    }
+
+    /// Write `count` blocks starting at `lba`, choosing WRITE(10) or WRITE(16).
+    ///
+    /// The mirror of [`ScsiBlockDevice::read_blocks`], and deliberately built
+    /// the same way: the CDB layout is identical, only the opcode and the
+    /// direction change. Divergence between the two would be a bug that shows
+    /// up as data landing at the wrong LBA.
+    #[cfg(feature = "dangerous-write-support")]
+    pub fn write_blocks(&self, lba: u64, count: u32, buf: &[u8]) -> Result<usize> {
+        let expected = count as usize * self.capacity.block_size as usize;
+        if buf.len() < expected {
+            return Err(LuksError::ScsiProtocol("write buffer too small"));
+        }
+
+        match self.write_blocks_once(lba, count, &buf[..expected]) {
+            Ok(n) => Ok(n),
+            Err(e) if expected > 128 * 1024 && self.is_stall_error(&e) => {
+                self.step_down_max_transfer(128 * 1024);
+                let _ = self.transport.clear_halt(true);
+                let _ = self.transport.clear_halt(false);
+                let bs = self.capacity.block_size as usize;
+                let max_sub_blocks = (128 * 1024 / bs).max(1) as u32;
+                let mut done = 0;
+                let mut cur_lba = lba;
+                let mut rem = count;
+                while rem > 0 {
+                    let c = rem.min(max_sub_blocks);
+                    let len = c as usize * bs;
+                    let n = self.write_blocks_once(cur_lba, c, &buf[done..done + len])?;
+                    if n < len {
+                        return Err(LuksError::ScsiProtocol("short data phase"));
+                    }
+                    done += n;
+                    cur_lba += c as u64;
+                    rem -= c;
+                }
+                Ok(done)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Read the mode parameter header and report the medium's write-protect
@@ -1084,15 +1218,13 @@ impl<T: BulkTransport> ReadAt for ScsiBlockDevice<T> {
             return Err(LuksError::OutOfBounds);
         }
 
-        // Per-command block count is bounded by the transport's transfer limit,
-        // the safe SCSI transfer cap (1 MiB), and what the CDB can express.
-        let max_bytes = self.transport.max_transfer().min(MAX_SCSI_TRANSFER);
-        let max_blocks = (max_bytes as u64 / bs).clamp(1, READ10_MAX_BLOCKS);
-
         let mut done = 0usize;
         let mut chunk = Vec::new();
 
         while done < buf.len() {
+            let max_bytes = self.max_transfer().min(MAX_SCSI_TRANSFER);
+            let max_blocks = (max_bytes as u64 / bs).clamp(1, READ10_MAX_BLOCKS);
+
             let pos = offset + done as u64;
             let lba = pos / bs;
             let within = (pos % bs) as usize;
@@ -1159,11 +1291,11 @@ impl<T: BulkTransport> crate::device::WriteAt for ScsiBlockDevice<T> {
             return Err(LuksError::OutOfBounds);
         }
 
-        let max_bytes = self.transport.max_transfer().min(MAX_SCSI_TRANSFER);
-        let max_blocks = (max_bytes as u64 / bs).clamp(1, READ10_MAX_BLOCKS);
-
         let mut done = 0usize;
         while done < buf.len() {
+            let max_bytes = self.max_transfer().min(MAX_SCSI_TRANSFER);
+            let max_blocks = (max_bytes as u64 / bs).clamp(1, READ10_MAX_BLOCKS);
+
             let pos = offset + done as u64;
             let lba = pos / bs;
             let within = (pos % bs) as usize;

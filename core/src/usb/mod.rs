@@ -48,6 +48,9 @@ pub trait BulkTransport {
         128 * 1024
     }
 
+    /// Update or clamp the maximum transfer limit for the transport.
+    fn set_max_transfer(&self, _bytes: usize) {}
+
     /// Clear a stalled endpoint. A failed SCSI command commonly stalls the IN
     /// endpoint, and the next command will not work until it is cleared.
     fn clear_halt(&self, _endpoint_in: bool) -> Result<()> {

@@ -134,6 +134,19 @@ pub fn clear_halt_code() -> u32 {
     ioc(DIR_READ, USB_IOC, 21, std::mem::size_of::<c_uint>())
 }
 
+pub fn get_speed_code() -> u32 {
+    ioc(DIR_NONE, USB_IOC, 31, 0)
+}
+
+// Speed constants from Linux include/uapi/linux/usb/ch9.h
+pub const USB_SPEED_UNKNOWN: c_int = 0;
+pub const USB_SPEED_LOW: c_int = 1;
+pub const USB_SPEED_FULL: c_int = 2;
+pub const USB_SPEED_HIGH: c_int = 3;
+pub const USB_SPEED_WIRELESS: c_int = 4;
+pub const USB_SPEED_SUPER: c_int = 5;
+pub const USB_SPEED_SUPER_PLUS: c_int = 6;
+
 // ----------------------------------------------------------- RawUsbFs trait seam
 
 /// Abstraction over raw usbfs kernel ioctl and poll operations for deterministic testing.
@@ -472,7 +485,14 @@ impl UsbFsTransport {
     /// command of which only 273 µs was wire time, so two thirds of the link was
     /// spent on overhead. Bigger transfers amortise the wrappers over more
     /// payload.
-    pub const DEFAULT_MAX_TRANSFER: usize = 1024 * 1024;
+    /// Default transfer size for USB 2.0 (High Speed) and below, or unknown/fallback.
+    ///
+    /// Cheap USB 2.0 thumb drives have limited SRAM FIFO buffers (often 64-128 KB)
+    /// and gain zero throughput from 1 MiB transfers.
+    pub const DEFAULT_MAX_TRANSFER: usize = 128 * 1024;
+
+    /// Transfer ceiling for USB 3.0+ (SuperSpeed and SuperSpeedPlus).
+    pub const SUPER_SPEED_MAX_TRANSFER: usize = 1024 * 1024;
 
     /// Never shrink below this. A transfer this small still works on any
     /// kernel, so an `EINVAL` here means something other than the size and
@@ -491,6 +511,35 @@ impl UsbFsTransport {
     /// shrink the limit (T5/P-5).
     pub const DATA_PHASE_MIN_BYTES: usize = 512;
 
+    /// Detect device speed using `USBDEVFS_GET_SPEED` (`_IO('U', 31)`).
+    ///
+    /// Returns the raw speed integer if the kernel/device reports it, or None on error.
+    pub fn detect_speed_raw(raw: &dyn RawUsbFs, fd: RawFd) -> Option<c_int> {
+        let rc = raw.ioctl(fd, get_speed_code() as IoctlReq, std::ptr::null_mut());
+        if rc > 0 {
+            Some(rc)
+        } else {
+            None
+        }
+    }
+
+    /// Select dynamic maximum transfer size based on detected USB speed.
+    ///
+    /// - If USB_SPEED_SUPER or higher (USB 3.0+): 1 MiB (1,048,576 bytes).
+    /// - If USB_SPEED_HIGH or below (USB 2.0 / full / low): 128 KiB (131,072 bytes).
+    /// - If unknown or fallback: 128 KiB.
+    pub fn default_max_transfer_for_speed(speed: Option<c_int>) -> usize {
+        match speed {
+            Some(s) if s >= USB_SPEED_SUPER => Self::SUPER_SPEED_MAX_TRANSFER,
+            _ => Self::DEFAULT_MAX_TRANSFER,
+        }
+    }
+
+    /// Query the current device speed.
+    pub fn detect_speed(&self) -> Option<c_int> {
+        Self::detect_speed_raw(&*self.raw, self.fd)
+    }
+
     /// Wrap a usbfs file descriptor.
     ///
     /// # Safety
@@ -508,16 +557,19 @@ impl UsbFsTransport {
     /// `ep_in` and `ep_out` are endpoint addresses as they appear in the
     /// descriptor, so `ep_in` has the 0x80 direction bit set.
     pub unsafe fn from_raw_fd(fd: RawFd, ep_in: u8, ep_out: u8, interface: u8) -> Self {
+        let raw = Arc::new(RealUsbFs);
+        let speed = Self::detect_speed_raw(&*raw, fd);
+        let max_transfer = Self::default_max_transfer_for_speed(speed);
         Self {
             fd,
             ep_in,
             ep_out,
             interface,
-            max_transfer: Arc::new(AtomicUsize::new(Self::DEFAULT_MAX_TRANSFER)),
+            max_transfer: Arc::new(AtomicUsize::new(max_transfer)),
             timeout_ms: 5_000,
             claimed: false,
             state: Arc::new(AtomicU8::new(TransportState::Healthy as u8)),
-            raw: Arc::new(RealUsbFs),
+            raw,
             arena: Arc::new(Mutex::new(UrbArena::new())),
         }
     }
@@ -525,6 +577,10 @@ impl UsbFsTransport {
     /// Inject a custom `RawUsbFs` implementation for testing.
     pub fn with_raw_usbfs(mut self, raw: Arc<dyn RawUsbFs>) -> Self {
         self.raw = raw;
+        if let Some(speed) = Self::detect_speed_raw(&*self.raw, self.fd) {
+            let limit = Self::default_max_transfer_for_speed(Some(speed));
+            self.max_transfer.store(limit, Ordering::Relaxed);
+        }
         self
     }
 
@@ -631,7 +687,13 @@ impl UsbFsTransport {
     /// fences that write. A fresh transport starts at the original limit.
     ///
     /// [`DATA_PHASE_MIN_BYTES`]: Self::DATA_PHASE_MIN_BYTES
-    fn on_bulk_error(&self, e: i32, attempted: usize, limit: usize) -> bool {
+    fn on_bulk_error(&self, ep: u8, e: i32, attempted: usize, limit: usize) -> bool {
+        if e == libc::EPIPE && attempted > 128 * 1024 {
+            self.max_transfer.fetch_min(128 * 1024, Ordering::Relaxed);
+            let _ = self.clear_halt(ep & 0x80 != 0);
+            return true;
+        }
+
         let size_error = e == libc::EINVAL || e == libc::ENOMEM;
         if !size_error
             || attempted < Self::DATA_PHASE_MIN_BYTES
@@ -819,7 +881,7 @@ impl UsbFsTransport {
             match err {
                 None => return Ok(prefix),
                 Some(e) => {
-                    if self.on_bulk_error(e, attempted, limit) && prefix == 0 {
+                    if self.on_bulk_error(ep, e, attempted, limit) && prefix == 0 {
                         // Nothing reached the wire this round — safe to
                         // redo the whole thing at the smaller size rather
                         // than reporting a zero-byte failure.
@@ -1028,7 +1090,7 @@ impl UsbFsTransport {
             match err {
                 None => return Ok(prefix),
                 Some(e) => {
-                    if self.on_bulk_error(e, attempted, limit) && prefix == 0 {
+                    if self.on_bulk_error(ep, e, attempted, limit) && prefix == 0 {
                         // Nothing reached the wire this round — safe to
                         // redo the whole thing at the smaller size rather
                         // than reporting a zero-byte failure.
@@ -1175,6 +1237,11 @@ impl BulkTransport for UsbFsTransport {
 
     fn max_transfer(&self) -> usize {
         self.max_transfer.load(Ordering::Relaxed)
+    }
+
+    fn set_max_transfer(&self, bytes: usize) {
+        let clamped = bytes.clamp(Self::MIN_MAX_TRANSFER, Self::MAX_MAX_TRANSFER);
+        self.max_transfer.fetch_min(clamped, Ordering::Relaxed);
     }
 
     fn clear_halt(&self, endpoint_in: bool) -> Result<()> {
@@ -1363,6 +1430,88 @@ mod tests {
         assert_eq!(claim_code(), 0x8004_550F, "USBDEVFS_CLAIMINTERFACE");
         assert_eq!(release_code(), 0x8004_5510, "USBDEVFS_RELEASEINTERFACE");
         assert_eq!(clear_halt_code(), 0x8004_5515, "USBDEVFS_CLEAR_HALT");
+        assert_eq!(get_speed_code(), 0x0000_551F, "USBDEVFS_GET_SPEED");
+    }
+
+    #[test]
+    fn usb_speed_constants_and_default_sizing() {
+        assert_eq!(USB_SPEED_UNKNOWN, 0);
+        assert_eq!(USB_SPEED_LOW, 1);
+        assert_eq!(USB_SPEED_FULL, 2);
+        assert_eq!(USB_SPEED_HIGH, 3);
+        assert_eq!(USB_SPEED_SUPER, 5);
+        assert_eq!(USB_SPEED_SUPER_PLUS, 6);
+
+        // SuperSpeed (USB 3.0+) gets 1 MiB
+        assert_eq!(
+            UsbFsTransport::default_max_transfer_for_speed(Some(USB_SPEED_SUPER)),
+            1024 * 1024
+        );
+        assert_eq!(
+            UsbFsTransport::default_max_transfer_for_speed(Some(USB_SPEED_SUPER_PLUS)),
+            1024 * 1024
+        );
+        assert_eq!(
+            UsbFsTransport::default_max_transfer_for_speed(Some(7)),
+            1024 * 1024
+        );
+
+        // HighSpeed (USB 2.0) and below get 128 KiB
+        assert_eq!(
+            UsbFsTransport::default_max_transfer_for_speed(Some(USB_SPEED_HIGH)),
+            128 * 1024
+        );
+        assert_eq!(
+            UsbFsTransport::default_max_transfer_for_speed(Some(USB_SPEED_FULL)),
+            128 * 1024
+        );
+        assert_eq!(
+            UsbFsTransport::default_max_transfer_for_speed(Some(USB_SPEED_LOW)),
+            128 * 1024
+        );
+        assert_eq!(
+            UsbFsTransport::default_max_transfer_for_speed(Some(USB_SPEED_UNKNOWN)),
+            128 * 1024
+        );
+        assert_eq!(
+            UsbFsTransport::default_max_transfer_for_speed(None),
+            128 * 1024
+        );
+    }
+
+    struct MockSpeedRaw(c_int);
+    impl RawUsbFs for MockSpeedRaw {
+        fn ioctl(&self, _fd: RawFd, req: IoctlReq, _arg: *mut c_void) -> c_int {
+            if req == get_speed_code() as IoctlReq {
+                self.0
+            } else {
+                -1
+            }
+        }
+        fn poll(&self, _fd: RawFd, _events: libc::c_short, _timeout_ms: i32) -> std::result::Result<libc::c_short, i32> {
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn usbfs_speed_detection_with_mock() {
+        let super_raw = Arc::new(MockSpeedRaw(USB_SPEED_SUPER));
+        let t_super = unsafe { UsbFsTransport::from_raw_fd(10, 0x81, 0x02, 0) }
+            .with_raw_usbfs(super_raw);
+        assert_eq!(t_super.detect_speed(), Some(USB_SPEED_SUPER));
+        assert_eq!(t_super.max_transfer(), 1024 * 1024);
+
+        let high_raw = Arc::new(MockSpeedRaw(USB_SPEED_HIGH));
+        let t_high = unsafe { UsbFsTransport::from_raw_fd(10, 0x81, 0x02, 0) }
+            .with_raw_usbfs(high_raw);
+        assert_eq!(t_high.detect_speed(), Some(USB_SPEED_HIGH));
+        assert_eq!(t_high.max_transfer(), 128 * 1024);
+
+        let err_raw = Arc::new(MockSpeedRaw(-1));
+        let t_err = unsafe { UsbFsTransport::from_raw_fd(10, 0x81, 0x02, 0) }
+            .with_raw_usbfs(err_raw);
+        assert_eq!(t_err.detect_speed(), None);
+        assert_eq!(t_err.max_transfer(), 128 * 1024);
     }
 
     /// 32-bit ARM has no padding before the pointer, so the size field — and

@@ -18,6 +18,7 @@ class VerifyLabelsTest {
     @Test fun `completed labels by level`() {
         assertEquals("Verified (hash)", VerifyLabels.label(item(TransferState.COMPLETED, level = VerifyLevel.FULL)))
         assertEquals("Size checked", VerifyLabels.label(item(TransferState.COMPLETED, level = VerifyLevel.SIZE)))
+        assertNull(VerifyLabels.label(item(TransferState.COMPLETED, level = VerifyLevel.NONE)))
         assertNull(VerifyLabels.label(item(TransferState.COMPLETED)))
     }
 

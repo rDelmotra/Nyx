@@ -20,6 +20,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
@@ -1163,7 +1164,7 @@ open class TransferController {
         var file = 0L
         var output: java.io.OutputStream? = null
         try {
-            withTransferCancelToken(transferId) { _ ->
+            withTransferCancelToken(transferId) { token ->
                 enter(transferId, "begin")
                 file = volume.openFile(path)
                 val totalBytes = volume.fileSizeOf(file)
@@ -1183,21 +1184,51 @@ open class TransferController {
                 output = out
                 enter(transferId, "read")
                 val readStartNs = System.nanoTime()
-                while (done < totalBytes) {
-                    currentCoroutineContext().ensureActive()
-                    if (isTransferCancelled(transferId)) throw CancellationException("Transfer cancelled")
+                if (totalBytes > 0L) {
+                    var readerError: Throwable? = null
+                    coroutineScope {
+                        val channel = Channel<ByteArray>(capacity = 2)
+                        val readerJob = launch {
+                            try {
+                                var readOffset = 0L
+                                while (readOffset < totalBytes) {
+                                    currentCoroutineContext().ensureActive()
+                                    if (isTransferCancelled(transferId)) throw CancellationException("Transfer cancelled")
 
-                    val toRead = (totalBytes - done).coerceAtMost(CHUNK_SIZE.toLong()).toInt()
-                    val chunk = stats.read { volume.readAt(file, done, toRead) }
-                    if (chunk.isEmpty()) break
-                    try {
-                        stats.write { out.write(chunk) }
-                        digest?.update(chunk)
-                    } finally {
-                        java.util.Arrays.fill(chunk, 0.toByte())
+                                    val toRead = (totalBytes - readOffset).coerceAtMost(CHUNK_SIZE.toLong()).toInt()
+                                    val chunk = stats.read {
+                                        withNativeCancel(token) {
+                                            volume.readAt(file, readOffset, toRead)
+                                        }
+                                    }
+                                    if (chunk.isEmpty()) break
+                                    channel.send(chunk)
+                                    readOffset += chunk.size
+                                }
+                            } catch (t: Throwable) {
+                                readerError = t
+                            } finally {
+                                channel.close()
+                            }
+                        }
+
+                        try {
+                            for (chunk in channel) {
+                                currentCoroutineContext().ensureActive()
+                                if (isTransferCancelled(transferId)) throw CancellationException("Transfer cancelled")
+
+                                stats.write { out.write(chunk) }
+                                digest?.update(chunk)
+                                done += chunk.size
+                                meter.tick(done)
+                            }
+                            readerError?.let { throw it }
+                        } catch (t: Throwable) {
+                            readerJob.cancel()
+                            channel.cancel(CancellationException("Writer failed", t))
+                            throw t
+                        }
                     }
-                    done += chunk.size
-                    meter.tick(done)
                 }
                 out.flush()
                 out.close() // a close that fails means the bytes may not have landed
@@ -1209,40 +1240,43 @@ open class TransferController {
                 if (isTransferCancelled(transferId)) throw CancellationException("Transfer cancelled")
                 if (done < totalBytes) throw TransferFailure("The file ended early, so the copy was stopped.")
 
-                updateActive(transferId) { it.copy(verifyLevel = level, verifying = true, transferredBytes = 0L, speedBytesPerSec = 0L) }
-                enter(transferId, "verify")
-                val verifyStartNs = System.nanoTime()
-                when (level) {
-                    VerifyLevel.FULL -> {
-                        val verifyMeter = Meter(transferId, done)
-                        val callJob = currentCoroutineContext().job
-                        val outcome = verifyReadBack(
-                            open = { target.openRead() },
-                            expectedBytes = done,
-                            expectedSha256 = digest?.digest() ?: ByteArray(0),
-                            isCancelled = { isTransferCancelled(transferId) || !callJob.isActive },
-                            onProgress = { verifyMeter.tick(it) },
-                        )
-                        when (outcome) {
-                            ReadBack.Verified -> Unit
-                            is ReadBack.SizeMismatch, ReadBack.HashMismatch ->
-                                throw TransferFailure("The saved file did not match the original, so it was removed.")
-                            ReadBack.Unreadable ->
-                                throw TransferFailure("The saved file could not be read back to verify it, so it was removed.")
+                if (level != VerifyLevel.NONE) {
+                    updateActive(transferId) { it.copy(verifyLevel = level, verifying = true, transferredBytes = 0L, speedBytesPerSec = 0L) }
+                    enter(transferId, "verify")
+                    val verifyStartNs = System.nanoTime()
+                    when (level) {
+                        VerifyLevel.FULL -> {
+                            val verifyMeter = Meter(transferId, done)
+                            val callJob = currentCoroutineContext().job
+                            val outcome = verifyReadBack(
+                                open = { target.openRead() },
+                                expectedBytes = done,
+                                expectedSha256 = digest?.digest() ?: ByteArray(0),
+                                isCancelled = { isTransferCancelled(transferId) || !callJob.isActive },
+                                onProgress = { verifyMeter.tick(it) },
+                            )
+                            when (outcome) {
+                                ReadBack.Verified -> Unit
+                                is ReadBack.SizeMismatch, ReadBack.HashMismatch ->
+                                    throw TransferFailure("The saved file did not match the original, so it was removed.")
+                                ReadBack.Unreadable ->
+                                    throw TransferFailure("The saved file could not be read back to verify it, so it was removed.")
+                            }
                         }
-                    }
-                    VerifyLevel.SIZE -> {
-                        // A cloud-backed provider: re-reading would download the file again.
-                        if (target.sizeBytes() != done) {
-                            throw TransferFailure("The saved file's size did not match the original, so it was removed.")
+                        VerifyLevel.SIZE -> {
+                            // A cloud-backed provider: re-reading would download the file again.
+                            if (target.sizeBytes() != done) {
+                                throw TransferFailure("The saved file's size did not match the original, so it was removed.")
+                            }
                         }
+                        VerifyLevel.NONE -> Unit
                     }
+                    phase(transferId, "verify", (System.nanoTime() - verifyStartNs) / 1_000_000L, bytes = done)
                 }
-                phase(transferId, "verify", (System.nanoTime() - verifyStartNs) / 1_000_000L, bytes = done)
                 timedPhase(transferId, "commit") { target.commit() }
 
                 succeeded = finishTransfer(transferId, TransferState.COMPLETED) {
-                    it.copy(transferredBytes = done, speedBytesPerSec = meter.finalSpeed(done))
+                    it.copy(transferredBytes = done, speedBytesPerSec = meter.finalSpeed(done), verifyLevel = level)
                 }
                 Trace.i("TransferManager", "Export completed: $transferId")
             }

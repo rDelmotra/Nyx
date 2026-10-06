@@ -149,26 +149,30 @@ fun formatThroughput(direction: String, bytes: Long, stats: TransferStats): Stri
 }
 
 /**
- * Accumulates [TransferStats] while a transfer runs. Not thread-safe and does
- * not need to be: both executors are single-threaded by construction, and a
- * pipelined version would hand each stage its own counter rather than sharing
- * this one.
+ * Accumulates [TransferStats] while a transfer runs. Thread-safe using atomic
+ * counters so pipelined stages can record reads, writes, and commits concurrently.
  */
 internal class StatsRecorder {
     private val startedAt = System.nanoTime()
-    var readNanos = 0L
-    var writeNanos = 0L
-    var commitNanos = 0L
-    var readCalls = 0
-    var writeCalls = 0
+    val readNanosAtomic = java.util.concurrent.atomic.AtomicLong(0L)
+    val writeNanosAtomic = java.util.concurrent.atomic.AtomicLong(0L)
+    val commitNanosAtomic = java.util.concurrent.atomic.AtomicLong(0L)
+    val readCallsAtomic = java.util.concurrent.atomic.AtomicInteger(0)
+    val writeCallsAtomic = java.util.concurrent.atomic.AtomicInteger(0)
+
+    val readNanos: Long get() = readNanosAtomic.get()
+    val writeNanos: Long get() = writeNanosAtomic.get()
+    val commitNanos: Long get() = commitNanosAtomic.get()
+    val readCalls: Int get() = readCallsAtomic.get()
+    val writeCalls: Int get() = writeCallsAtomic.get()
 
     inline fun <T> read(block: () -> T): T {
         val t0 = System.nanoTime()
         try {
             return block()
         } finally {
-            readNanos += System.nanoTime() - t0
-            readCalls++
+            readNanosAtomic.addAndGet(System.nanoTime() - t0)
+            readCallsAtomic.incrementAndGet()
         }
     }
 
@@ -177,8 +181,8 @@ internal class StatsRecorder {
         try {
             return block()
         } finally {
-            writeNanos += System.nanoTime() - t0
-            writeCalls++
+            writeNanosAtomic.addAndGet(System.nanoTime() - t0)
+            writeCallsAtomic.incrementAndGet()
         }
     }
 
@@ -187,7 +191,7 @@ internal class StatsRecorder {
         try {
             return block()
         } finally {
-            commitNanos += System.nanoTime() - t0
+            commitNanosAtomic.addAndGet(System.nanoTime() - t0)
         }
     }
 

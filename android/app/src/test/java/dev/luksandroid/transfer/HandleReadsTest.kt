@@ -100,4 +100,89 @@ class HandleReadsTest {
         assertEquals(0, vol.closed)
         assertEquals(0, vol.openCount)
     }
+
+    @Test
+    fun `direct unbuffered reads when len is at least chunkBytes`() {
+        val data = ByteArray(8192) { (it % 127).toByte() }
+        val vol = HandleVolume(mutableMapOf("/direct.bin" to data))
+        val stream = VolumeSourceBytes(vol, chunkBytes = 4096).open("/direct.bin")
+
+        val target = ByteArray(4096)
+        val n1 = stream.read(target, 0, target.size)
+        assertEquals(4096, n1)
+        assertArrayEquals(data.copyOfRange(0, 4096), target)
+        assertEquals(0, stream.available())
+
+        val n2 = stream.read(target, 0, target.size)
+        assertEquals(4096, n2)
+        assertArrayEquals(data.copyOfRange(4096, 8192), target)
+        assertEquals(0, stream.available())
+
+        val n3 = stream.read(target, 0, target.size)
+        assertEquals(-1, n3)
+        stream.close()
+    }
+
+    @Test
+    fun `small reads buffer a chunk and mixed reads drain buffer before direct reading`() {
+        val data = ByteArray(5000) { (it % 127).toByte() }
+        val vol = HandleVolume(mutableMapOf("/mixed.bin" to data))
+        val stream = VolumeSourceBytes(vol, chunkBytes = 4096).open("/mixed.bin")
+
+        // 1-byte read triggers fill()
+        val b0 = stream.read()
+        assertEquals(data[0].toInt() and 0xFF, b0)
+        assertEquals(4095, stream.available())
+
+        // Small block read drains partial buffer
+        val small = ByteArray(100)
+        val readSmall = stream.read(small, 0, 100)
+        assertEquals(100, readSmall)
+        assertArrayEquals(data.copyOfRange(1, 101), small)
+        assertEquals(3995, stream.available())
+
+        // Block read larger than remaining buffered bytes drains remainder
+        val rem = ByteArray(4000)
+        val readRem = stream.read(rem, 0, 4000)
+        assertEquals(3995, readRem)
+        assertArrayEquals(data.copyOfRange(101, 4096), rem.copyOfRange(0, 3995))
+        assertEquals(0, stream.available())
+
+        // Buffer is spent: next large read does direct read of remaining 904 bytes
+        val next = ByteArray(4096)
+        val readNext = stream.read(next, 0, 4096)
+        assertEquals(904, readNext)
+        assertArrayEquals(data.copyOfRange(4096, 5000), next.copyOfRange(0, 904))
+        assertEquals(0, stream.available())
+
+        // EOF
+        assertEquals(-1, stream.read(next, 0, 4096))
+        stream.close()
+    }
+
+    @Test
+    fun `read bounds checking throws IndexOutOfBoundsException`() {
+        val data = ByteArray(100) { 1 }
+        val vol = HandleVolume(mutableMapOf("/bounds.bin" to data))
+        val stream = VolumeSourceBytes(vol, chunkBytes = 4096).open("/bounds.bin")
+        val buf = ByteArray(10)
+
+        try {
+            stream.read(buf, -1, 5)
+            fail("expected IndexOutOfBoundsException")
+        } catch (_: IndexOutOfBoundsException) {}
+
+        try {
+            stream.read(buf, 0, -1)
+            fail("expected IndexOutOfBoundsException")
+        } catch (_: IndexOutOfBoundsException) {}
+
+        try {
+            stream.read(buf, 5, 10)
+            fail("expected IndexOutOfBoundsException")
+        } catch (_: IndexOutOfBoundsException) {}
+
+        assertEquals(0, stream.read(buf, 0, 0))
+        stream.close()
+    }
 }

@@ -14,7 +14,7 @@ object VerifyLabels {
         return when (item.verifyLevel) {
             VerifyLevel.FULL -> "Verified (hash)"
             VerifyLevel.SIZE -> "Size checked"
-            null -> null
+            VerifyLevel.NONE, null -> null
         }
     }
 }

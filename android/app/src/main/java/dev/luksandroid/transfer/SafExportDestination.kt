@@ -89,12 +89,15 @@ class SafExportDestination(
         contentResolver.openOutputStream(documentUri(docId))
             ?: throw java.io.IOException("the destination refused to open '$docId' for writing")
 
+    override val verifyLevel: VerifyLevel
+        get() = verifyLevelForAuthority(treeUri.authority)
+
     /**
      * Read-back verification only for local providers: re-reading a cloud-backed document would
      * download everything again. Null (not verified) for the rest.
      */
     override fun openInput(docId: String): java.io.InputStream? {
-        if (verifyLevelForAuthority(treeUri.authority) != VerifyLevel.FULL) return null
+        if (verifyLevel != VerifyLevel.FULL) return null
         return contentResolver.openInputStream(documentUri(docId))
             ?: throw java.io.IOException("the destination refused to open '$docId' for reading")
     }

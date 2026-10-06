@@ -233,10 +233,12 @@ class EventSitesReviewTest {
         repeat(300) { i ->
             val session = SessionController(scope = scope)
             session.nativeDrain = sync(Src())
-            session.startUnlockedForTest(volume = RecordingVolume(EventLog(), "V$i"))
+            val gate = CountDownLatch(1)
+            session.startUnlockedForTest(volume = RecordingVolume(EventLog(), "V$i").apply { commitGate = gate })
             val detach = scope.launch { session.onDeviceDetached() }
             while (session.state.value !is SessionState.Detached) Thread.onSpinWait()
             assertTrue("iteration $i: Detached was visible before pendingClose existed", session.hasPendingClose)
+            gate.countDown()
             detach.join()
         }
     }

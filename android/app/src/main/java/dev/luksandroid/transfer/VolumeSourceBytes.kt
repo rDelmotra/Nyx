@@ -58,7 +58,11 @@ private class VolumeInputStream(
         if (closed) throw java.io.IOException("stream is closed")
         if (file == 0L) file = volume.openFile(path)
         val chunk = volume.readAt(file, offset, chunkBytes)
-        if (chunk.isEmpty()) return false
+        if (chunk.isEmpty()) {
+            buffer = ByteArray(0)
+            bufferPos = 0
+            return false
+        }
         buffer = chunk
         bufferPos = 0
         offset += chunk.size
@@ -67,15 +71,51 @@ private class VolumeInputStream(
 
     override fun read(): Int {
         if (!fill()) return -1
-        return buffer[bufferPos++].toInt() and 0xFF
+        val byteVal = buffer[bufferPos++].toInt() and 0xFF
+        if (bufferPos >= buffer.size) {
+            buffer = ByteArray(0)
+            bufferPos = 0
+        }
+        return byteVal
     }
 
     override fun read(b: ByteArray, off: Int, len: Int): Int {
+        if (off < 0 || len < 0 || len > b.size - off) {
+            throw IndexOutOfBoundsException()
+        }
         if (len == 0) return 0
+
+        if (bufferPos < buffer.size) {
+            val n = minOf(len, buffer.size - bufferPos)
+            System.arraycopy(buffer, bufferPos, b, off, n)
+            bufferPos += n
+            if (bufferPos >= buffer.size) {
+                buffer = ByteArray(0)
+                bufferPos = 0
+            }
+            return n
+        }
+
+        if (closed) throw java.io.IOException("stream is closed")
+        if (file == 0L) file = volume.openFile(path)
+
+        if (len >= chunkBytes) {
+            val toRead = minOf(len, chunkBytes)
+            val chunk = volume.readAt(file, offset, toRead)
+            if (chunk.isEmpty()) return -1
+            offset += chunk.size
+            System.arraycopy(chunk, 0, b, off, chunk.size)
+            return chunk.size
+        }
+
         if (!fill()) return -1
         val n = minOf(len, buffer.size - bufferPos)
         System.arraycopy(buffer, bufferPos, b, off, n)
         bufferPos += n
+        if (bufferPos >= buffer.size) {
+            buffer = ByteArray(0)
+            bufferPos = 0
+        }
         return n
     }
 

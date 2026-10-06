@@ -38,8 +38,19 @@ class TransferIoIntegrityTest {
     private val ctx: Context = object : ContextWrapper(null) {}
     private val uri: Uri? = Uri.parse("content://t/x") // null under the JVM stubs; the fakes ignore it
 
+    private val originalDrain = TransferManager.nativeDrain
+
+    @org.junit.Before
+    fun setUpDrain() {
+        TransferManager.nativeDrain = dev.luksandroid.log.NativeDrain(object : dev.luksandroid.log.NativeEventSource {
+            override fun drain() = """{"dropped":0,"events":[]}"""
+            override fun ringJson() = """{"dropped":0,"events":[]}"""
+        }, executor = { it.run() })
+    }
+
     @After
     fun clear() {
+        TransferManager.nativeDrain = originalDrain
         val field = TransferController::class.java.getDeclaredField("_transfers")
         field.isAccessible = true
         @Suppress("UNCHECKED_CAST")
@@ -48,7 +59,7 @@ class TransferIoIntegrityTest {
 
     // ------------------------------------------------------------------ export fakes
 
-    private class SrcVolume(private val data: ByteArray) : LuksVolume(0L) {
+    private open class SrcVolume(private val data: ByteArray) : LuksVolume(0L) {
         override val info = VolumeInfo("Test", "uuid-0000", 4096, 1024L, "ext4", emptyList())
         var changeAtRead = 0
         var reads = 0
@@ -227,6 +238,44 @@ class TransferIoIntegrityTest {
         val t = Target(available = null)
         val id = export(SrcVolume(payload(10)), t)
         assertEquals(TransferState.COMPLETED, TransferManager.getTransfer(id)?.state)
+    }
+
+    @Test
+    fun `pipelined export multi-chunk succeeds with verification`() {
+        val data = payload(TransferController.CHUNK_SIZE * 2 + 500)
+        val vol = SrcVolume(data)
+        val t = Target()
+        val id = export(vol, t)
+        assertEquals(TransferState.COMPLETED, TransferManager.getTransfer(id)?.state)
+        assertArrayEquals(data, t.out.toByteArray())
+        assertEquals(1, t.committed)
+        assertEquals(0, t.discarded)
+    }
+
+    @Test
+    fun `pipelined export early EOF fails transfer and discards partial output`() {
+        val vol = object : SrcVolume(payload(TransferController.CHUNK_SIZE * 3)) {
+            override fun readAt(file: Long, offset: Long, len: Int): ByteArray {
+                if (offset >= TransferController.CHUNK_SIZE) return ByteArray(0)
+                return super.readAt(file, offset, len)
+            }
+        }
+        val t = Target()
+        val id = export(vol, t)
+        assertEquals(TransferState.FAILED, TransferManager.getTransfer(id)?.state)
+        assertEquals(1, t.discarded)
+        assertEquals(0, t.committed)
+    }
+
+    @Test
+    fun `R4 a NONE provider does not re-read or query size and completes fast`() {
+        val data = payload(1000)
+        val t = Target().also { it.verifyLevel = dev.luksandroid.transfer.VerifyLevel.NONE; it.reportedSize = null }
+        val id = export(SrcVolume(data), t)
+        val item = TransferManager.getTransfer(id)!!
+        assertEquals(TransferState.COMPLETED, item.state)
+        assertEquals(dev.luksandroid.transfer.VerifyLevel.NONE, item.verifyLevel)
+        assertEquals("no re-read for a NONE provider", 0, t.reads)
     }
 
     @Test

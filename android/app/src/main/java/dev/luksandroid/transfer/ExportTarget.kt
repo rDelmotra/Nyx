@@ -17,6 +17,9 @@ enum class VerifyLevel {
 
     /** Size reported by the provider only: re-reading a cloud-backed document would download it again. */
     SIZE,
+
+    /** Direct high-performance export with no post-hoc read-back or size querying. */
+    NONE,
 }
 
 /**
@@ -35,7 +38,7 @@ interface ExportTarget {
     fun openOutput(): OutputStream
 
     /** How this destination is verified. */
-    val verifyLevel: VerifyLevel get() = VerifyLevel.FULL
+    val verifyLevel: VerifyLevel get() = VerifyLevel.NONE
 
     /** Opens what was written for reading back ([VerifyLevel.FULL]), or null when the provider cannot. */
     fun openRead(): InputStream?
@@ -109,10 +112,10 @@ val LOCAL_DOCUMENT_AUTHORITIES = setOf(
 
 /**
  * Verification level for exported documents.
- * Defaults to [VerifyLevel.SIZE] to avoid reading back the entire file over Android's slow SAF layer,
- * preserving maximum USB 3.0 / SSD export throughput (~100+ MiB/s).
+ * Defaults to [VerifyLevel.NONE] to avoid reading back or querying the provider over
+ * Android's slow SAF layer, preserving maximum USB 3.0 / SSD export throughput (~100+ MiB/s).
  */
-fun verifyLevelForAuthority(authority: String?): VerifyLevel = VerifyLevel.SIZE
+fun verifyLevelForAuthority(authority: String?): VerifyLevel = VerifyLevel.NONE
 
 /** The document operations [PendingNameTarget] needs, over an opaque document handle [D]. */
 interface DocumentOps<D : Any> {
@@ -145,7 +148,7 @@ interface DocumentOps<D : Any> {
 class PendingNameTarget<D : Any>(
     private val ops: DocumentOps<D>,
     private val finalDoc: D,
-    override val verifyLevel: VerifyLevel = VerifyLevel.FULL,
+    override val verifyLevel: VerifyLevel = VerifyLevel.NONE,
 ) : ExportTarget {
 
     private var current: D = finalDoc

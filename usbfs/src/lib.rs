@@ -342,6 +342,35 @@ fn contiguous_prefix(outcomes: &[Option<i32>]) -> usize {
     total
 }
 
+/// Bytes actually usable from an IN transfer round: the sum of `actual_length` over
+/// the longest prefix of URBs that completed successfully without a gap.
+///
+/// For an IN transfer, if any URB in the chunk list receives less than its allocated
+/// buffer length (`actual_length < buffer_length`), no subsequent chunk's data sits
+/// contiguously in the caller's buffer, because each chunk was submitted pointing to
+/// disjoint slices of the caller's buffer. Counting past a short URB would leave an
+/// unpopulated gap between chunks in the caller's buffer. The contiguous prefix MUST break
+/// immediately at that short URB.
+fn contiguous_prefix_in<T: std::ops::Deref<Target = [u8]>>(
+    outcomes: &[Option<i32>],
+    chunks: &[T],
+) -> usize {
+    let mut total = 0usize;
+    for (outcome, chunk) in outcomes.iter().zip(chunks.iter()) {
+        match outcome {
+            Some(n) => {
+                let actual = (*n).max(0) as usize;
+                total += actual;
+                if actual < chunk.len() {
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    total
+}
+
 // --------------------------------------------------------------------- errors
 
 fn errno() -> i32 {
@@ -604,8 +633,7 @@ impl UsbFsTransport {
     /// [`DATA_PHASE_MIN_BYTES`]: Self::DATA_PHASE_MIN_BYTES
     fn on_bulk_error(&self, e: i32, attempted: usize, limit: usize) -> bool {
         let size_error = e == libc::EINVAL || e == libc::ENOMEM;
-        let data_timeout = e == libc::ETIMEDOUT;
-        if !(size_error || data_timeout)
+        if !size_error
             || attempted < Self::DATA_PHASE_MIN_BYTES
             || limit <= Self::MIN_MAX_TRANSFER
         {
@@ -878,7 +906,7 @@ impl UsbFsTransport {
             luks_core::forensic::record_usb(luks_core::forensic::UsbEvent::Submit {
                 ep,
                 count: submitted_count,
-                bytes: buf.len(),
+                bytes: buf_len,
                 gen: generation,
             });
 
@@ -995,7 +1023,7 @@ impl UsbFsTransport {
                 }
             }
 
-            let prefix = contiguous_prefix(&outcomes);
+            let prefix = contiguous_prefix_in(&outcomes, &chunks);
 
             match err {
                 None => return Ok(prefix),
@@ -1263,6 +1291,42 @@ mod tests {
     #[test]
     fn no_urbs_at_all_is_zero() {
         assert_eq!(contiguous_prefix(&[]), 0);
+    }
+
+    #[test]
+    fn in_short_piece_followed_by_full_piece_breaks_immediately() {
+        let outcomes = vec![Some(50), Some(100)];
+        let chunks: Vec<Vec<u8>> = vec![vec![0u8; 100], vec![0u8; 100]];
+        assert_eq!(
+            contiguous_prefix_in(&outcomes, &chunks),
+            50,
+            "must break immediately at short URB, not count subsequent chunk across gap"
+        );
+    }
+
+    #[test]
+    fn in_full_piece_followed_by_short_piece_sums_both() {
+        let outcomes = vec![Some(100), Some(37)];
+        let chunks: Vec<Vec<u8>> = vec![vec![0u8; 100], vec![0u8; 100]];
+        assert_eq!(
+            contiguous_prefix_in(&outcomes, &chunks),
+            137,
+            "must sum full piece and short piece then stop"
+        );
+    }
+
+    #[test]
+    fn in_gap_at_the_start_is_zero() {
+        let outcomes = vec![None, Some(100)];
+        let chunks: Vec<Vec<u8>> = vec![vec![0u8; 100], vec![0u8; 100]];
+        assert_eq!(contiguous_prefix_in(&outcomes, &chunks), 0);
+    }
+
+    #[test]
+    fn in_gap_in_middle_stops_at_gap() {
+        let outcomes = vec![Some(100), None, Some(100)];
+        let chunks: Vec<Vec<u8>> = vec![vec![0u8; 100], vec![0u8; 100], vec![0u8; 100]];
+        assert_eq!(contiguous_prefix_in(&outcomes, &chunks), 100);
     }
 
     /// Ground truth, not self-reference.

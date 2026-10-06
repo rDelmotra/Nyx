@@ -300,27 +300,21 @@ fn a_cbw_or_csw_timeout_does_not_shrink_max_transfer() {
 }
 
 #[test]
-fn a_data_phase_timeout_shrinks_to_half_the_attempt_and_stays_shrunk() {
+fn a_data_phase_timeout_does_not_shrink_max_transfer() {
     let mock = Arc::new(MockRawUsbFs::new());
     let t = transport(&mock);
 
-    // A 128 KiB data phase times out: the next attempt must be smaller than
-    // the one that failed, i.e. 64 KiB.
+    // A 128 KiB data phase times out: cable glitch or latency.
+    // It must NOT permanently degrade max_transfer throughput.
     timeout_round(&mock);
     t.write(&vec![0u8; 128 * 1024]).unwrap_err();
-    assert_eq!(t.max_transfer(), 64 * 1024, "a data-phase timeout must halve what was attempted");
+    assert_eq!(t.max_transfer(), UsbFsTransport::DEFAULT_MAX_TRANSFER, "a data-phase timeout must not shrink max_transfer");
 
-    // The limit only goes down within a session: a long run of clean
-    // transfers must not probe upward (a probe is a user write).
     for _ in 0..1024 {
         ok_round(&mock);
         t.write(&vec![0u8; 64 * 1024]).unwrap();
     }
-    assert_eq!(t.max_transfer(), 64 * 1024, "the limit rose without a re-open");
-
-    // A fresh transport starts at the original value.
-    let fresh = transport(&mock);
-    assert_eq!(fresh.max_transfer(), UsbFsTransport::DEFAULT_MAX_TRANSFER);
+    assert_eq!(t.max_transfer(), UsbFsTransport::DEFAULT_MAX_TRANSFER);
 }
 
 #[test]

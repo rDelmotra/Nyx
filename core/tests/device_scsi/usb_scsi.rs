@@ -559,17 +559,150 @@ fn csw_stall_recovers_via_clear_halt() {
 
 #[test]
 fn max_scsi_transfer_caps_single_read_commands() {
-    // A transport that allows 1 MiB transfers
-    let drive = MockUsbDrive::new(fixture("disks/gpt-luks.img")).with_max_transfer(1024 * 1024);
+    // A transport that allows 2 MiB transfers
+    let drive = MockUsbDrive::new(fixture("disks/gpt-luks.img")).with_max_transfer(2 * 1024 * 1024);
     let dev = ScsiBlockDevice::open(drive).unwrap();
 
-    let mut buf = vec![0u8; 1024 * 1024];
+    let mut buf = vec![0u8; 2 * 1024 * 1024];
     dev.read_at(0, &mut buf).unwrap();
 
     let stats = *dev.transport().stats.borrow();
-    // 1 MiB in 128 KiB commands = 8 commands
-    assert!(stats.read_commands >= 8, "must split into at least 8 commands");
-    assert_eq!(stats.largest_read_blocks, 256, "capped at 128 KiB / 512 = 256 blocks");
+    // 2 MiB in 1 MiB commands = 2 commands
+    assert!(stats.read_commands >= 2, "must split into at least 2 commands");
+    assert_eq!(stats.largest_read_blocks, 2048, "capped at 1 MiB / 512 = 2048 blocks");
+}
+
+/// Trap 2: A reply short by exactly 13 bytes counts the drive's status reply (CSW) as file data.
+/// During Direction::In, if a read yields 13 bytes matching CSW_SIGNATURE and tag, the drive
+/// ended the data phase early and sent the CSW into the data buffer. It must be captured into
+/// csw_buf, and NOT treated as file data.
+#[test]
+fn early_csw_in_data_buffer_is_captured_without_counting_as_file_data() {
+    struct EarlyCswTransport<T> {
+        inner: T,
+        step: std::cell::Cell<usize>,
+        last_tag: std::cell::Cell<u32>,
+    }
+
+    impl<T: luks_core::usb::BulkTransport> luks_core::usb::BulkTransport for EarlyCswTransport<T> {
+        fn write(&self, data: &[u8]) -> Result<usize, LuksError> {
+            if data.len() >= 8 && &data[0..4] == b"USBC" {
+                let tag = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+                self.last_tag.set(tag);
+            }
+            self.inner.write(data)
+        }
+
+        fn read(&self, buf: &mut [u8]) -> Result<usize, LuksError> {
+            let s = self.step.get();
+            self.step.set(s + 1);
+            if s == 1 && buf.len() >= 100 {
+                // First data read: return 100 bytes of data
+                buf[..100].fill(0x55);
+                return Ok(100);
+            } else if s == 2 && buf.len() >= 13 {
+                // Second data read: drive finishes early and sends CSW directly into data buffer!
+                let tag = self.last_tag.get();
+                let mut csw = [0u8; 13];
+                csw[0..4].copy_from_slice(b"USBS");
+                csw[4..8].copy_from_slice(&tag.to_le_bytes());
+                csw[8..12].copy_from_slice(&412u32.to_le_bytes()); // 512 - 100 = 412 residue
+                csw[12] = 0; // Passed
+                buf[..13].copy_from_slice(&csw);
+                return Ok(13);
+            }
+            self.inner.read(buf)
+        }
+
+        fn max_transfer(&self) -> usize {
+            self.inner.max_transfer()
+        }
+
+        fn clear_halt(&self, endpoint_in: bool) -> Result<(), LuksError> {
+            self.inner.clear_halt(endpoint_in)
+        }
+
+        fn reset(&self) -> Result<(), LuksError> {
+            self.inner.reset()
+        }
+    }
+
+    let inner = MockUsbDrive::new(vec![0u8; 1024 * 1024]);
+    let transport = EarlyCswTransport {
+        inner,
+        step: std::cell::Cell::new(0),
+        last_tag: std::cell::Cell::new(0u32),
+    };
+    let dev = ScsiBlockDevice::open(transport).unwrap();
+
+    // Arm step counter for the READ(10) command
+    dev.transport().step.set(1);
+    let mut data = vec![0u8; 512];
+    let got = dev.read_blocks(0, 1, &mut data).unwrap();
+
+    // Exactly 100 bytes of data were transferred — NOT 113!
+    assert_eq!(got, 100, "CSW bytes must not be counted as transferred data");
+}
+
+#[test]
+fn early_failed_csw_in_data_buffer_reports_command_failed() {
+    struct EarlyFailedCswTransport<T> {
+        inner: T,
+        armed: std::cell::Cell<bool>,
+        last_tag: std::cell::Cell<u32>,
+    }
+
+    impl<T: luks_core::usb::BulkTransport> luks_core::usb::BulkTransport for EarlyFailedCswTransport<T> {
+        fn write(&self, data: &[u8]) -> Result<usize, LuksError> {
+            if data.len() >= 8 && &data[0..4] == b"USBC" {
+                let tag = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+                self.last_tag.set(tag);
+            }
+            self.inner.write(data)
+        }
+
+        fn read(&self, buf: &mut [u8]) -> Result<usize, LuksError> {
+            if self.armed.get() && buf.len() >= 13 {
+                self.armed.set(false);
+                let tag = self.last_tag.get();
+                let mut csw = [0u8; 13];
+                csw[0..4].copy_from_slice(b"USBS");
+                csw[4..8].copy_from_slice(&tag.to_le_bytes());
+                csw[8..12].copy_from_slice(&512u32.to_le_bytes()); // residue
+                csw[12] = 1; // Failed status
+                buf[..13].copy_from_slice(&csw);
+                return Ok(13);
+            }
+            self.inner.read(buf)
+        }
+
+        fn max_transfer(&self) -> usize {
+            self.inner.max_transfer()
+        }
+
+        fn clear_halt(&self, endpoint_in: bool) -> Result<(), LuksError> {
+            self.inner.clear_halt(endpoint_in)
+        }
+
+        fn reset(&self) -> Result<(), LuksError> {
+            self.inner.reset()
+        }
+    }
+
+    let inner = MockUsbDrive::new(vec![0u8; 1024 * 1024]);
+    let transport = EarlyFailedCswTransport {
+        inner,
+        armed: std::cell::Cell::new(false),
+        last_tag: std::cell::Cell::new(0u32),
+    };
+    let dev = ScsiBlockDevice::open(transport).unwrap();
+
+    dev.transport().armed.set(true);
+    let mut data = vec![0u8; 512];
+    let err = dev.read_blocks(0, 1, &mut data).unwrap_err();
+
+    // The CSW reported Failed, so ScsiCommandFailed is returned with sense info
+    assert!(matches!(err, LuksError::ScsiCommandFailed { .. }));
 }
 
 // --- MODE SENSE / write-cache probe -----------------------------------------

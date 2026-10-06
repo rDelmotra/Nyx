@@ -8,7 +8,7 @@
 use crate::device::ReadAt;
 use crate::error::{LuksError, Result};
 use crate::usb::bot::{
-    CommandBlockWrapper, CommandStatusWrapper, CswStatus, Direction, CSW_LEN,
+    CommandBlockWrapper, CommandStatusWrapper, CswStatus, Direction, CSW_LEN, CSW_SIGNATURE,
 };
 use crate::usb::BulkTransport;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -57,11 +57,10 @@ const READ10_MAX_LBA: u64 = 0xFFFF_FFFF;
 
 /// The maximum bytes moved in a single SCSI data phase.
 ///
-/// Linux `usb-storage` caps single transfers to 128 KiB (`US_MAX_SECTORS = 240`
-/// or 120 KiB, commonly 128 KiB). Cheap USB flash bridges (e.g. SanDisk) have
-/// limited internal SRAM buffers (typically 128 KiB) and stall the bulk pipe
-/// (`EPIPE` / errno 32) if a single SCSI command requests more.
-pub const MAX_SCSI_TRANSFER: usize = 128 * 1024;
+/// Linux `usb-storage` historically capped single transfers to 128 KiB (`US_MAX_SECTORS = 240`
+/// or 120 KiB, commonly 128 KiB). We increase this to 1 MiB to reduce USB round-trips from
+/// 8 down to 1 per megabyte.
+pub const MAX_SCSI_TRANSFER: usize = 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct InquiryData {
@@ -565,6 +564,9 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
         }
 
         let mut transferred = 0usize;
+        let mut csw_buf = [0u8; CSW_LEN];
+        let mut got = 0usize;
+
         if !data.is_empty() {
             match direction {
                 Direction::In => {
@@ -572,6 +574,16 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
                         let n = self.recover(self.transport.read(&mut data[transferred..]))?;
                         if n == 0 {
                             break; // device ended the data phase early
+                        }
+                        if n == CSW_LEN {
+                            let candidate = &data[transferred..transferred + CSW_LEN];
+                            let sig = u32::from_le_bytes([candidate[0], candidate[1], candidate[2], candidate[3]]);
+                            let cand_tag = u32::from_le_bytes([candidate[4], candidate[5], candidate[6], candidate[7]]);
+                            if sig == CSW_SIGNATURE && cand_tag == tag {
+                                csw_buf.copy_from_slice(candidate);
+                                got = CSW_LEN;
+                                break;
+                            }
                         }
                         transferred += n;
                     }
@@ -589,8 +601,6 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
             }
         }
 
-        let mut csw_buf = [0u8; CSW_LEN];
-        let mut got = 0usize;
         let mut cleared_halt = false;
         while got < CSW_LEN {
             let read_res = self.transport.read(&mut csw_buf[got..]);
@@ -1075,12 +1085,12 @@ impl<T: BulkTransport> ReadAt for ScsiBlockDevice<T> {
         }
 
         // Per-command block count is bounded by the transport's transfer limit,
-        // the safe SCSI transfer cap (128 KiB), and what the CDB can express.
+        // the safe SCSI transfer cap (1 MiB), and what the CDB can express.
         let max_bytes = self.transport.max_transfer().min(MAX_SCSI_TRANSFER);
         let max_blocks = (max_bytes as u64 / bs).clamp(1, READ10_MAX_BLOCKS);
 
         let mut done = 0usize;
-        let mut chunk = vec![0u8; (max_blocks * bs) as usize];
+        let mut chunk = Vec::new();
 
         while done < buf.len() {
             let pos = offset + done as u64;
@@ -1091,14 +1101,25 @@ impl<T: BulkTransport> ReadAt for ScsiBlockDevice<T> {
             let blocks = ((within + remaining) as u64).div_ceil(bs).min(max_blocks);
             let span = (blocks * bs) as usize;
 
-            let got = self.read_blocks(lba, blocks as u32, &mut chunk[..span])?;
-            if got < span {
-                return Err(LuksError::ScsiProtocol("short data phase"));
-            }
+            if within == 0 && remaining >= span {
+                let got = self.read_blocks(lba, blocks as u32, &mut buf[done..done + span])?;
+                if got < span {
+                    return Err(LuksError::ScsiProtocol("short data phase"));
+                }
+                done += span;
+            } else {
+                if chunk.len() < span {
+                    chunk.resize(span, 0);
+                }
+                let got = self.read_blocks(lba, blocks as u32, &mut chunk[..span])?;
+                if got < span {
+                    return Err(LuksError::ScsiProtocol("short data phase"));
+                }
 
-            let take = (span - within).min(remaining);
-            buf[done..done + take].copy_from_slice(&chunk[within..within + take]);
-            done += take;
+                let take = (span - within).min(remaining);
+                buf[done..done + take].copy_from_slice(&chunk[within..within + take]);
+                done += take;
+            }
         }
         Ok(())
     }

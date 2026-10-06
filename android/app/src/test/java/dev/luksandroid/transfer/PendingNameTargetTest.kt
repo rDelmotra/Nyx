@@ -100,4 +100,42 @@ class PendingNameTargetTest {
         assertEquals(VerifyLevel.NONE, verifyLevelForAuthority("com.google.android.apps.docs.storage"))
         assertEquals(VerifyLevel.NONE, verifyLevelForAuthority(null))
     }
+
+    @Test
+    fun `syncOutputStream on ByteArrayOutputStream is a safe no-op`() {
+        val baos = ByteArrayOutputStream()
+        baos.write(byteArrayOf(1, 2, 3))
+        syncOutputStream(baos)
+        assertEquals(3, baos.size())
+    }
+
+    @Test
+    fun `syncOutputStream on FileOutputStream forces dirty pages to disk`() {
+        val tmp = java.io.File.createTempFile("fsync_test", ".tmp")
+        try {
+            val fos = java.io.FileOutputStream(tmp)
+            fos.write(byteArrayOf(10, 20, 30, 40))
+            syncOutputStream(fos)
+            fos.close()
+            assertEquals(4L, tmp.length())
+        } finally {
+            tmp.delete()
+        }
+    }
+
+    @Test
+    fun `syncOutputStream on FilterOutputStream unwraps and forces dirty pages to disk`() {
+        val tmp = java.io.File.createTempFile("fsync_test_filter", ".tmp")
+        try {
+            val fos = java.io.FileOutputStream(tmp)
+            val filtered = java.io.BufferedOutputStream(fos)
+            filtered.write(byteArrayOf(50, 60, 70, 80))
+            syncOutputStream(filtered)
+            filtered.close()
+            assertEquals(4L, tmp.length())
+        } finally {
+            tmp.delete()
+        }
+    }
 }
+

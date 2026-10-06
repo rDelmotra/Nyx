@@ -48,6 +48,7 @@ import dev.luksandroid.transfer.TransferProgress
 import dev.luksandroid.transfer.VerifyLevel
 import dev.luksandroid.transfer.formatThroughput
 import dev.luksandroid.transfer.stoppedSummary
+import dev.luksandroid.transfer.syncOutputStream
 import dev.luksandroid.transfer.treeProgressLabel
 import dev.luksandroid.transfer.verifyReadBack
 import java.lang.ref.WeakReference
@@ -1231,6 +1232,7 @@ open class TransferController {
                     }
                 }
                 out.flush()
+                stats.commit { syncOutputStream(out) }
                 out.close() // a close that fails means the bytes may not have landed
                 output = null
                 phase(transferId, "read", (System.nanoTime() - readStartNs) / 1_000_000L, bytes = done)

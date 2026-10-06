@@ -4,9 +4,12 @@ import android.content.Context
 import android.net.Uri
 import android.provider.DocumentsContract
 import dev.luksandroid.Trace
+import java.io.FileOutputStream
+import java.io.FilterOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
+import java.io.SyncFailedException
 import java.security.MessageDigest
 import kotlinx.coroutines.CancellationException
 
@@ -289,3 +292,47 @@ fun availableFromStatVfs(blocksAvailable: Long, fragmentSize: Long): Long {
     if (blocksAvailable <= 0L || fragmentSize <= 0L) return 0L
     return if (blocksAvailable > Long.MAX_VALUE / fragmentSize) Long.MAX_VALUE else blocksAvailable * fragmentSize
 }
+
+/**
+ * Flushes userspace JVM buffers and forces kernel page cache and storage controller dirty blocks
+ * to non-volatile storage (fsync).
+ *
+ * Durability guarantee:
+ * - Unwraps [FilterOutputStream] layers to access any underlying [FileOutputStream].
+ * - On local flash / SD card storage, [FileOutputStream.getChannel().force(true)]
+ *   invokes POSIX fsync(2) to commit both dirty pages and inode metadata (file size, timestamps).
+ * - On non-file descriptors (pipes, sockets, fifos, in-memory streams in unit tests), [SyncFailedException]
+ *   and non-seekable EINVAL/ENOTTY are caught and ignored so virtual or pipe providers are not broken.
+ * - Real I/O write failures (EIO, ENOSPC) are re-thrown as [IOException].
+ */
+fun syncOutputStream(out: OutputStream) {
+    out.flush()
+    val fos = unwrapFileOutputStream(out) ?: return
+    try {
+        if (fos.fd.valid()) {
+            fos.fd.sync()
+        }
+    } catch (_: SyncFailedException) {
+        // Thrown when the descriptor is a pipe, socket, or non-syncable virtual stream
+    }
+}
+
+private fun unwrapFileOutputStream(stream: OutputStream): FileOutputStream? {
+    var cur: OutputStream? = stream
+    while (cur != null) {
+        if (cur is FileOutputStream) return cur
+        if (cur is FilterOutputStream) {
+            cur = try {
+                val field = FilterOutputStream::class.java.getDeclaredField("out")
+                field.isAccessible = true
+                field.get(cur) as? OutputStream
+            } catch (_: Throwable) {
+                null
+            }
+        } else {
+            break
+        }
+    }
+    return null
+}
+

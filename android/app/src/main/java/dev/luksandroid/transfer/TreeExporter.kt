@@ -313,6 +313,7 @@ object TreeExporter {
                     streamFilePipelined(input, output, stats, digest, entry, onChunk)
                 }
             }
+            stats.commit { syncOutputStream(output) }
         } catch (t: Throwable) {
             failure = t
             throw t

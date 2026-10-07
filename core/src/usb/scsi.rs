@@ -284,26 +284,20 @@ pub fn parse_vpd_block_limits(buf: &[u8], block_size: u32) -> Option<usize> {
     }
     // Bytes 8..12: Maximum transfer length (in logical blocks).
     let max_blocks = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]) as u64;
-    // Bytes 12..16: Optimal transfer length (in logical blocks).
-    let opt_blocks = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]) as u64;
 
-    let chosen_blocks = match (max_blocks, opt_blocks) {
-        (0, 0) => return None,
-        (max, 0) => max,
-        (0, opt) => opt,
-        (max, opt) => opt.min(max),
-    };
-
-    if chosen_blocks == 0 || block_size == 0 {
+    // Use only the "maximum" transfer length, never "optimal" (many USB bridges
+    // report odd optimal sizes of a few KB). Enforce a floor of 128 KiB.
+    if max_blocks == 0 || block_size == 0 {
         return None;
     }
 
-    let bytes = chosen_blocks.checked_mul(block_size as u64)?;
+    let bytes = max_blocks.checked_mul(block_size as u64)?;
     if bytes == 0 {
         return None;
     }
 
-    Some((bytes as usize).min(MAX_SCSI_TRANSFER))
+    let clamped = (bytes as usize).min(MAX_SCSI_TRANSFER);
+    Some(clamped.max(128 * 1024))
 }
 
 /// A USB mass storage device presented as random-access bytes.
@@ -376,11 +370,11 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
             return Err(LuksError::ScsiProtocol("implausible block size"));
         }
 
-        let mut max_transfer = dev.transport.max_transfer().min(MAX_SCSI_TRANSFER);
-        if let Ok(limit) = dev.probe_vpd_block_limits() {
-            max_transfer = max_transfer.min(limit);
-            dev.transport.set_max_transfer(max_transfer);
-        }
+        // Linux deliberately avoids sending VPD queries (EVPD=1) to USB storage bridges
+        // because fragile cheap bridges often hang, crash, or time out. Transport transfer
+        // sizing is established from the link speed (USBDEVFS_GET_SPEED: 128 KiB for USB 2,
+        // 1 MiB for USB 3+), and automatically steps down to 128 KiB on any endpoint stall.
+        let max_transfer = dev.transport.max_transfer().min(MAX_SCSI_TRANSFER);
         dev.max_transfer.store(max_transfer, Ordering::Relaxed);
 
         Ok(dev)

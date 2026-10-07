@@ -933,17 +933,18 @@ fn write_cache_state_is_unknown_when_the_descriptor_overruns_the_response() {
 
 #[test]
 fn parse_vpd_block_limits_tests() {
-    // 1. Valid buffer with optimal and max blocks
+    // 1. Valid buffer with max blocks and optimal blocks:
+    // Uses ONLY max_blocks (2048 * 512 = 1 MiB), ignoring optimal blocks (1024 * 512 = 512 KiB)
     let mut buf = vec![0u8; 64];
     buf[1] = 0xB0; // Block limits page code
     // max_blocks = 2048 blocks (bytes 8..12) -> 2048 * 512 = 1 MiB
     buf[8..12].copy_from_slice(&2048u32.to_be_bytes());
-    // opt_blocks = 1024 blocks (bytes 12..16) -> 1024 * 512 = 512 KiB
+    // opt_blocks = 1024 blocks (bytes 12..16) -> ignored
     buf[12..16].copy_from_slice(&1024u32.to_be_bytes());
     assert_eq!(
         parse_vpd_block_limits(&buf, 512),
-        Some(512 * 1024),
-        "should choose minimum of max and opt: 512 KiB"
+        Some(1024 * 1024),
+        "should use max_blocks (1 MiB), ignoring optimal"
     );
 
     // 2. Only max_blocks set
@@ -955,13 +956,14 @@ fn parse_vpd_block_limits_tests() {
         Some(256 * 1024)
     );
 
-    // 3. Only opt_blocks set
-    let mut buf_opt_only = vec![0u8; 64];
-    buf_opt_only[1] = 0xB0;
-    buf_opt_only[12..16].copy_from_slice(&256u32.to_be_bytes()); // 256 * 512 = 128 KiB
+    // 3. Small max_blocks below 128 KiB is clamped up to 128 KiB floor
+    let mut buf_small = vec![0u8; 64];
+    buf_small[1] = 0xB0;
+    buf_small[8..12].copy_from_slice(&64u32.to_be_bytes()); // 64 * 512 = 32 KiB
     assert_eq!(
-        parse_vpd_block_limits(&buf_opt_only, 512),
-        Some(128 * 1024)
+        parse_vpd_block_limits(&buf_small, 512),
+        Some(128 * 1024),
+        "must enforce 128 KiB floor"
     );
 
     // 4. Clamping to MAX_SCSI_TRANSFER (1 MiB)
@@ -990,28 +992,18 @@ fn parse_vpd_block_limits_tests() {
 }
 
 #[test]
-fn vpd_block_limits_clamps_scsi_device_max_transfer() {
+fn open_does_not_send_vpd_queries_to_usb_storage() {
     let image = fixture("disks/gpt-luks.img");
-    // 512 blocks * 512 bytes = 256 KiB
     let drive = MockUsbDrive::new(image)
         .with_max_transfer(1024 * 1024)
         .with_vpd_block_limits(512, 1024);
     let dev = ScsiBlockDevice::open(drive).unwrap();
 
-    assert_eq!(dev.max_transfer(), 256 * 1024);
-    assert_eq!(dev.transport().max_transfer(), 256 * 1024);
-}
-
-#[test]
-fn vpd_block_limits_gracefully_ignored_on_rejection() {
-    let image = fixture("disks/gpt-luks.img");
-    let drive = MockUsbDrive::new(image)
-        .with_max_transfer(1024 * 1024)
-        .with_vpd_reject();
-    let dev = ScsiBlockDevice::open(drive).unwrap();
-
-    // Rejection of VPD Page 0xB0 must not fail open(), and max_transfer stays at default/transport cap
+    // open() does not query VPD Page 0xB0; max_transfer stays at transport cap (1 MiB)
     assert_eq!(dev.max_transfer(), 1024 * 1024);
+    // Manual query via probe_vpd_block_limits still functions if explicitly called
+    let limit = dev.probe_vpd_block_limits().unwrap();
+    assert_eq!(limit, 256 * 1024);
 }
 
 #[test]

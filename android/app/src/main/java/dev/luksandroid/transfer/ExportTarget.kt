@@ -3,6 +3,9 @@ package dev.luksandroid.transfer
 import android.content.Context
 import android.net.Uri
 import android.provider.DocumentsContract
+import android.system.ErrnoException
+import android.system.Os
+import android.system.OsConstants
 import dev.luksandroid.Trace
 import java.io.FileOutputStream
 import java.io.FilterOutputStream
@@ -308,13 +311,44 @@ fun availableFromStatVfs(blocksAvailable: Long, fragmentSize: Long): Long {
 fun syncOutputStream(out: OutputStream) {
     out.flush()
     val fos = unwrapFileOutputStream(out) ?: return
+    val fd = fos.fd
+    if (!fd.valid()) return
+
     try {
-        if (fos.fd.valid()) {
-            fos.fd.sync()
+        Os.fsync(fd)
+    } catch (e: ErrnoException) {
+        val errno = e.errno
+        // Ignore descriptors that do not support fsync (pipes, sockets, fifos, read-only).
+        // Real disk/flash errors (EIO, ENOSPC, EDQUOT, etc.) MUST be propagated.
+        if (!isNonSyncableErrno(errno)) {
+            throw IOException(e)
         }
-    } catch (_: SyncFailedException) {
-        // Thrown when the descriptor is a pipe, socket, or non-syncable virtual stream
+    } catch (_: LinkageError) {
+        // Fallback for non-Android environments (e.g. host JUnit tests)
+        try {
+            fd.sync()
+        } catch (e: SyncFailedException) {
+            val cause = e.cause
+            if (cause is ErrnoException) {
+                if (!isNonSyncableErrno(cause.errno)) {
+                    throw IOException(cause)
+                }
+            } else {
+                throw IOException(e)
+            }
+        }
     }
+}
+
+internal fun isNonSyncableErrno(errno: Int): Boolean {
+    // Linux/Bionic errno constants:
+    // EINVAL = 22, ENOTTY = 25, EBADF = 9, EROFS = 30, ESPIPE = 29
+    val einval = if (OsConstants.EINVAL != 0) OsConstants.EINVAL else 22
+    val enotty = if (OsConstants.ENOTTY != 0) OsConstants.ENOTTY else 25
+    val ebadf = if (OsConstants.EBADF != 0) OsConstants.EBADF else 9
+    val erofs = if (OsConstants.EROFS != 0) OsConstants.EROFS else 30
+    val espipe = 29
+    return errno == einval || errno == enotty || errno == ebadf || errno == erofs || errno == espipe
 }
 
 private fun unwrapFileOutputStream(stream: OutputStream): FileOutputStream? {

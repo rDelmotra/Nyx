@@ -1,5 +1,7 @@
 package dev.luksandroid.transfer
 
+import android.system.ErrnoException
+import android.system.OsConstants
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -136,6 +138,28 @@ class PendingNameTargetTest {
         } finally {
             tmp.delete()
         }
+    }
+
+    @Test
+    fun `syncOutputStream classifies EIO and ENOSPC as fatal while ignoring non-syncable errnos`() {
+        // Linux/Bionic standard errno codes
+        val eio = 5
+        val enospc = 28
+        val edquot = 122
+        val einval = 22
+        val enotty = 25
+        val ebadf = 9
+        val erofs = 30
+        val espipe = 29
+
+        assertFalse("EIO must not be ignored", isNonSyncableErrno(eio))
+        assertFalse("ENOSPC must not be ignored", isNonSyncableErrno(enospc))
+        assertFalse("EDQUOT must not be ignored", isNonSyncableErrno(edquot))
+        assertTrue("EINVAL must be ignored", isNonSyncableErrno(einval))
+        assertTrue("ENOTTY must be ignored", isNonSyncableErrno(enotty))
+        assertTrue("EBADF must be ignored", isNonSyncableErrno(ebadf))
+        assertTrue("EROFS must be ignored", isNonSyncableErrno(erofs))
+        assertTrue("ESPIPE must be ignored", isNonSyncableErrno(espipe))
     }
 }
 

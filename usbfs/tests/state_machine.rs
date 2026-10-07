@@ -368,15 +368,15 @@ fn dynamic_step_down_on_large_transfer_stall() {
 
     // Initial submission stalls with EPIPE
     mock.set_submit_errno(Some(libc::EPIPE));
-    // The retry at 128 KiB will poll and reap successfully
-    mock.push_poll(Ok(libc::POLLOUT));
-    mock.push_reap(0, 1);
 
     let data = vec![0x42u8; 512 * 1024];
-    let written = t.write(&data).expect("write should recover and succeed after step-down");
-    assert_eq!(written, 128 * 1024);
+    let err = t.write(&data).unwrap_err();
+    assert!(matches!(err, LuksError::UsbErrno { errno, .. } if errno == libc::EPIPE));
+    // The transport must have stepped down its max_transfer to 128 KiB
     assert_eq!(t.max_transfer(), 128 * 1024);
-    assert_eq!(mock.clear_halt_count(), 1);
+    // The USB transport layer must NOT retry or clear_halt on the data pipe;
+    // error must be returned to SCSI layer for BOT Reset Recovery and clean re-issue.
+    assert_eq!(mock.clear_halt_count(), 0);
 }
 
 #[test]

@@ -687,11 +687,19 @@ impl UsbFsTransport {
     /// fences that write. A fresh transport starts at the original limit.
     ///
     /// [`DATA_PHASE_MIN_BYTES`]: Self::DATA_PHASE_MIN_BYTES
-    fn on_bulk_error(&self, ep: u8, e: i32, attempted: usize, limit: usize) -> bool {
+    fn on_bulk_error(&self, _ep: u8, e: i32, attempted: usize, limit: usize) -> bool {
         if e == libc::EPIPE && attempted > 128 * 1024 {
+            // Step down the session's limit so subsequent transfers will not exceed 128 KiB.
+            // Under USB Mass Storage Bulk-Only Transport (BOT) rules, an endpoint stall in the
+            // middle of the data phase means the drive has abandoned the current command.
+            // The USB transport layer MUST NOT retry on the data pipe:
+            // - On read: the drive expects to send a CSW status reply, not more data.
+            // - On write: sending data when the drive expects a CSW or new command causes
+            //   raw file data to be interpreted as a command (CBW)!
+            // We return false so the stall error propagates to the SCSI layer. The SCSI layer
+            // performs Reset Recovery and re-issues the command in <= 128 KiB pieces.
             self.max_transfer.fetch_min(128 * 1024, Ordering::Relaxed);
-            let _ = self.clear_halt(ep & 0x80 != 0);
-            return true;
+            return false;
         }
 
         let size_error = e == libc::EINVAL || e == libc::ENOMEM;

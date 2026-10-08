@@ -13,10 +13,10 @@ All integration tests are registered in [`core/Cargo.toml`](../Cargo.toml) with 
 | [`crypto_luks/`](crypto_luks/) | 7 | Cryptographic backends, Argon2id/PBKDF2, AES, secret zeroization, LUKS2 headers, keyslot unlocking | Default / `dangerous-write-support` |
 | [`device_scsi/`](device_scsi/) | 6 | USB Mass Storage Bulk-Only Transport (BOT), SCSI command emulation (INQUIRY, READ/WRITE), mock drive, write cost metrics | Default / `dangerous-write-support` |
 | [`ext4/`](ext4/) | 11 | ext4 inode allocation/deallocation, directory indexing (htree), checksumming, block allocators, streaming | Default / `dangerous-write-support` |
-| [`btrfs_tree/`](btrfs_tree/) | 6 | B-tree regressions (root split, empty leaf, CoW key fixup, node round-trip) and self-tests for the shared tree and accounting checkers | `dangerous-write-support` |
+| [`btrfs_tree/`](btrfs_tree/) | 7 | B-tree state suite (`btrfs_states`: grow/shrink, free-space tree, big files, batch shapes, power cuts, each phase judged by both checkers and `btrfs check`), B-tree regressions (root split, empty leaf, CoW key fixup, node round-trip) and self-tests for the shared tree and accounting checkers | `dangerous-write-support` |
 | [`txn_batch/`](txn_batch/) | 10 | Atomic commit pipeline, reservation stages (B2, C, FG), transaction batching, crash safety, fail-closed aborts | `dangerous-write-support` |
 | [`alloc_chunk/`](alloc_chunk/) | 8 | Btrfs chunk allocation, free space search, block group management, system chunk valves, extent trees | Default / `dangerous-write-support` |
-| [`btrfs_ops/`](btrfs_ops/) | 16 | High-level file and directory CRUD (read, create, write, delete, mkdir, rename, finish csum, timestamp, gates, subvolume prep & write, byte-identical determinism) | Default / `dangerous-write-support` |
+| [`btrfs_ops/`](btrfs_ops/) | 19 | High-level file and directory CRUD (read, create, write, delete, mkdir, rename, finish csum, timestamp, gates incl. shared-history/quota refusal, subvolume prep & write, byte-identical determinism) | Default / `dangerous-write-support` |
 | [`integration/`](integration/) | 6 | Full-stack scenarios, statfs capacity, tree import replays, forensic logs, and oracle ledgers | Default / `dangerous-write-support` |
 | [`common/`](common/) | - | Shared test harnesses: `accounting.rs`, `btree_validator.rs`, `csum_pack.rs`, `fail_after.rs`, `mem_device.rs`, `oracle.rs`, `scratch.rs`, `temp_guard.rs` | Shared helper modules |
 
@@ -33,7 +33,7 @@ cargo test -p luks_core --test luks2_header
 
 # Write-enabled tests:
 cargo test -p luks_core --features dangerous-write-support --test btrfs_tree_validator
-cargo test -p luks_core --features dangerous-write-support --test btrfs_conformance
+cargo test -p luks_core --features dangerous-write-support --release --test btrfs_states
 ```
 
 ### Running Entire Test Suites

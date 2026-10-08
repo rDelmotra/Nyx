@@ -14,7 +14,8 @@ use luks_core::error::{LuksError, Result};
 // writes).
 // ---------------------------------------------------------------------
 
-/// Wraps a real, file-backed [`FileDevice`] and simulates the device
+/// Wraps a device (a file-backed [`FileDevice`] by default, or an in-memory
+/// one) and simulates the device
 /// disappearing (USB detach, power loss) after `budget` successful
 /// `write_at` calls.
 ///
@@ -23,8 +24,8 @@ use luks_core::error::{LuksError, Result};
 /// used rather than `Cell` so the wrapper stays `Sync`-agnostic-safe; the
 /// test harness is single-threaded, but nothing about the trait promises
 /// that.
-pub struct FailAfterNWrites {
-    pub inner: FileDevice,
+pub struct FailAfterNWrites<D = FileDevice> {
+    pub inner: D,
     /// Number of `write_at` calls still allowed to succeed.
     pub budget: AtomicUsize,
     /// Total `write_at` calls observed, successful or not — used by the
@@ -33,8 +34,8 @@ pub struct FailAfterNWrites {
     pub attempted: AtomicUsize,
 }
 
-impl FailAfterNWrites {
-    pub fn new(inner: FileDevice, budget: usize) -> Self {
+impl<D> FailAfterNWrites<D> {
+    pub fn new(inner: D, budget: usize) -> Self {
         Self {
             inner,
             budget: AtomicUsize::new(budget),
@@ -52,7 +53,7 @@ impl FailAfterNWrites {
     }
 }
 
-impl ReadAt for FailAfterNWrites {
+impl<D: ReadAt> ReadAt for FailAfterNWrites<D> {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
         self.inner.read_at(offset, buf)
     }
@@ -62,7 +63,7 @@ impl ReadAt for FailAfterNWrites {
     }
 }
 
-impl WriteAt for FailAfterNWrites {
+impl<D: WriteAt> WriteAt for FailAfterNWrites<D> {
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
         self.attempted.fetch_add(1, Ordering::SeqCst);
         // Decrement-if-nonzero. Every call after the budget hits zero fails,

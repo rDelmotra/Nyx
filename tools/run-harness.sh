@@ -136,6 +136,8 @@ if [ "$RUN_INTEGRATION" -eq 1 ]; then
         --test btrfs_cow_fixup \
         --test btrfs_node_surgery \
         --test btrfs_tree_validator \
+        --test btrfs_states \
+        --test btrfs_shared_history_gate \
         --test btrfs_accounting_oracle \
         --test btrfs_chunk_alloc_search \
         --test btrfs_batch_double_alloc \

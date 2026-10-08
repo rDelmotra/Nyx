@@ -225,6 +225,11 @@ name = "btrfs_node_surgery"
 path = "tests/btrfs_tree/btrfs_node_surgery.rs"
 required-features = ["dangerous-write-support"]
 
+[[test]]
+name = "btrfs_states"
+path = "tests/btrfs_tree/btrfs_states.rs"
+required-features = ["dangerous-write-support"]
+
 
 # --- txn_batch (10 tests) ---
 [[test]]
@@ -382,6 +387,11 @@ required-features = ["dangerous-write-support"]
 [[test]]
 name = "btrfs_csum_type_gate"
 path = "tests/btrfs_ops/btrfs_csum_type_gate.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_shared_history_gate"
+path = "tests/btrfs_ops/btrfs_shared_history_gate.rs"
 required-features = ["dangerous-write-support"]
 
 [[test]]

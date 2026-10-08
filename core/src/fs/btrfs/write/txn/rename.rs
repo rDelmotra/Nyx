@@ -89,6 +89,8 @@ impl Transaction {
         let new_generation = sb.generation + 1;
 
         let extent_tree = ExtentTree::read(fs)?;
+
+        gate::check_no_shared_history_or_quota(fs, &extent_tree)?;
         let mut allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(&extent_tree, fs.chunk_map())?;
         let mut pending_blocks = HashMap::new();
         let mut blocks_to_add = Vec::<(u64, u8, u64)>::new();
@@ -404,11 +406,7 @@ fn resolve_rename<D: ReadAt>(
                 let extent_tree_for_refs = ExtentTree::read(fs)?;
                 for &(bytenr, _num_bytes) in &data_extents_to_free {
                     if let Some(ext) = extent_tree_for_refs.extents.iter().find(|e| e.bytenr == bytenr) {
-                        if ext.refs > 1 {
-                            return Err(LuksError::UnsupportedFsFeature(
-                                "overwriting a file with shared data extents (refs > 1) is not supported".into(),
-                            ));
-                        }
+                        gate::check_data_extent_freeable(ext)?;
                     }
                 }
             }

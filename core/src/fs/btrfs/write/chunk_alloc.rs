@@ -251,6 +251,7 @@ pub fn allocate_data_chunk_transaction_excluding<D: ReadAt>(
 
     let new_generation = sb.generation + 1;
     let extent_tree = ExtentTree::read(fs)?;
+    gate::check_no_shared_history_or_quota(fs, &extent_tree)?;
     let mut allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(&extent_tree, fs.chunk_map())?;
     if !reserved.is_empty() {
         let reserved_ranges: Vec<std::ops::Range<u64>> = reserved

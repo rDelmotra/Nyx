@@ -20,6 +20,18 @@ layout. Test names are preserved as explicit
 `[[test]]` targets in `core/Cargo.toml`, so `cargo test --test <name>` still works
 without knowing which subdirectory a test lives in.
 
+### B-tree state suite
+```bash
+cargo test -p luks_core --features dangerous-write-support --release --test btrfs_states
+```
+Drives the real write API through the tree shapes a drive goes through: a
+folder growing to a 3-level tree and emptied again, a fragmented free-space
+tree, big files filling the checksum tree, a batch writing into two folders,
+and a power cut at every write of a split or delete commit. After every phase
+the image is graded by `TreeValidator`, `AccountingOracle` and
+`btrfs check --readonly` (local btrfs-progs, else colima). Needs
+`fixtures/btrfs/states-4k.img` (`tools/gen-btrfs-fixtures.sh`, mkfs only).
+
 ### 2. Autonomous Test Harness (recommended before a PR)
 ```bash
 # Every tier: fast/integration/oracle/strict/android

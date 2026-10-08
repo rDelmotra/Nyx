@@ -51,6 +51,8 @@ REQUIRED_BTRFS=(
     "subvol-shared.img"
     "nonmixed-4k.img"
     "sha256-4k.img"
+    "states-4k.img"
+    "quota-4k.img"
     "fst-aged.img"
     "fst-multileaf.img"
     "fst-bitmap.img"

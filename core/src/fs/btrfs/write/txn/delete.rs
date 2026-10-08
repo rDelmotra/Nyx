@@ -177,17 +177,15 @@ impl Transaction {
         data_extents_to_free.sort_unstable();
         data_extents_to_free.dedup();
 
-        // G1: Refuse to free shared extents (refs > 1). This prevents
-        // data corruption when deleting files that share extents via
-        // reflink, deduplication, or snapshots.
+        // G1: Refuse to free shared extents (refs > 1), or one whose only
+        // ref lives outside the extent item. This prevents corruption when
+        // deleting files that share extents via reflink, deduplication, or
+        // snapshots.
         let extent_tree = ExtentTree::read(fs)?;
+        gate::check_no_shared_history_or_quota(fs, &extent_tree)?;
         for &(bytenr, _num_bytes) in &data_extents_to_free {
             if let Some(ext) = extent_tree.extents.iter().find(|e| e.bytenr == bytenr) {
-                if ext.refs > 1 {
-                    return Err(LuksError::UnsupportedFsFeature(
-                        "deleting a file with shared data extents (refs > 1) is not supported".into(),
-                    ));
-                }
+                gate::check_data_extent_freeable(ext)?;
             }
         }
 

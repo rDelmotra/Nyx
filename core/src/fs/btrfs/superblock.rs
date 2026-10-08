@@ -365,6 +365,10 @@ impl Superblock {
         self.incompat_flags & INCOMPAT_MIXED_GROUPS != 0
     }
 
+    pub fn has_simple_quota(&self) -> bool {
+        self.incompat_flags & INCOMPAT_SIMPLE_QUOTA != 0
+    }
+
     /// Whether tree blocks are recorded as skinny `METADATA_ITEM`s (key
     /// offset = level) rather than legacy `EXTENT_ITEM`s carrying an inline
     /// `tree_block_info` header. The write engine's extent-tree parser only

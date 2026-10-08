@@ -101,6 +101,7 @@ pub const DEV_TREE_OBJECTID: u64 = 4;
 pub const FS_TREE_OBJECTID: u64 = 5;
 pub const ROOT_TREE_DIR_OBJECTID: u64 = 6;
 pub const CSUM_TREE_OBJECTID: u64 = 7;
+pub const QUOTA_TREE_OBJECTID: u64 = 8;
 pub const FREE_SPACE_TREE_OBJECTID: u64 = 10;
 pub const BLOCK_GROUP_TREE_OBJECTID: u64 = 11;
 pub const FIRST_CHUNK_TREE_OBJECTID: u64 = 256;

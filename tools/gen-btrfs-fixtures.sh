@@ -25,7 +25,7 @@
 set -euo pipefail
 
 OUT="${1:-/tmp/btrfs-fixtures}"
-TARGETS="${2:-plain compress mixed-4k subvol subvol-aged subvol-shared large nonmixed-4k sha256-4k fst-aged fst-multileaf fst-bitmap}"
+TARGETS="${2:-plain compress mixed-4k subvol subvol-aged subvol-shared large nonmixed-4k sha256-4k states-4k quota-4k fst-aged fst-multileaf fst-bitmap}"
 UUID_PLAIN="33333333-4444-5555-6666-777777777777"
 UUID_COMPRESS="88888888-9999-aaaa-bbbb-cccccccccccc"
 UUID_MIXED="11111111-2222-3333-4444-555555555555"
@@ -35,6 +35,8 @@ UUID_SUBVOL_SHARED="acacacac-bded-cefe-dfaf-e0e0e0e0e0e0"
 UUID_LARGE="44444444-5555-6666-7777-888888888888"
 UUID_NONMIXED="99999999-8888-7777-6666-555555555555"
 UUID_SHA256="12121212-3434-5656-7878-909090909090"
+UUID_STATES="23232323-4545-6767-8989-a0a0a0a0a0a0"
+UUID_QUOTA="34343434-5656-7878-9a9a-b0b0b0b0b0b0"
 UUID_FST_AGED="77777777-6666-5555-4444-333333333333"
 UUID_FST_MULTILEAF="66666666-5555-4444-3333-222222222222"
 UUID_FST_BITMAP="55555555-4444-3333-2222-111111111111"
@@ -343,6 +345,32 @@ rm -f "$IMG"
 truncate -s 1G "$IMG"
 mkfs.btrfs -q -f -n 4096 --csum sha256 -L BTRFSSHA -U "$UUID_SHA256" "$IMG"
 echo "  -> sha256-4k.img"
+fi
+
+# --- states-4k.img: small, empty, 4k nodes -----------------------------------
+# The B-tree state suite (core/tests/btrfs_tree/btrfs_states.rs) loads this
+# into memory. 4096-byte nodes make trees grow tall after a few thousand
+# items; 256 MiB keeps each in-memory copy cheap. Default profiles (metadata
+# DUP), same as a stick formatted with plain mkfs.btrfs. No mount needed.
+if want states-4k; then
+echo "Building states-4k.img..."
+IMG="$OUT/states-4k.img"
+rm -f "$IMG"
+truncate -s 256M "$IMG"
+mkfs.btrfs -q -f -n 4096 -L BTRFSSTATES -U "$UUID_STATES" "$IMG"
+echo "  -> states-4k.img"
+fi
+
+# --- quota-4k.img: qgroups enabled -------------------------------------------
+# The writer does not maintain qgroup counters, so it must refuse this volume
+# by name (gate::check_no_shared_history_or_quota). No mount needed.
+if want quota-4k; then
+echo "Building quota-4k.img..."
+IMG="$OUT/quota-4k.img"
+rm -f "$IMG"
+truncate -s 256M "$IMG"
+mkfs.btrfs -q -f -n 4096 -O quota -L BTRFSQUOTA -U "$UUID_QUOTA" "$IMG"
+echo "  -> quota-4k.img"
 fi
 
 # --- fst-aged.img: ~500 free extents, ~80-90% of single-leaf ceiling (16 KiB nodes)

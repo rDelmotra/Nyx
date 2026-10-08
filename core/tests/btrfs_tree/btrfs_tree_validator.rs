@@ -146,7 +146,7 @@ fn test_validate_all_on_all_fixtures() {
 }
 
 #[test]
-fn test_tree_validator_i6_root_single_child_negative_control() {
+fn test_tree_validator_root_single_child_allowed_and_counted() {
     let (fs, mut allocator, root_bytenr, _) = setup_in_memory_fixture();
     let mem_dev = fs.device().clone();
     let node_size = fs.superblock().node_size;
@@ -190,24 +190,12 @@ fn test_tree_validator_i6_root_single_child_negative_control() {
 
     let remounted = Btrfs::mount(mem_dev).expect("remount btrfs");
 
-    // Validating this interior root (level = 1, nr_items = 1) MUST fail Invariant I-6!
-    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = TreeValidator::validate(&remounted, interior_bytenr, Some(1));
-    }));
-
-    assert!(res.is_err(), "TreeValidator must reject an interior root with exactly 1 child (Invariant I-6)");
-    let err = res.expect_err("must fail");
-    let msg = if let Some(s) = err.downcast_ref::<&str>() {
-        s.to_string()
-    } else if let Some(s) = err.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        String::new()
-    };
-    assert!(
-        msg.contains("Invariant I-6"),
-        "Expected Invariant I-6 panic message, got: {msg}"
-    );
+    // A root with one child is legal btrfs (the kernel leaves it too, and
+    // `btrfs check` accepts it): it must validate and be counted.
+    let report = TreeValidator::validate(&remounted, interior_bytenr, Some(1))
+        .expect("an interior root with one child is legal");
+    assert_eq!(report.tree_height, 1);
+    assert_eq!(report.total_single_child_interior_nodes, 1, "the root itself is counted");
 }
 
 #[test]

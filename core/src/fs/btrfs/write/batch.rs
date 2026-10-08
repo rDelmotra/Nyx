@@ -16,7 +16,8 @@ use crate::fs::btrfs::tree::{
 use crate::fs::btrfs::write::alloc::FreeSpaceMap;
 use crate::fs::btrfs::write::cow::{cow_tree_insert, cow_tree_mutate};
 use crate::fs::btrfs::write::extent_tree::{
-    converge_and_finalize, find_item_in_tree, find_max_inode, record_cow_result, ExtentTree,
+    converge_and_finalize, find_item_in_tree, find_max_inode, max_offset_in_tree, record_cow_result,
+    ExtentTree,
 };
 use crate::fs::btrfs::write::file::BtrfsFileWriter;
 use crate::fs::btrfs::write::interval_set::IntervalSet;
@@ -99,6 +100,7 @@ impl Batch {
     /// Open a new batch by scanning the filesystem's extent tree.
     pub fn open<D: WriteAt>(fs: &mut Btrfs<D>) -> Result<Self> {
         let ext_tree = ExtentTree::read(fs)?;
+        gate::check_no_shared_history_or_quota(fs, &ext_tree)?;
         let chunk_map = fs.chunk_map().clone();
         let allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(&ext_tree, &chunk_map)?;
         Self::open_with_allocator(fs, allocator)
@@ -461,13 +463,17 @@ impl Batch {
             *next_idx += 1;
             idx
         } else {
-            let mut max_dir_index = 1u64;
-            fs.for_each_item(self.fs_root.0, parent_ino, DIR_INDEX_KEY, &mut |key, _| {
-                if key.offset > max_dir_index {
-                    max_dir_index = key.offset;
-                }
-                Ok(true)
-            })?;
+            // Through `pending`: once an earlier file in this batch has
+            // changed the tree, `self.fs_root` names a block not yet on disk.
+            let max_dir_index = max_offset_in_tree(
+                fs,
+                &self.pending_blocks,
+                self.fs_root.0,
+                parent_ino,
+                DIR_INDEX_KEY,
+            )?
+            .unwrap_or(1)
+            .max(1);
             let idx = max_dir_index + 1;
             self.next_dir_index.insert(parent_ino, idx + 1);
             idx

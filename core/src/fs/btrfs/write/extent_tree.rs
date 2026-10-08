@@ -346,6 +346,19 @@ fn parse_inline_backrefs(mut data: &[u8]) -> Result<Vec<InlineBackref>> {
     Ok(backrefs)
 }
 
+/// Why an extent's flags or inline backrefs show it was once shared, if they do.
+fn shared_mark(flags: u64, backrefs: &[InlineBackref]) -> Option<&'static str> {
+    if flags & BLOCK_FLAG_FULL_BACKREF != 0 {
+        return Some("FULL_BACKREF flag");
+    }
+    backrefs.iter().find_map(|b| match b {
+        InlineBackref::SharedBlock { .. } => Some("shared tree block backref"),
+        InlineBackref::SharedData { .. } => Some("shared data backref"),
+        InlineBackref::Other { .. } => Some("unknown inline backref type"),
+        InlineBackref::TreeBlock { .. } | InlineBackref::ExtentData { .. } => None,
+    })
+}
+
 /// Unified representation of an allocated extent (data or metadata).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AllocatedExtent {
@@ -364,6 +377,13 @@ pub struct AllocatedExtent {
 pub struct ExtentTree {
     pub block_groups: Vec<BlockGroupItem>,
     pub extents: Vec<AllocatedExtent>,
+    /// First sign, if any, that this filesystem's metadata was once shared
+    /// (a snapshot, a reflink, a balance): a `FULL_BACKREF` tree block, a
+    /// shared or keyed tree-block backref, or a backref type this writer does
+    /// not know. The writer only maintains plain inline owner refs, so CoW
+    /// over any of these would leave backrefs naming freed blocks.
+    /// `gate::check_no_shared_history_or_quota` refuses on it.
+    pub shared_history: Option<String>,
 }
 
 impl ExtentTree {
@@ -393,6 +413,12 @@ impl ExtentTree {
         let mut block_groups = Vec::new();
         let mut extents = Vec::new();
         let node_size = fs.superblock().node_size as u64;
+        let mut shared_history: Option<String> = None;
+        let mut note = |what: String| {
+            if shared_history.is_none() {
+                shared_history = Some(what);
+            }
+        };
 
         fs.walk_tree(root.bytenr, &mut |key, data| {
             match key.item_type {
@@ -400,8 +426,17 @@ impl ExtentTree {
                     let bg = BlockGroupItem::parse(&key, data)?;
                     block_groups.push(bg);
                 }
+                TREE_BLOCK_REF_KEY | SHARED_BLOCK_REF_KEY | SHARED_DATA_REF_KEY => {
+                    note(format!(
+                        "keyed backref item type {} for extent {}",
+                        key.item_type, key.objectid
+                    ));
+                }
                 EXTENT_ITEM_KEY => {
                     let item = ExtentItem::parse(&key, data)?;
+                    if let Some(why) = shared_mark(item.flags, &item.backrefs) {
+                        note(format!("extent {}: {why}", item.bytenr));
+                    }
                     let is_data = item.flags & EXTENT_FLAG_DATA != 0;
                     let is_tree_block = item.flags & EXTENT_FLAG_TREE_BLOCK != 0;
                     extents.push(AllocatedExtent {
@@ -417,6 +452,11 @@ impl ExtentTree {
                 }
                 METADATA_ITEM_KEY => {
                     let item = MetadataItem::parse(&key, data)?;
+                    if let Some(why) = shared_mark(item.flags, &item.backrefs) {
+                        note(format!("tree block {}: {why}", item.bytenr));
+                    } else if item.refs == 1 && item.backrefs.is_empty() {
+                        note(format!("tree block {}: backref stored outside the item", item.bytenr));
+                    }
                     extents.push(AllocatedExtent {
                         bytenr: item.bytenr,
                         length: node_size,
@@ -440,6 +480,7 @@ impl ExtentTree {
         Ok(ExtentTree {
             block_groups,
             extents,
+            shared_history,
         })
     }
 
@@ -596,6 +637,60 @@ pub(crate) fn find_item_in_tree<D: ReadAt>(
         depth += 1;
     }
     Ok(None)
+}
+
+/// Largest key offset among items `(objectid, item_type, *)` in the tree
+/// rooted at `root_bytenr`, consulting `pending`, or `None` if there are none.
+///
+/// Mid-batch the root and the nodes under it may exist only in `pending`;
+/// reading them from the device instead returns whatever older block sits at
+/// that address.
+pub(crate) fn max_offset_in_tree<D: ReadAt>(
+    fs: &Btrfs<D>,
+    pending: &HashMap<u64, Vec<u8>>,
+    root_bytenr: u64,
+    objectid: u64,
+    item_type: u8,
+) -> Result<Option<u64>> {
+    fn walk<D: ReadAt>(
+        fs: &Btrfs<D>,
+        pending: &HashMap<u64, Vec<u8>>,
+        bytenr: u64,
+        lo: &Key,
+        hi: &Key,
+        depth: usize,
+        best: &mut Option<u64>,
+    ) -> Result<()> {
+        if depth > 16 {
+            return Err(LuksError::CorruptFs("btrfs tree deeper than 16 levels"));
+        }
+        let node = read_node(fs, pending, bytenr)?;
+        if node.is_leaf() {
+            for i in 0..node.nr_items {
+                let k = node.key(i)?;
+                if k >= *lo && k <= *hi {
+                    *best = Some(best.map_or(k.offset, |b| b.max(k.offset)));
+                }
+            }
+            return Ok(());
+        }
+        // Child i holds keys in [key(i), key(i+1)).
+        for i in 0..node.nr_items {
+            let start = node.key(i)?;
+            let starts_after_range = start > *hi;
+            let ends_before_range = i + 1 < node.nr_items && node.key(i + 1)? <= *lo;
+            if !starts_after_range && !ends_before_range {
+                walk(fs, pending, node.key_ptr(i)?.blockptr, lo, hi, depth + 1, best)?;
+            }
+        }
+        Ok(())
+    }
+
+    let lo = Key::new(objectid, item_type, 0);
+    let hi = Key::new(objectid, item_type, u64::MAX);
+    let mut best = None;
+    walk(fs, pending, root_bytenr, &lo, &hi, 0, &mut best)?;
+    Ok(best)
 }
 
 /// Collect all (Key, data) items present in the tree rooted at `bytenr`, consulting `pending`.
@@ -954,6 +1049,14 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
                             "modifying shared tree blocks is not supported (subvolume is snapshotted)".into(),
                         ));
                     }
+                    // Second line behind `gate::check_no_shared_history_or_quota`:
+                    // a once-shared block's children name it by address.
+                    let flags = u64::from_le_bytes(data[16..24].try_into().unwrap());
+                    if flags & BLOCK_FLAG_FULL_BACKREF != 0 {
+                        return Err(LuksError::UnsupportedFsFeature(
+                            "modifying a once-shared (FULL_BACKREF) tree block is not supported".into(),
+                        ));
+                    }
                     let _ = leaf.delete_item(&del_key)?;
                     freed_to_allocator = true;
                     Ok(())
@@ -1070,34 +1173,6 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
                 !to_delete.is_empty() || !to_insert.is_empty() || !to_mutate.is_empty();
 
             if fst_modified {
-                for del_key in to_delete {
-                    let fst_res = cow_tree_mutate(
-                        fs,
-                        &pending_blocks,
-                        *fst_bytenr,
-                        *fst_level,
-                        FREE_SPACE_TREE_OBJECTID,
-                        &del_key,
-                        new_generation,
-                        &mut allocator,
-                        |leaf| {
-                            let _ = leaf.delete_item(&del_key)?;
-                            Ok(())
-                        },
-                    )?;
-                    record_cow_result(
-                        &fst_res,
-                        &mut blocks_to_add,
-                        &mut blocks_to_remove,
-                        &mut allocator,
-                        &mut pending_blocks,
-                        sb.node_size,
-                        FREE_SPACE_TREE_OBJECTID,
-                    )?;
-                    *fst_bytenr = fst_res.new_root_bytenr;
-                    *fst_level = fst_res.new_root_level;
-                }
-
                 for (mut_key, mut_data) in to_mutate {
                     let fst_res = cow_tree_mutate(
                         fs,
@@ -1129,6 +1204,13 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
                     *fst_level = fst_res.new_root_level;
                 }
 
+                // Inserts before deletes. A changed free extent is a new key
+                // (start and length are the key), so it arrives as one delete
+                // plus one insert. Deleting first can empty a leaf that holds
+                // only that item, collapsing the tree, and the insert then
+                // splits it again onto other blocks, which changes the free
+                // space this tree describes: on a fragmented volume that
+                // flipped between two states until the round limit.
                 for (ins_key, ins_data) in to_insert {
                     let fst_res = cow_tree_insert(
                         fs,
@@ -1140,6 +1222,34 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
                         ins_data,
                         new_generation,
                         &mut allocator,
+                    )?;
+                    record_cow_result(
+                        &fst_res,
+                        &mut blocks_to_add,
+                        &mut blocks_to_remove,
+                        &mut allocator,
+                        &mut pending_blocks,
+                        sb.node_size,
+                        FREE_SPACE_TREE_OBJECTID,
+                    )?;
+                    *fst_bytenr = fst_res.new_root_bytenr;
+                    *fst_level = fst_res.new_root_level;
+                }
+
+                for del_key in to_delete {
+                    let fst_res = cow_tree_mutate(
+                        fs,
+                        &pending_blocks,
+                        *fst_bytenr,
+                        *fst_level,
+                        FREE_SPACE_TREE_OBJECTID,
+                        &del_key,
+                        new_generation,
+                        &mut allocator,
+                        |leaf| {
+                            let _ = leaf.delete_item(&del_key)?;
+                            Ok(())
+                        },
                     )?;
                     record_cow_result(
                         &fst_res,

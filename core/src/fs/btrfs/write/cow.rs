@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use crate::device::ReadAt;
 use crate::error::{LuksError, Result};
-use crate::fs::btrfs::tree::{Key, Node};
+use crate::fs::btrfs::tree::{check_generation, Key, Node};
 use crate::fs::btrfs::write::alloc::FreeSpaceMap;
 use crate::fs::btrfs::write::node::{InteriorNode, Leaf, LeafItem};
 use crate::fs::btrfs::Btrfs;
@@ -61,6 +61,7 @@ pub fn cow_tree_insert<D: ReadAt>(
         fs,
         pending,
         root_bytenr,
+        None,
         root_level,
         owner,
         &key,
@@ -221,6 +222,8 @@ fn cow_descend_insert<D: ReadAt>(
     fs: &Btrfs<D>,
     pending: &HashMap<u64, Vec<u8>>,
     bytenr: u64,
+    // Generation the parent recorded for this child; `None` for the root.
+    expected_gen: Option<u64>,
     level: u8,
     owner: u64,
     target_key: &Key,
@@ -234,6 +237,9 @@ fn cow_descend_insert<D: ReadAt>(
     let node_size = sb.node_size;
     let csum_type = sb.csum_type;
     let node = read_node(fs, pending, bytenr)?;
+    if let Some(expected) = expected_gen {
+        check_generation(expected, &node)?;
+    }
 
     let is_already_new = node.generation == generation && pending.contains_key(&bytenr);
     if is_already_new {
@@ -387,6 +393,7 @@ fn cow_descend_insert<D: ReadAt>(
             fs,
             pending,
             child_ptr.blockptr,
+            Some(child_ptr.generation),
             level - 1,
             owner,
             target_key,
@@ -529,6 +536,7 @@ where
         fs,
         pending,
         root_bytenr,
+        None,
         root_level,
         owner,
         target_key,
@@ -563,6 +571,8 @@ fn cow_descend<D: ReadAt, F>(
     fs: &Btrfs<D>,
     pending: &HashMap<u64, Vec<u8>>,
     bytenr: u64,
+    // Generation the parent recorded for this child; `None` for the root.
+    expected_gen: Option<u64>,
     level: u8,
     owner: u64,
     target_key: &Key,
@@ -580,6 +590,9 @@ where
     let node_size = sb.node_size;
     let csum_type = sb.csum_type;
     let node = read_node(fs, pending, bytenr)?;
+    if let Some(expected) = expected_gen {
+        check_generation(expected, &node)?;
+    }
 
     let is_already_new = node.generation == generation && pending.contains_key(&bytenr);
     if is_already_new {
@@ -665,6 +678,7 @@ where
             fs,
             pending,
             child_ptr.blockptr,
+            Some(child_ptr.generation),
             level - 1,
             owner,
             target_key,
@@ -749,6 +763,7 @@ where
         if is_root && interior.entries.len() == 1 {
             let child_entry = &interior.entries[0];
             let child_bytenr = child_entry.blockptr;
+            let child_entry_gen = child_entry.generation;
             let child_key = child_entry.key;
             let child_level = level - 1;
             freed.push((bytenr, level));
@@ -767,6 +782,7 @@ where
             // The child has a stale generation — read it, stamp it with the
             // current generation at a fresh address, and emit.
             let child_node = read_node(fs, pending, child_bytenr)?;
+            check_generation(child_entry_gen, &child_node)?;
             let new_bytenr = allocator.allocate_metadata_for_owner(node_size, owner)?;
             allocated.push((new_bytenr, child_level));
             freed.push((child_bytenr, child_level));

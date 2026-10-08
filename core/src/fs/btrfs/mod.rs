@@ -317,6 +317,7 @@ impl<D: ReadAt> Btrfs<D> {
                     "btrfs child node is not one level below its parent",
                 ));
             }
+            ptr.check_child(&child)?;
             self.walk_node(child, visit)?;
         }
         Ok(())
@@ -366,14 +367,17 @@ impl<D: ReadAt> Btrfs<D> {
         if data.len() < 239 {
             return Err(LuksError::CorruptFs("btrfs root item truncated"));
         }
-        Ok(Some(TreeRoot {
+        let root = TreeRoot {
             objectid,
             bytenr: u64::from_le_bytes(data[176..184].try_into().unwrap()),
             level: data[238],
             root_dirid: u64::from_le_bytes(data[168..176].try_into().unwrap()),
             generation: u64::from_le_bytes(data[160..168].try_into().unwrap()),
             flags: u64::from_le_bytes(data[208..216].try_into().unwrap()),
-        }))
+        };
+        // The root item is the "parent" of the tree's root node.
+        tree::check_generation(root.generation, &self.read_node(root.bytenr)?)?;
+        Ok(Some(root))
     }
 
     /// The **current** root of the tree with this objectid, as of now.

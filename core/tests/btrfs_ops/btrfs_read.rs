@@ -722,8 +722,9 @@ fn searching_costs_the_depth_of_the_tree_not_its_size() {
     fs.walk_tree(root, &mut |_, _| Ok(())).unwrap();
     let walked = load(&fs) - before;
 
-    // level 1 tree: root node plus one leaf.
-    assert_eq!(searched, 2, "a search should read one node per level");
+    // level 1 tree: root node plus one leaf. Mount already read and verified
+    // the root against its root item, so the root is cached by now.
+    assert_eq!(searched, 1, "a search should read one node per level below the cached root");
     assert!(
         walked > searched * 4,
         "walking read {walked} nodes, searching {searched} — the fixture is \

@@ -59,6 +59,7 @@ impl<'a, D: ReadAt> Cursor<'a, D> {
                     "btrfs child node is not one level below its parent",
                 ));
             }
+            ptr.check_child(&child)?;
             path.push((node, i));
             node = child;
         }
@@ -151,15 +152,16 @@ impl<'a, D: ReadAt> Cursor<'a, D> {
             *i -= 1;
 
             // Descend rightmost from here.
-            let mut ptr = node.key_ptr(*i)?.blockptr;
+            let mut kp = node.key_ptr(*i)?;
             let mut level = node.level;
             loop {
-                let child = self.fs.read_node(ptr)?;
+                let child = self.fs.read_node(kp.blockptr)?;
                 if child.level + 1 != level {
                     return Err(LuksError::CorruptFs(
                         "btrfs child node is not one level below its parent",
                     ));
                 }
+                kp.check_child(&child)?;
                 level = child.level;
                 let leaf = child.is_leaf();
                 if child.nr_items == 0 {
@@ -171,16 +173,14 @@ impl<'a, D: ReadAt> Cursor<'a, D> {
                     break;
                 }
                 let last_index = child.nr_items - 1;
-                let next = if leaf {
-                    0
-                } else {
-                    child.key_ptr(last_index)?.blockptr
-                };
+                let next = if leaf { None } else { Some(child.key_ptr(last_index)?) };
                 self.path.push((child, last_index));
                 if leaf {
                     return Ok(());
                 }
-                ptr = next;
+                if let Some(next) = next {
+                    kp = next;
+                }
             }
         }
     }
@@ -288,15 +288,16 @@ impl<'a, D: ReadAt> Cursor<'a, D> {
             *i += 1;
 
             // Descend leftmost from here.
-            let mut ptr = node.key_ptr(*i)?.blockptr;
+            let mut kp = node.key_ptr(*i)?;
             let mut level = node.level;
             loop {
-                let child = self.fs.read_node(ptr)?;
+                let child = self.fs.read_node(kp.blockptr)?;
                 if child.level + 1 != level {
                     return Err(LuksError::CorruptFs(
                         "btrfs child node is not one level below its parent",
                     ));
                 }
+                kp.check_child(&child)?;
                 level = child.level;
                 let leaf = child.is_leaf();
                 if child.nr_items == 0 && !leaf {
@@ -304,12 +305,14 @@ impl<'a, D: ReadAt> Cursor<'a, D> {
                         "btrfs interior node has no child pointers",
                     ));
                 }
-                let next = if leaf { 0 } else { child.key_ptr(0)?.blockptr };
+                let next = if leaf { None } else { Some(child.key_ptr(0)?) };
                 self.path.push((child, 0));
                 if leaf {
                     break;
                 }
-                ptr = next;
+                if let Some(next) = next {
+                    kp = next;
+                }
             }
             if self.valid() {
                 return Ok(());

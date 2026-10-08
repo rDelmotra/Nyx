@@ -484,3 +484,8 @@ required-features = ["dangerous-write-support"]
 [[test]]
 name = "scsi_forensic"
 path = "tests/device_scsi/scsi_forensic.rs"
+
+[[test]]
+name = "btrfs_stale_block_gate"
+path = "tests/btrfs_ops/btrfs_stale_block_gate.rs"
+required-features = ["dangerous-write-support"]

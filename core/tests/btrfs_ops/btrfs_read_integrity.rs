@@ -139,6 +139,9 @@ impl Lab {
         let mut raw = self.read_raw(self.fs_root, self.node);
         raw[101..].fill(0);
         put_u64(&mut raw, 48, at);
+        // Parents placed below record `sb.generation` for their children, and a
+        // child whose header disagrees is refused as a stale block.
+        put_u64(&mut raw, 80, self.sb.generation);
         raw[100] = level;
         if level == 0 {
             raw[96..100].copy_from_slice(&(leaf_items.len() as u32).to_le_bytes());

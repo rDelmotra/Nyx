@@ -20,7 +20,7 @@ use crate::error::{LuksError, Result};
 use crate::fs::btrfs::cursor::Cursor;
 use crate::fs::btrfs::superblock::BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE;
 use crate::fs::btrfs::tree::{
-    Key, BLOCK_GROUP_ITEM_KEY, CSUM_TREE_OBJECTID, EXTENT_DATA_REF_KEY, EXTENT_ITEM_KEY,
+    check_generation, Key, BLOCK_GROUP_ITEM_KEY, CSUM_TREE_OBJECTID, EXTENT_DATA_REF_KEY, EXTENT_ITEM_KEY,
     EXTENT_TREE_OBJECTID, FREE_SPACE_TREE_OBJECTID, FS_TREE_OBJECTID, METADATA_ITEM_KEY,
     ROOT_ITEM_KEY, ROOT_TREE_OBJECTID, SHARED_BLOCK_REF_KEY, SHARED_DATA_REF_KEY,
     TREE_BLOCK_REF_KEY,
@@ -608,9 +608,13 @@ pub(crate) fn find_item_in_tree<D: ReadAt>(
     key: &Key,
 ) -> Result<Option<Vec<u8>>> {
     let mut curr_bytenr = root_bytenr;
+    let mut expected_gen: Option<u64> = None;
     let mut depth = 0;
     while depth < 16 {
         let node = read_node(fs, pending, curr_bytenr)?;
+        if let Some(expected) = expected_gen {
+            check_generation(expected, &node)?;
+        }
         if node.is_leaf() {
             for i in 0..node.nr_items {
                 if node.key(i)? == *key {
@@ -622,16 +626,19 @@ pub(crate) fn find_item_in_tree<D: ReadAt>(
         if node.nr_items == 0 {
             return Ok(None);
         }
-        let mut child_bytenr = None;
+        let mut child = None;
         for i in (0..node.nr_items).rev() {
             let k = node.key(i)?;
             if *key >= k {
-                child_bytenr = Some(node.key_ptr(i)?.blockptr);
+                child = Some(node.key_ptr(i)?);
                 break;
             }
         }
-        match child_bytenr {
-            Some(ptr) => curr_bytenr = ptr,
+        match child {
+            Some(ptr) => {
+                curr_bytenr = ptr.blockptr;
+                expected_gen = Some(ptr.generation);
+            }
             None => return Ok(None),
         }
         depth += 1;
@@ -656,6 +663,7 @@ pub(crate) fn max_offset_in_tree<D: ReadAt>(
         fs: &Btrfs<D>,
         pending: &HashMap<u64, Vec<u8>>,
         bytenr: u64,
+        expected_gen: Option<u64>,
         lo: &Key,
         hi: &Key,
         depth: usize,
@@ -665,6 +673,9 @@ pub(crate) fn max_offset_in_tree<D: ReadAt>(
             return Err(LuksError::CorruptFs("btrfs tree deeper than 16 levels"));
         }
         let node = read_node(fs, pending, bytenr)?;
+        if let Some(expected) = expected_gen {
+            check_generation(expected, &node)?;
+        }
         if node.is_leaf() {
             for i in 0..node.nr_items {
                 let k = node.key(i)?;
@@ -680,7 +691,8 @@ pub(crate) fn max_offset_in_tree<D: ReadAt>(
             let starts_after_range = start > *hi;
             let ends_before_range = i + 1 < node.nr_items && node.key(i + 1)? <= *lo;
             if !starts_after_range && !ends_before_range {
-                walk(fs, pending, node.key_ptr(i)?.blockptr, lo, hi, depth + 1, best)?;
+                let ptr = node.key_ptr(i)?;
+                walk(fs, pending, ptr.blockptr, Some(ptr.generation), lo, hi, depth + 1, best)?;
             }
         }
         Ok(())
@@ -689,7 +701,7 @@ pub(crate) fn max_offset_in_tree<D: ReadAt>(
     let lo = Key::new(objectid, item_type, 0);
     let hi = Key::new(objectid, item_type, u64::MAX);
     let mut best = None;
-    walk(fs, pending, root_bytenr, &lo, &hi, 0, &mut best)?;
+    walk(fs, pending, root_bytenr, None, &lo, &hi, 0, &mut best)?;
     Ok(best)
 }
 
@@ -705,15 +717,28 @@ pub(crate) fn collect_tree_items<D: ReadAt>(
     if bytenr == 0 {
         return Ok(());
     }
+    collect_node_items(fs, pending, bytenr, None, items)
+}
+
+fn collect_node_items<D: ReadAt>(
+    fs: &Btrfs<D>,
+    pending: &HashMap<u64, Vec<u8>>,
+    bytenr: u64,
+    expected_gen: Option<u64>,
+    items: &mut Vec<(Key, Vec<u8>)>,
+) -> Result<()> {
     let node = read_node(fs, pending, bytenr)?;
+    if let Some(expected) = expected_gen {
+        check_generation(expected, &node)?;
+    }
     if node.is_leaf() {
         for i in 0..node.nr_items {
             items.push((node.key(i)?, node.item_data(i)?.to_vec()));
         }
     } else {
         for i in 0..node.nr_items {
-            let child_ptr = node.key_ptr(i)?.blockptr;
-            collect_tree_items(fs, pending, child_ptr, items)?;
+            let ptr = node.key_ptr(i)?;
+            collect_node_items(fs, pending, ptr.blockptr, Some(ptr.generation), items)?;
         }
     }
     Ok(())

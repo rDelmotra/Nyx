@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use crate::device::ReadAt;
 use crate::error::{LuksError, Result};
-use crate::fs::btrfs::tree::{check_generation, Key, Node};
+use crate::fs::btrfs::tree::{check_generation, check_owner, Key, Node};
 use crate::fs::btrfs::write::alloc::FreeSpaceMap;
 use crate::fs::btrfs::write::node::{InteriorNode, Leaf, LeafItem};
 use crate::fs::btrfs::Btrfs;
@@ -237,6 +237,7 @@ fn cow_descend_insert<D: ReadAt>(
     let node_size = sb.node_size;
     let csum_type = sb.csum_type;
     let node = read_node(fs, pending, bytenr)?;
+    check_owner(owner, &node)?;
     if let Some(expected) = expected_gen {
         check_generation(expected, &node)?;
     }
@@ -590,6 +591,7 @@ where
     let node_size = sb.node_size;
     let csum_type = sb.csum_type;
     let node = read_node(fs, pending, bytenr)?;
+    check_owner(owner, &node)?;
     if let Some(expected) = expected_gen {
         check_generation(expected, &node)?;
     }
@@ -783,6 +785,7 @@ where
             // current generation at a fresh address, and emit.
             let child_node = read_node(fs, pending, child_bytenr)?;
             check_generation(child_entry_gen, &child_node)?;
+            check_owner(owner, &child_node)?;
             let new_bytenr = allocator.allocate_metadata_for_owner(node_size, owner)?;
             allocated.push((new_bytenr, child_level));
             freed.push((child_bytenr, child_level));

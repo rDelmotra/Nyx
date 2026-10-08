@@ -184,6 +184,23 @@ pub fn check_generation(expected: u64, child: &Node) -> Result<()> {
     Ok(())
 }
 
+/// Refuse a node whose header `owner` is not the tree being descended.
+///
+/// Write path only. The write gate has already refused volumes with
+/// snapshot/reflink/shared-block history, so every node reached while
+/// descending tree X must be stamped X. A different owner means pages of
+/// another tree are linked into this one, and modifying them would bleed the
+/// change into that other tree. (Reads must not use this: blocks are
+/// legitimately shared between trees on snapshot volumes.)
+pub fn check_owner(expected: u64, node: &Node) -> Result<()> {
+    if node.owner != expected {
+        return Err(LuksError::CorruptFs(
+            "btrfs node owner does not match the tree being written",
+        ));
+    }
+    Ok(())
+}
+
 /// A verified tree node, holding the whole block.
 ///
 /// The block is kept rather than parsed into owned items because item data is

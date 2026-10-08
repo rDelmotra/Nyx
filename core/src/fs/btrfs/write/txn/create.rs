@@ -407,7 +407,7 @@ impl Transaction {
             2, // FT_DIR
             name,
         );
-        let existing_dir_item = find_item_in_tree(fs, &pending_blocks, fs_root_bytenr, &dir_item_key)?;
+        let existing_dir_item = find_item_in_tree(fs, &pending_blocks, fs_root_bytenr, parent_tree.objectid, &dir_item_key)?;
         if let Some(existing_data) = existing_dir_item {
             let mut merged_data = existing_data;
             merged_data.extend_from_slice(&dir_item_entry);

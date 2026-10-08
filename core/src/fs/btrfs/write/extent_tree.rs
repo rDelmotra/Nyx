@@ -20,7 +20,7 @@ use crate::error::{LuksError, Result};
 use crate::fs::btrfs::cursor::Cursor;
 use crate::fs::btrfs::superblock::BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE;
 use crate::fs::btrfs::tree::{
-    check_generation, Key, BLOCK_GROUP_ITEM_KEY, CSUM_TREE_OBJECTID, EXTENT_DATA_REF_KEY, EXTENT_ITEM_KEY,
+    check_generation, check_owner, Key, BLOCK_GROUP_ITEM_KEY, CSUM_TREE_OBJECTID, EXTENT_DATA_REF_KEY, EXTENT_ITEM_KEY,
     EXTENT_TREE_OBJECTID, FREE_SPACE_TREE_OBJECTID, FS_TREE_OBJECTID, METADATA_ITEM_KEY,
     ROOT_ITEM_KEY, ROOT_TREE_OBJECTID, SHARED_BLOCK_REF_KEY, SHARED_DATA_REF_KEY,
     TREE_BLOCK_REF_KEY,
@@ -594,7 +594,7 @@ pub fn tree_root_if_present<D: ReadAt>(
     objectid: u64,
 ) -> Result<Option<crate::fs::btrfs::TreeRoot>> {
     let key = Key::new(objectid, ROOT_ITEM_KEY, 0);
-    match find_item_in_tree(fs, &HashMap::new(), fs.superblock().root, &key)? {
+    match find_item_in_tree(fs, &HashMap::new(), fs.superblock().root, ROOT_TREE_OBJECTID, &key)? {
         None => Ok(None),
         Some(_) => fs.tree_root(objectid).map(Some),
     }
@@ -605,6 +605,7 @@ pub(crate) fn find_item_in_tree<D: ReadAt>(
     fs: &Btrfs<D>,
     pending: &HashMap<u64, Vec<u8>>,
     root_bytenr: u64,
+    owner: u64,
     key: &Key,
 ) -> Result<Option<Vec<u8>>> {
     let mut curr_bytenr = root_bytenr;
@@ -612,6 +613,7 @@ pub(crate) fn find_item_in_tree<D: ReadAt>(
     let mut depth = 0;
     while depth < 16 {
         let node = read_node(fs, pending, curr_bytenr)?;
+        check_owner(owner, &node)?;
         if let Some(expected) = expected_gen {
             check_generation(expected, &node)?;
         }
@@ -656,12 +658,14 @@ pub(crate) fn max_offset_in_tree<D: ReadAt>(
     fs: &Btrfs<D>,
     pending: &HashMap<u64, Vec<u8>>,
     root_bytenr: u64,
+    owner: u64,
     objectid: u64,
     item_type: u8,
 ) -> Result<Option<u64>> {
     fn walk<D: ReadAt>(
         fs: &Btrfs<D>,
         pending: &HashMap<u64, Vec<u8>>,
+        owner: u64,
         bytenr: u64,
         expected_gen: Option<u64>,
         lo: &Key,
@@ -673,6 +677,7 @@ pub(crate) fn max_offset_in_tree<D: ReadAt>(
             return Err(LuksError::CorruptFs("btrfs tree deeper than 16 levels"));
         }
         let node = read_node(fs, pending, bytenr)?;
+        check_owner(owner, &node)?;
         if let Some(expected) = expected_gen {
             check_generation(expected, &node)?;
         }
@@ -692,7 +697,7 @@ pub(crate) fn max_offset_in_tree<D: ReadAt>(
             let ends_before_range = i + 1 < node.nr_items && node.key(i + 1)? <= *lo;
             if !starts_after_range && !ends_before_range {
                 let ptr = node.key_ptr(i)?;
-                walk(fs, pending, ptr.blockptr, Some(ptr.generation), lo, hi, depth + 1, best)?;
+                walk(fs, pending, owner, ptr.blockptr, Some(ptr.generation), lo, hi, depth + 1, best)?;
             }
         }
         Ok(())
@@ -701,7 +706,7 @@ pub(crate) fn max_offset_in_tree<D: ReadAt>(
     let lo = Key::new(objectid, item_type, 0);
     let hi = Key::new(objectid, item_type, u64::MAX);
     let mut best = None;
-    walk(fs, pending, root_bytenr, None, &lo, &hi, 0, &mut best)?;
+    walk(fs, pending, owner, root_bytenr, None, &lo, &hi, 0, &mut best)?;
     Ok(best)
 }
 
@@ -712,22 +717,25 @@ pub(crate) fn collect_tree_items<D: ReadAt>(
     fs: &Btrfs<D>,
     pending: &HashMap<u64, Vec<u8>>,
     bytenr: u64,
+    owner: u64,
     items: &mut Vec<(Key, Vec<u8>)>,
 ) -> Result<()> {
     if bytenr == 0 {
         return Ok(());
     }
-    collect_node_items(fs, pending, bytenr, None, items)
+    collect_node_items(fs, pending, bytenr, owner, None, items)
 }
 
 fn collect_node_items<D: ReadAt>(
     fs: &Btrfs<D>,
     pending: &HashMap<u64, Vec<u8>>,
     bytenr: u64,
+    owner: u64,
     expected_gen: Option<u64>,
     items: &mut Vec<(Key, Vec<u8>)>,
 ) -> Result<()> {
     let node = read_node(fs, pending, bytenr)?;
+    check_owner(owner, &node)?;
     if let Some(expected) = expected_gen {
         check_generation(expected, &node)?;
     }
@@ -738,7 +746,7 @@ fn collect_node_items<D: ReadAt>(
     } else {
         for i in 0..node.nr_items {
             let ptr = node.key_ptr(i)?;
-            collect_node_items(fs, pending, ptr.blockptr, Some(ptr.generation), items)?;
+            collect_node_items(fs, pending, ptr.blockptr, owner, Some(ptr.generation), items)?;
         }
     }
     Ok(())
@@ -1159,7 +1167,7 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
         // Reconcile Free Space Tree if present on this filesystem.
         if let Some((ref mut fst_bytenr, ref mut fst_level)) = fst_root_opt {
             let mut current_items = Vec::new();
-            collect_tree_items(fs, &pending_blocks, *fst_bytenr, &mut current_items)?;
+            collect_tree_items(fs, &pending_blocks, *fst_bytenr, FREE_SPACE_TREE_OBJECTID, &mut current_items)?;
             let desired_items = allocator.emit_free_space_tree_items();
 
             let mut to_delete = Vec::new();

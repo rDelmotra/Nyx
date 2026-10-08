@@ -744,7 +744,7 @@ fn rename_swap_dirent<D: ReadAt>(
         new_name,
     );
 
-    let existing_new_dir_item = find_item_in_tree(fs, pending_blocks, fs_root_bytenr, &new_dir_item_key)?;
+    let existing_new_dir_item = find_item_in_tree(fs, pending_blocks, fs_root_bytenr, target_objectid, &new_dir_item_key)?;
     if let Some(existing_data) = existing_new_dir_item {
         let mut merged_data = existing_data;
         merged_data.extend_from_slice(&new_dir_item_entry);

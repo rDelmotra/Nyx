@@ -432,7 +432,7 @@ impl Batch {
         let name_hash = crate::fs::btrfs::crc32c::name_hash(name.as_bytes());
         let dir_item_key = Key::new(parent_ino, DIR_ITEM_KEY, name_hash);
         if let Some(item_data) =
-            find_item_in_tree(fs, &self.pending_blocks, self.fs_root.0, &dir_item_key)?
+            find_item_in_tree(fs, &self.pending_blocks, self.fs_root.0, located_parent_tree_id(&self.target)?, &dir_item_key)?
         {
             let entries = crate::fs::btrfs::inode::parse_dir_entries(&item_data)?;
             if entries.iter().any(|e| e.name == name.as_bytes()) {
@@ -469,6 +469,7 @@ impl Batch {
                 fs,
                 &self.pending_blocks,
                 self.fs_root.0,
+                target_objectid,
                 parent_ino,
                 DIR_INDEX_KEY,
             )?
@@ -886,4 +887,11 @@ mod tests {
         // Run outside every group is never merged.
         assert_eq!(merge_adjacent_runs(&[(5000, 10), (5010, 10)], &groups), vec![(5000, 10), (5010, 10)]);
     }
+}
+
+/// Objectid of the batch's bound target tree (set by the first operation).
+fn located_parent_tree_id(target: &Option<(TargetTree, u64)>) -> Result<u64> {
+    target.as_ref().map(|(t, _)| t.objectid).ok_or(LuksError::CorruptFs(
+        "batch target tree must be bound before file insertion",
+    ))
 }

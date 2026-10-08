@@ -32,6 +32,27 @@ the image is graded by `TreeValidator`, `AccountingOracle` and
 `btrfs check --readonly` (local btrfs-progs, else colima). Needs
 `fixtures/btrfs/states-4k.img` (`tools/gen-btrfs-fixtures.sh`, mkfs only).
 
+### Subvolume safety suite (Fedora-shaped disk)
+```bash
+cargo test -p luks_core --features dangerous-write-support --release \
+    --test btrfs_subvol_states --test btrfs_subvol_power_cut
+```
+Same shapes as the state suite, run on `fedora-4k.img` (subvolumes `root`
+and `home`, zstd) with every write inside `/home/user`: H1 home tree to
+3 levels and back, H2 free-space tree, H3 big files, H4 two-folder batch and
+a refused batch spanning `root` and `home`, H5 power cuts during splits,
+deletes and a big-file write. After every step and every cut the `root`
+subvolume and the top-level tree must be byte-identical (`common::states::
+Untouched`), the original home files must read back exactly, and the three
+checkers must pass. `NYX_BTRFS` points the outside check at another
+btrfs-progs. The fixture needs mkfs with `--subvol` (btrfs-progs >= 6.11):
+`MKFS_BTRFS=/path/to/mkfs.btrfs tools/gen-btrfs-fixtures.sh <out> fedora-4k`.
+
+`btrfs_stale_block_gate` and `btrfs_owner_gate` cover the two read-side
+guards every write relies on: a child whose generation differs from its
+parent pointer (a lost write on the device) and, on the write path, a node
+owned by another tree.
+
 ### 2. Autonomous Test Harness (recommended before a PR)
 ```bash
 # Every tier: fast/integration/oracle/strict/android

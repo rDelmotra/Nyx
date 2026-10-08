@@ -138,6 +138,11 @@ if [ "$RUN_INTEGRATION" -eq 1 ]; then
         --test btrfs_tree_validator \
         --test btrfs_states \
         --test btrfs_shared_history_gate \
+        --test btrfs_stale_block_gate \
+        --test btrfs_owner_gate \
+        --test btrfs_untouched_judge \
+        --test btrfs_subvol_states \
+        --test btrfs_subvol_power_cut \
         --test btrfs_accounting_oracle \
         --test btrfs_chunk_alloc_search \
         --test btrfs_batch_double_alloc \

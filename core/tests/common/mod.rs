@@ -20,8 +20,6 @@ pub mod fail_after;
 #[cfg(feature = "dangerous-write-support")]
 pub mod accounting;
 #[cfg(feature = "dangerous-write-support")]
-pub mod fs_model;
-#[cfg(feature = "dangerous-write-support")]
 pub mod csum_pack;
 
 use luks_core::error::{LuksError, Result};

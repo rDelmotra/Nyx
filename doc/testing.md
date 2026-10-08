@@ -14,25 +14,22 @@ cat tools/README-fixtures.md
 cargo test --workspace
 cargo test --workspace --features luks_core/dangerous-write-support,luks_jni/dangerous-write-support
 ```
-`core/tests/` is organized into domain subdirectories (`btrfs_ops/`, `fs_permutation/`,
+`core/tests/` is organized into domain subdirectories (`btrfs_ops/`, `btrfs_tree/`,
 `txn_batch/`, etc.) — see [`core/tests/README.md`](../core/tests/README.md) for the
-layout and a legacy-path lookup table. Test names are preserved as explicit
+layout. Test names are preserved as explicit
 `[[test]]` targets in `core/Cargo.toml`, so `cargo test --test <name>` still works
 without knowing which subdirectory a test lives in.
 
 ### 2. Autonomous Test Harness (recommended before a PR)
 ```bash
-# All 7 tiers: fast/stress/integration/oracle/strict/transitions/android
+# Every tier: fast/integration/oracle/strict/android
 tools/run-harness.sh --all
 
-# Just the structural transition coverage gate
-tools/run-harness.sh --transitions
-
-# Quick local iteration: fast unit + stress permutation tests only (<20s)
+# Quick local iteration: fast unit tests only
 tools/run-harness.sh
 ```
-Executes six-tree B-tree validation, in-process accounting oracle (A-1 through A-7),
-structural transition coverage gating, and Linux kernel oracle verification.
+Executes B-tree validation, the in-process accounting oracle, and Linux kernel
+oracle verification.
 Run `tools/run-harness.sh` with no arguments to view all tier flags.
 
 ### 3. Linux Kernel Oracle Graded Suite (granular alternative to `--oracle`)

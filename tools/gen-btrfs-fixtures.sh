@@ -316,8 +316,7 @@ fi
 
 # --- nonmixed-4k.img: 4k nodesize, dedicated metadata chunk -----------------
 # 1 GiB capacity, 4096-byte nodes, non-mixed layout.
-# Used by structural transition tests to trigger interior node splits
-# (level 1 -> 2) on EXTENT_TREE and CSUM_TREE without mixed block group bounds.
+# Exercises metadata trees that live in their own chunk, not a mixed block group.
 if want nonmixed-4k; then
 echo "Building nonmixed-4k.img..."
 IMG="$OUT/nonmixed-4k.img"

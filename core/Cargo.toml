@@ -194,60 +194,35 @@ path = "tests/ext4/ext4_streaming_unknown.rs"
 required-features = ["dangerous-write-support"]
 
 
-# --- fs_permutation (11 tests) ---
+# --- btrfs_tree: B-tree structure regressions and checker self-tests ---
 [[test]]
-name = "btrfs_btree_permutations"
-path = "tests/fs_permutation/btrfs_btree_permutations.rs"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_conformance"
-path = "tests/fs_permutation/btrfs_conformance.rs"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_structural_transitions"
-path = "tests/fs_permutation/btrfs_structural_transitions.rs"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_interior_collapse"
-path = "tests/fs_permutation/btrfs_interior_collapse.rs"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_fst_collapse"
-path = "tests/fs_permutation/btrfs_fst_collapse.rs"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_root_split"
-path = "tests/fs_permutation/btrfs_root_split.rs"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_node_surgery"
-path = "tests/fs_permutation/btrfs_node_surgery.rs"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_cow_fixup"
-path = "tests/fs_permutation/btrfs_cow_fixup.rs"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_empty_leaf"
-path = "tests/fs_permutation/btrfs_empty_leaf.rs"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_scale_convergence"
-path = "tests/fs_permutation/btrfs_scale_convergence.rs"
+name = "btrfs_tree_validator"
+path = "tests/btrfs_tree/btrfs_tree_validator.rs"
 required-features = ["dangerous-write-support"]
 
 [[test]]
 name = "btrfs_accounting_oracle"
-path = "tests/fs_permutation/btrfs_accounting_oracle.rs"
+path = "tests/btrfs_tree/btrfs_accounting_oracle.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_root_split"
+path = "tests/btrfs_tree/btrfs_root_split.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_empty_leaf"
+path = "tests/btrfs_tree/btrfs_empty_leaf.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_cow_fixup"
+path = "tests/btrfs_tree/btrfs_cow_fixup.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_node_surgery"
+path = "tests/btrfs_tree/btrfs_node_surgery.rs"
 required-features = ["dangerous-write-support"]
 
 

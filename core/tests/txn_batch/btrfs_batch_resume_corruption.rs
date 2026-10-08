@@ -342,6 +342,8 @@ fn run_clean(img: &Path) -> ImportOutcome {
 // This is `write/alloc.rs:92-97`'s comparison, reported per group.
 // ---------------------------------------------------------------------
 
+// Fields are read only through `Debug` in assertion messages.
+#[allow(dead_code)]
 #[derive(Debug)]
 struct Mismatch {
     bg_start: u64,

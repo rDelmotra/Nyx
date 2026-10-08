@@ -34,11 +34,6 @@ impl TargetTree {
         }
     }
 
-    /// Whether this target tree is the primary top-level `FS_TREE` (objectid 5).
-    pub fn is_fs_tree(&self) -> bool {
-        self.objectid == FS_TREE_OBJECTID
-    }
-
     /// Logical bytenr of the root node of this tree.
     pub fn bytenr(&self) -> u64 {
         self.root.bytenr

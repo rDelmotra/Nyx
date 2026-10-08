@@ -17,7 +17,7 @@ use common::fail_after::FailAfterNWrites;
 use luks_core::device::FileDevice;
 use luks_core::fs::btrfs::Btrfs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 
 fn scratch(tag: &str) -> TempPath {
     scratch_from("plain", tag)
@@ -185,7 +185,7 @@ fn b5_superblock_dev_item_bytes_used_matches_chunk_tree() {
 // ---------------------------------------------------------------------------
 fn rekey_root_item(img: &PathBuf, from: u64, to: u64) {
     use std::io::{Read, Seek, SeekFrom, Write};
-    let (root, node_size, stripes) = {
+    let (_root, node_size, stripes) = {
         let fs = Btrfs::mount(dev(img)).expect("mount");
         let sb = fs.superblock();
         assert_eq!(sb.root_level, 0, "setup: root tree must be a single leaf");

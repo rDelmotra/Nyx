@@ -52,10 +52,6 @@ pub enum Verified {
 }
 
 impl Verified {
-    /// Whether every byte was covered by a checksum that matched.
-    pub fn is_complete(self) -> bool {
-        self == Verified::All
-    }
 }
 
 impl<D: ReadAt> Btrfs<D> {

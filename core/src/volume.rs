@@ -64,11 +64,6 @@ impl<D: ReadAt> PlainVolume<D> {
         &self.device
     }
 
-    /// Consume the volume and return the underlying device.
-    pub fn into_device(self) -> D {
-        self.device
-    }
-
     /// Read bytes at `offset` relative to the partition start.
     ///
     /// Strictly checked against `self.len`. Slices into `self.device.read_at`.

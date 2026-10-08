@@ -58,7 +58,6 @@ class EventLogger internal constructor(
         const val QUEUE_CAPACITY = 4096
         const val MAX_FILES = 5
         const val MAX_FILE_BYTES = 4L * 1024 * 1024
-        const val MAX_MSG_CHARS = 400
         private const val BATCH = 256
     }
 

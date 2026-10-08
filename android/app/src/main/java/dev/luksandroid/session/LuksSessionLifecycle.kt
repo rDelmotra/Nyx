@@ -33,7 +33,6 @@ class LuksSessionLifecycle(
     private val aliveActivities = AtomicInteger(0)
 
     val activeActivityCount: Int get() = startedActivities.get()
-    val aliveActivityCount: Int get() = aliveActivities.get()
 
     override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) {
         aliveActivities.incrementAndGet()

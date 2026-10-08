@@ -29,9 +29,6 @@ pub enum LuksError {
     #[error("JSON metadata parse failed: {0}")]
     JsonParse(#[from] serde_json::Error),
 
-    #[error("field {field} is not a valid integer: {value:?}")]
-    BadIntegerField { field: &'static str, value: String },
-
     #[error("header declares no {0}")]
     Missing(&'static str),
 
@@ -380,7 +377,6 @@ impl LuksError {
             | ImplausibleHeaderSize(_)
             | JsonNotUtf8
             | JsonParse(_)
-            | BadIntegerField { .. }
             | Missing(_)
             | BadExtentHeader(_)
             | BadExtentTree(_)

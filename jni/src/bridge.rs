@@ -185,7 +185,6 @@ pub fn error_code(e: &LuksError) -> i32 {
         | ImplausibleHeaderSize(_)
         | JsonNotUtf8
         | JsonParse(_)
-        | BadIntegerField { .. }
         | Missing(_)
         | BadExtentHeader(_)
         | BadExtentTree(_)

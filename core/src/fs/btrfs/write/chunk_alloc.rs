@@ -22,7 +22,8 @@ use crate::fs::btrfs::write::cow::{cow_tree_insert, cow_tree_mutate};
 use crate::fs::btrfs::write::exclude::compute_sb_exclusions;
 use crate::fs::btrfs::write::extent_tree::{BlockGroupItem, ExtentTree};
 use crate::fs::btrfs::write::gate;
-use crate::fs::btrfs::write::txn::{converge_and_finalize, record_cow_result, Transaction};
+use crate::fs::btrfs::write::extent_tree::{converge_and_finalize, record_cow_result};
+use crate::fs::btrfs::write::txn::Transaction;
 use crate::fs::btrfs::Btrfs;
 
 /// 64 KiB alignment / minimum stripe boundary.

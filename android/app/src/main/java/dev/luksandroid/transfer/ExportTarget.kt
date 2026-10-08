@@ -110,12 +110,6 @@ fun verifyReadBack(
     return if (MessageDigest.isEqual(digest.digest(), expectedSha256)) ReadBack.Verified else ReadBack.HashMismatch
 }
 
-/** Providers whose documents live on this device. */
-val LOCAL_DOCUMENT_AUTHORITIES = setOf(
-    "com.android.externalstorage.documents",
-    "com.android.providers.downloads.documents",
-)
-
 /**
  * Verification level for exported documents.
  * Defaults to [VerifyLevel.NONE] to avoid reading back or querying the provider over

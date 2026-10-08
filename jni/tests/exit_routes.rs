@@ -125,7 +125,7 @@ fn w2_drop_volume_with_open_writer_leaves_ext4_clean() {
             open_partial_writer(&v)
         };
         drop_volume(vol_h);
-        drop(w);
+        let _ = w; // the writer is deliberately never finished or abandoned
     }
     assert_kernel_clean(&path, "drop_volume with open writer");
 }

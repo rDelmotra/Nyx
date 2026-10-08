@@ -7,21 +7,12 @@
 //! group descriptor's checksum. Update four of the five and `e2fsck` reports a
 //! filesystem that is quietly wrong.
 //!
-//! # What this deliberately does not do yet
+//! # Uninitialised groups
 //!
-//! Groups flagged `BLOCK_UNINIT` or `INODE_UNINIT` are **skipped**. Those flags
-//! mean the bitmap on disk was never written and holds whatever bytes were
-//! there before, so allocating from such a group requires first *materialising*
-//! its bitmap — computing which of its blocks are metadata and marking them —
-//! and with `flex_bg` those metadata blocks may belong to a different group
-//! entirely. That is a distinct problem with its own failure modes, so it gets
-//! its own pass rather than being smuggled in here.
-//!
-//! The cost is real and worth stating plainly: on the 4 GiB test stick, 26 of
-//! 33 groups are `BLOCK_UNINIT`, so only about 800 MiB of its 4 GiB is
-//! reachable until that pass lands. Correctness first — an allocator that
-//! quietly hands out blocks it believes are free, from a bitmap it never read,
-//! overwrites live data.
+//! Groups flagged `BLOCK_UNINIT` or `INODE_UNINIT` have never had their bitmap
+//! written, so the bytes on disk are garbage. `read_bitmap` never trusts them:
+//! it builds the bitmap in memory instead (`materialize_bitmap`), marking the
+//! group's metadata blocks — which, with `flex_bg`, may live in another group.
 //!
 //! # Ordering
 //!

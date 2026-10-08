@@ -10,8 +10,7 @@ use temp_guard::{TempPath};
 mod common;
 
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -39,25 +38,6 @@ fn copy_to_temp(src_name: &str, tag: &str) -> TempPath {
     ));
     fs::copy(&src, &dst).expect("copy fixture to temp");
     TempPath::new(dst)
-}
-
-fn run_verify_btrfs(img_path: &Path) -> bool {
-    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("tools")
-        .join("verify-btrfs.sh");
-    assert!(script.exists(), "verify-btrfs.sh must exist at {:?}", script);
-
-    if !common::oracle::gate() {
-        return true;
-    }
-
-    let output = Command::new("bash")
-        .arg(&script)
-        .arg(img_path)
-        .output()
-        .expect("run verify-btrfs.sh");
-    output.status.success()
 }
 
 struct FailNextWrite {

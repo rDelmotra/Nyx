@@ -43,6 +43,4 @@ val DarkErrorContainer = Color(0xFF3A1818)
 val DarkOnErrorContainer = DestructiveRed
 
 // Semantic compatibility aliases
-val SuccessGreen = Color(0xFF4CAF50)
 val WarningAmber = StateUnlocked
-val InfoCyan = StateLocked

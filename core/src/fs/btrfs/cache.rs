@@ -24,12 +24,11 @@
 //!
 //! # What is safe to cache, and why
 //!
-//! The filesystem is mounted read-only and this crate cannot write to a device
-//! at all (`dangerous-write-support` is an empty non-default feature), so a
-//! node's contents cannot change underneath the cache. There is no invalidation
-//! and there is nothing to invalidate. A drive physically swapped mid-read is
-//! outside what any cache could defend against, and the `fsid` check on every
-//! parsed node is what catches that.
+//! Without `dangerous-write-support` nothing can change a node underneath the
+//! cache. With it, every commit clears the cache (see `Btrfs` after a commit in
+//! `fs/btrfs/mod.rs`), so a cached node is never older than the last commit. A
+//! drive physically swapped mid-read is outside what any cache could defend
+//! against, and the `fsid` check on every parsed node is what catches that.
 //!
 //! A hit skips the checksum verification that a miss performs — the node was
 //! verified when it was first parsed, and re-verifying an in-memory copy would

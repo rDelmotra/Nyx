@@ -44,9 +44,6 @@ fn mount(img: &[u8]) -> Result<Btrfs<Vec<u8>>> {
     Btrfs::mount(img.to_vec())
 }
 
-fn u32le(b: &[u8], o: usize) -> u32 {
-    u32::from_le_bytes(b[o..o + 4].try_into().unwrap())
-}
 fn put_u64(b: &mut [u8], o: usize, v: u64) {
     b[o..o + 8].copy_from_slice(&v.to_le_bytes());
 }
@@ -170,10 +167,6 @@ impl Lab {
         }
         seal(&mut raw);
         self.write_raw(at, &raw);
-    }
-
-    fn device(&self) -> Vec<u8> {
-        self.img.clone()
     }
 }
 

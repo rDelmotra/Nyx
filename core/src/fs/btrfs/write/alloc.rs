@@ -206,16 +206,6 @@ impl FreeSpaceMap {
         }
     }
 
-    /// All free ranges flattened across all block groups, sorted by address.
-    pub fn all_free_ranges(&self) -> Vec<FreeRange> {
-        let mut ranges = Vec::new();
-        for bg in &self.block_groups {
-            ranges.extend_from_slice(&bg.free_ranges);
-        }
-        ranges.sort_by_key(|r| r.start);
-        ranges
-    }
-
     /// Find an available free range in a block group matching `flags_mask`.
     pub fn find_free_range(
         &self,

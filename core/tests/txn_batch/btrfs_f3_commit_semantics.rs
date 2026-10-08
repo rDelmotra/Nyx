@@ -178,12 +178,14 @@ fn b5_superblock_dev_item_bytes_used_matches_chunk_tree() {
 
 // ---------------------------------------------------------------------------
 // B7: a missing/unreadable csum tree or free-space tree must fail the write,
-// never be skipped. The root tree's ROOT_ITEM for the tree is re-keyed (7 -> 8,
-// 10 -> 11; order-preserving, node checksum recomputed) so the tree "does not
-// exist" as far as `tree_root` is concerned while the superblock still
-// advertises it.
+// never be skipped. The root tree's ROOT_ITEM for the tree is re-keyed
+// (order-preserving, node checksum recomputed) so the tree "does not exist" as
+// far as `tree_root` is concerned while the superblock still advertises it.
+// The csum tree keeps objectid 7 and gets an unused item type (133): moving it
+// to objectid 8 would make it look like a quota tree, which the write gate
+// refuses before the csum path is reached.
 // ---------------------------------------------------------------------------
-fn rekey_root_item(img: &PathBuf, from: u64, to: u64) {
+fn rekey_root_item(img: &PathBuf, from: u64, to: u64, to_type: u8) {
     use std::io::{Read, Seek, SeekFrom, Write};
     let (_root, node_size, stripes) = {
         let fs = Btrfs::mount(dev(img)).expect("mount");
@@ -205,6 +207,7 @@ fn rekey_root_item(img: &PathBuf, from: u64, to: u64) {
             let oid = u64::from_le_bytes(buf[at..at + 8].try_into().unwrap());
             if oid == from && buf[at + 8] == 132 {
                 buf[at..at + 8].copy_from_slice(&to.to_le_bytes());
+                buf[at + 8] = to_type;
                 hit = true;
             }
         }
@@ -222,7 +225,7 @@ fn rekey_root_item(img: &PathBuf, from: u64, to: u64) {
 #[test]
 fn b7_missing_csum_tree_fails_the_write_instead_of_skipping_csums() {
     let img = scratch("b7csum");
-    rekey_root_item(&img, 7, 8);
+    rekey_root_item(&img, 7, 7, 133);
     let mut fs = Btrfs::mount(dev(&img)).expect("mount with csum root hidden");
     let r = small_file!(fs, "nocsum.bin");
     assert!(
@@ -239,7 +242,7 @@ fn b7_missing_free_space_tree_fails_the_commit_instead_of_skipping_reconcile() {
         let fs = Btrfs::mount(dev(&img)).expect("mount");
         assert_ne!(fs.superblock().compat_ro_flags & 1, 0, "setup: fixture must advertise the FST");
     }
-    rekey_root_item(&img, 10, 11);
+    rekey_root_item(&img, 10, 11, 132);
     let mut fs = Btrfs::mount(dev(&img)).expect("mount with FST root hidden");
     let r = small_file!(fs, "nofst.bin").and_then(|_| fs.commit_active_batch().map(|_| 0));
     assert!(

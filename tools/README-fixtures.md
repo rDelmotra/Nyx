@@ -90,6 +90,7 @@ colima ssh -- sudo bash /tmp/btrfs/gen.sh /tmp/btrfs/out fst-aged
 | `sha256-4k.img` | 32-byte checksums (sha256 volume; write path refuses it — issue 44) |
 | `states-4k.img` | 256 MiB, 4 KiB nodes, empty; loaded into memory by the B-tree state suite |
 | `quota-4k.img` | qgroups enabled (write path refuses it) |
+| `fedora-4k.img` | 256 MiB, 4 KiB nodes, zstd; `root` and `home` subvolumes like a Fedora install, no snapshots/quota (needs btrfs-progs >= 6.11 to build) |
 | `fst-aged.img` | ~500 free-space-tree extents, ~80-90% of the single-leaf ceiling (16 KiB nodes) |
 | `fst-multileaf.img` | 4096-byte nodes, free-space-tree root level >= 1 |
 | `fst-bitmap.img` | At least one block group with `flags & USING_BITMAPS` |

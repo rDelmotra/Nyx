@@ -53,6 +53,7 @@ REQUIRED_BTRFS=(
     "sha256-4k.img"
     "states-4k.img"
     "quota-4k.img"
+    "fedora-4k.img"
     "fst-aged.img"
     "fst-multileaf.img"
     "fst-bitmap.img"

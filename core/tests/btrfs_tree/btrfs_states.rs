@@ -26,8 +26,8 @@
 //!    levels and generations in every tree.
 //! 2. `AccountingOracle`: every reachable block and file extent is in the
 //!    extent tree, block-group `used` adds up, the free-space tree agrees.
-//! 3. The outside tool, `btrfs check --readonly`, run directly when btrfs-progs
-//!    is installed, else `tools/verify-btrfs.sh` in colima (which also mounts
+//! 3. The outside tool, `btrfs check --readonly` (binary overridable with
+//!    `NYX_BTRFS`), run directly when btrfs-progs is installed, else `tools/verify-btrfs.sh` in colima (which also mounts
 //!    and scrubs). Never grade our writer with only our own reader.
 //!
 //! Images are `fixtures/btrfs/states-4k.img` (256 MiB, 4 KiB nodes, made by
@@ -52,124 +52,22 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::process::Command;
-use std::sync::atomic::Ordering;
 
-use common::accounting::AccountingOracle;
-use common::btree_validator::{AllTreesValidationReport, TreeValidator};
 use common::fail_after::FailAfterNWrites;
 use common::mem_device::MemoryDevice;
-use luks_core::device::WriteAt;
+use common::states::{
+    count_writes, cut_after, cut_points, fresh_from, judge, long_name, mount, payload, snapshot_dir,
+    write_batch, Depth,
+};
 use luks_core::fs::btrfs::Btrfs;
 
 const FIXTURE: &str = "btrfs/states-4k.img";
 
-// ------------------------------------------------------------------ judge
-
-/// How hard to grade one state.
-#[derive(Clone, Copy, PartialEq)]
-enum Depth {
-    /// Our two checkers only. For the power-cut sweep, which grades dozens of
-    /// states.
-    Ours,
-    /// Ours plus the outside tool.
-    Full,
-}
-
-/// Grade the committed state of `dev`. Panics naming `step` on any finding.
-fn judge(dev: &MemoryDevice, step: &str, depth: Depth) -> AllTreesValidationReport {
-    // Outside tool first: when our checkers and it disagree, its verdict is
-    // the one that says whether the disk is broken.
-    if depth == Depth::Full {
-        outside_check(dev, step);
-    }
-    let fs = Btrfs::mount(dev.clone()).unwrap_or_else(|e| panic!("[{step}] remount failed: {e}"));
-    let report = TreeValidator::validate_all(&fs)
-        .unwrap_or_else(|e| panic!("[{step}] tree validator: {e}"));
-    if let Err(e) = AccountingOracle::check(&fs) {
-        panic!("[{step}] accounting: {e}");
-    }
-    report
-}
-
-/// `btrfs check --readonly` on a dump of `dev`.
-fn outside_check(dev: &MemoryDevice, step: &str) {
-    let path = std::env::temp_dir().join(format!(
-        "nyx-states-{}-{}.img",
-        std::process::id(),
-        step.replace(|c: char| !c.is_ascii_alphanumeric(), "_")
-    ));
-    dev.dump_to_file(&path).expect("dump image");
-    let local = Command::new("btrfs").args(["check", "--readonly"]).arg(&path).output();
-    let verdict = match local {
-        Ok(out) => {
-            let ok = out.status.success();
-            (ok, format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
-        }
-        // No btrfs-progs on this host (macOS): the colima script, with its
-        // own ALLOW_NO_ORACLE gate.
-        Err(_) => {
-            let (ok, out, err) = common::oracle::verify_btrfs(&path);
-            (ok, format!("{out}{err}"))
-        }
-    };
-    let _ = std::fs::remove_file(&path);
-    assert!(verdict.0, "[{step}] btrfs check rejected the image:\n{}", verdict.1);
-}
-
-// ---------------------------------------------------------------- helpers
+// The generic judge and helpers live in `common::states`; this file keeps the
+// scenarios and the fixture they run on.
 
 fn fresh() -> MemoryDevice {
-    MemoryDevice::from_fixture(FIXTURE)
-}
-
-fn mount(dev: &MemoryDevice) -> Btrfs<MemoryDevice> {
-    Btrfs::mount(dev.clone()).expect("mount")
-}
-
-/// Deterministic file content, different per `seed`.
-fn payload(len: usize, seed: u64) -> Vec<u8> {
-    let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-    (0..len)
-        .map(|_| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x as u8
-        })
-        .collect()
-}
-
-/// Write `files` through the batch path the app uses, then commit.
-fn write_batch<D: WriteAt>(fs: &mut Btrfs<D>, files: &[(String, String, Vec<u8>)]) {
-    for (dir, name, data) in files {
-        let mut w = fs.begin_file(data.len() as u64).unwrap_or_else(|e| panic!("begin {name}: {e}"));
-        for piece in data.chunks(256 * 1024) {
-            fs.write_chunk(&mut w, piece).unwrap_or_else(|e| panic!("write {name}: {e}"));
-        }
-        fs.finish_file(w, dir, name).unwrap_or_else(|e| panic!("finish {name}: {e}"));
-    }
-    fs.commit_active_batch().expect("commit batch");
-}
-
-/// A long name makes each directory entry big, so few fit in a 4 KiB leaf
-/// and the tree grows tall after a few thousand files.
-fn long_name(i: usize) -> String {
-    format!("{i:05}-{}", "n".repeat(150))
-}
-
-/// Every regular file under `dir` (one level) with its contents.
-fn snapshot_dir(fs: &Btrfs<MemoryDevice>, dir: &str) -> BTreeMap<String, Vec<u8>> {
-    fs.list_dir(dir)
-        .expect("list dir")
-        .into_iter()
-        .filter(|e| !e.name.starts_with('.'))
-        .map(|e| {
-            let p = format!("{}/{}", dir.trim_end_matches('/'), e.name);
-            let data = fs.read_file(&p).unwrap_or_else(|err| panic!("read {p}: {err}"));
-            (e.name, data)
-        })
-        .collect()
+    fresh_from(FIXTURE)
 }
 
 // ------------------------------------------------------------------ S1
@@ -466,40 +364,6 @@ fn s4_batch_into_two_folders_cancel_and_rename_over() {
 }
 
 // ------------------------------------------------------------------ S5
-
-/// Number of `write_at` calls `op` makes on a copy of `base`.
-type CutOp<'a> = &'a dyn Fn(&mut Btrfs<FailAfterNWrites<MemoryDevice>>) -> luks_core::error::Result<()>;
-
-fn count_writes(base: &[u8], op: CutOp) -> usize {
-    let dev = FailAfterNWrites::new(MemoryDevice::from_bytes(base.to_vec()), usize::MAX);
-    let mut fs = Btrfs::mount(dev).expect("mount");
-    op(&mut fs).expect("uncut run must succeed");
-    fs.device().attempted.load(Ordering::SeqCst)
-}
-
-/// Cut points worth trying: all of them when few, otherwise an even spread
-/// plus every one of the last 12 (the superblock and flush end of a commit).
-fn cut_points(total: usize) -> Vec<usize> {
-    if total <= 60 {
-        return (0..total).collect();
-    }
-    let mut pts: Vec<usize> = (0..40).map(|k| k * total / 40).collect();
-    pts.extend(total.saturating_sub(12)..total);
-    pts.sort_unstable();
-    pts.dedup();
-    pts
-}
-
-/// Run `op` on a copy of `base` with the device vanishing after `n` writes,
-/// then hand back what is on the device.
-fn cut_after(base: &[u8], n: usize, op: CutOp) -> MemoryDevice {
-    let mem = MemoryDevice::from_bytes(base.to_vec());
-    let mut fs = Btrfs::mount(FailAfterNWrites::new(mem.clone(), n)).expect("mount");
-    // The op fails wherever the device vanished, or finishes if `n` is past
-    // its last write. Either is fine: only what is on the device is judged.
-    let _ = op(&mut fs);
-    mem
-}
 
 /// A base image with 600 long-named files in /d: the fs tree has many leaves
 /// and an interior level, so the next writes split and the next deletes

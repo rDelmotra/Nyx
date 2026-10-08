@@ -21,6 +21,8 @@ pub mod fail_after;
 pub mod accounting;
 #[cfg(feature = "dangerous-write-support")]
 pub mod csum_pack;
+#[cfg(feature = "dangerous-write-support")]
+pub mod states;
 
 use luks_core::error::{LuksError, Result};
 use luks_core::usb::bot::{CBW_LEN, CBW_SIGNATURE, CSW_LEN, CSW_SIGNATURE};

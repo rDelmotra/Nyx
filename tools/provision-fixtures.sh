@@ -77,8 +77,8 @@ REQUIRED_DISKS=(
     "gpt-luks-btrfs.img"
 )
 
-missing=0
-
+# Prints the number of missing items. Runs in a $(...) subshell, so it must
+# not try to update any outer variable — the total is summed by the caller.
 check_group() {
     local subdir="$1"
     shift
@@ -87,16 +87,26 @@ check_group() {
     for item in "${items[@]}"; do
         if [ "$FORCE" -eq 1 ] || [ ! -f "$fixtures_dir/$subdir/$item" ]; then
             group_missing=$((group_missing + 1))
-            missing=$((missing + 1))
         fi
     done
     echo "$group_missing"
+}
+
+# Lists every required fixture that is still absent, one per line.
+# (No namerefs: macOS ships bash 3.2.)
+list_missing() {
+    local item
+    for item in "${REQUIRED_BTRFS[@]}"; do [ -f "$fixtures_dir/btrfs/$item" ] || echo "  btrfs/$item"; done
+    for item in "${REQUIRED_EXT4[@]}"; do [ -f "$fixtures_dir/ext4/$item" ] || echo "  ext4/$item"; done
+    for item in "${REQUIRED_CONTAINERS[@]}"; do [ -f "$fixtures_dir/containers/$item" ] || echo "  containers/$item"; done
+    for item in "${REQUIRED_DISKS[@]}"; do [ -f "$fixtures_dir/disks/$item" ] || echo "  disks/$item"; done
 }
 
 btrfs_missing=$(check_group "btrfs" "${REQUIRED_BTRFS[@]}")
 ext4_missing=$(check_group "ext4" "${REQUIRED_EXT4[@]}")
 containers_missing=$(check_group "containers" "${REQUIRED_CONTAINERS[@]}")
 disks_missing=$(check_group "disks" "${REQUIRED_DISKS[@]}")
+missing=$((btrfs_missing + ext4_missing + containers_missing + disks_missing))
 
 echo "  btrfs fixtures missing/stale:      $btrfs_missing / ${#REQUIRED_BTRFS[@]}"
 echo "  ext4 fixtures missing/stale:       $ext4_missing / ${#REQUIRED_EXT4[@]}"
@@ -160,4 +170,10 @@ if [ "$btrfs_missing" -gt 0 ] || [ "$containers_missing" -gt 0 ] || [ "$disks_mi
     fi
 fi
 
+still_missing=$(list_missing)
+if [ -n "$still_missing" ]; then
+    echo "==> Still missing after provisioning:"
+    echo "$still_missing"
+    exit 1
+fi
 echo "==> Fixture provisioning complete."

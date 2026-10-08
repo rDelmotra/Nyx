@@ -235,6 +235,11 @@ name = "btrfs_untouched_judge"
 path = "tests/btrfs_tree/btrfs_untouched_judge.rs"
 required-features = ["dangerous-write-support"]
 
+[[test]]
+name = "btrfs_subvol_states"
+path = "tests/btrfs_tree/btrfs_subvol_states.rs"
+required-features = ["dangerous-write-support"]
+
 
 # --- txn_batch (10 tests) ---
 [[test]]

@@ -1,6 +1,7 @@
 package dev.luksandroid.transfer
 
 import dev.luksandroid.LuksVolume
+import dev.luksandroid.zeroEntireCapacity
 import java.io.InputStream
 
 /**
@@ -29,9 +30,8 @@ class VolumeSourceBytes(
 /**
  * Pulls a file off the volume one chunk at a time.
  *
- * Deliberately not backed by a `ByteArray` of the whole file: a chunked reader
- * that materialises everything first is the same bug as [LuksVolume.readFile]'s
- * cap, just with a bigger limit.
+ * Backed by a single reusable direct [ByteBuffer] wiped on [close], avoiding heap allocations
+ * and lingering plaintext tails.
  */
 private class VolumeInputStream(
     private val volume: LuksVolume,
@@ -42,11 +42,12 @@ private class VolumeInputStream(
     private var offset = 0L
     private var file = 0L
     private var closed = false
-    private var buffer = ByteArray(0)
+    private val directBuf: java.nio.ByteBuffer = java.nio.ByteBuffer.allocateDirect(chunkBytes)
     private var bufferPos = 0
+    private var bufferLimit = 0
 
     /**
-     * Fills [buffer] if it is spent. Returns false at end of file.
+     * Fills [directBuf] if it is spent. Returns false at end of file.
      *
      * A short read is treated as end of file rather than retried: the native
      * side returns what the extent actually holds, so a chunk shorter than
@@ -54,29 +55,25 @@ private class VolumeInputStream(
      * a zero-length return.
      */
     private fun fill(): Boolean {
-        if (bufferPos < buffer.size) return true
+        if (bufferPos < bufferLimit) return true
         if (closed) throw java.io.IOException("stream is closed")
         if (file == 0L) file = volume.openFile(path)
-        val chunk = volume.readAt(file, offset, chunkBytes)
-        if (chunk.isEmpty()) {
-            buffer = ByteArray(0)
+        directBuf.clear()
+        val got = volume.readAt(file, offset, directBuf, chunkBytes)
+        if (got <= 0) {
             bufferPos = 0
+            bufferLimit = 0
             return false
         }
-        buffer = chunk
         bufferPos = 0
-        offset += chunk.size
+        bufferLimit = got
+        offset += got
         return true
     }
 
     override fun read(): Int {
         if (!fill()) return -1
-        val byteVal = buffer[bufferPos++].toInt() and 0xFF
-        if (bufferPos >= buffer.size) {
-            buffer = ByteArray(0)
-            bufferPos = 0
-        }
-        return byteVal
+        return directBuf.get(bufferPos++).toInt() and 0xFF
     }
 
     override fun read(b: ByteArray, off: Int, len: Int): Int {
@@ -85,14 +82,11 @@ private class VolumeInputStream(
         }
         if (len == 0) return 0
 
-        if (bufferPos < buffer.size) {
-            val n = minOf(len, buffer.size - bufferPos)
-            System.arraycopy(buffer, bufferPos, b, off, n)
+        if (bufferPos < bufferLimit) {
+            val n = minOf(len, bufferLimit - bufferPos)
+            directBuf.position(bufferPos)
+            directBuf.get(b, off, n)
             bufferPos += n
-            if (bufferPos >= buffer.size) {
-                buffer = ByteArray(0)
-                bufferPos = 0
-            }
             return n
         }
 
@@ -101,31 +95,31 @@ private class VolumeInputStream(
 
         if (len >= chunkBytes) {
             val toRead = minOf(len, chunkBytes)
-            val chunk = volume.readAt(file, offset, toRead)
-            if (chunk.isEmpty()) return -1
-            offset += chunk.size
-            System.arraycopy(chunk, 0, b, off, chunk.size)
-            return chunk.size
+            directBuf.clear()
+            val got = volume.readAt(file, offset, directBuf, toRead)
+            if (got <= 0) return -1
+            offset += got
+            directBuf.position(0)
+            directBuf.get(b, off, got)
+            return got
         }
 
         if (!fill()) return -1
-        val n = minOf(len, buffer.size - bufferPos)
-        System.arraycopy(buffer, bufferPos, b, off, n)
+        val n = minOf(len, bufferLimit - bufferPos)
+        directBuf.position(bufferPos)
+        directBuf.get(b, off, n)
         bufferPos += n
-        if (bufferPos >= buffer.size) {
-            buffer = ByteArray(0)
-            bufferPos = 0
-        }
         return n
     }
 
-    override fun available(): Int = buffer.size - bufferPos
+    override fun available(): Int = bufferLimit - bufferPos
 
     override fun close() {
         if (closed) return
         closed = true
-        buffer = ByteArray(0)
         bufferPos = 0
+        bufferLimit = 0
+        directBuf.zeroEntireCapacity()
         val f = file
         file = 0L
         if (f != 0L) volume.closeFile(f)

@@ -27,6 +27,7 @@ use jni::sys::{jbyteArray, jint, jlong, jstring};
 use jni::JNIEnv;
 
 use luks_core::error::LuksError;
+use zeroize::Zeroize;
 
 #[cfg(target_os = "android")]
 #[allow(dead_code)]
@@ -688,7 +689,113 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeReadAt<'l>(
                 format!("read of file handle {file} at offset {offset} failed: {e}"),
             )
         })?;
-        out_bytes(env, &buf[..got])
+        let res = out_bytes(env, &buf[..got]);
+        buf.zeroize();
+        res
+    })
+}
+
+/// Up to `len` bytes at `offset` read directly into a direct off-heap `ByteBuffer`.
+/// Avoids intermediate heap allocation and copies across JNI.
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeReadAtDirect<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    volume: jlong,
+    file: jlong,
+    offset: jlong,
+    data: JByteBuffer<'l>,
+    len: jint,
+) -> jint {
+    guard(&mut env, 0, |env| {
+        let vol = bridge::volume_ref(volume).map_err(bad_handle)?;
+        let fh = bridge::file_ref(file).map_err(bad_handle)?;
+        if fh.volume_id() != vol.id {
+            return Err(bad_handle("file belongs to another volume"));
+        }
+        if offset < 0 || len <= 0 {
+            return Err(Fail::Msg(
+                bridge::code::GENERIC,
+                format!("bad read request file={file} offset={offset} len={len}"),
+            ));
+        }
+        let len = usize::try_from(len)
+            .map_err(|_| Fail::Msg(bridge::code::GENERIC, "negative chunk length".into()))?;
+
+        let ptr = env.get_direct_buffer_address(&data)
+            .map_err(|e| Fail::Msg(bridge::code::GENERIC, format!("not a direct ByteBuffer: {e}")))?;
+        let cap = env.get_direct_buffer_capacity(&data)
+            .map_err(|e| Fail::Msg(bridge::code::GENERIC, format!("cannot query direct buffer capacity: {e}")))?;
+
+        if len > cap {
+            return Err(Fail::Msg(bridge::code::GENERIC, "chunk length exceeds buffer capacity".into()));
+        }
+        if ptr.is_null() {
+            return Err(Fail::Msg(bridge::code::GENERIC, "direct buffer address is null".into()));
+        }
+
+        let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+        let got = vol.read_at(&fh, offset as u64, slice).map_err(|e| {
+            Fail::Msg(
+                bridge::error_code(&e),
+                format!("read of file handle {file} at offset {offset} failed: {e}"),
+            )
+        })?;
+        Ok(got as jint)
+    })
+}
+
+/// Sibling of `nativeReadAtDirect` that checks `cancel_token` and refuses if cancelled.
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeReadAtDirectWithCancel<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    volume: jlong,
+    file: jlong,
+    offset: jlong,
+    data: JByteBuffer<'l>,
+    len: jint,
+    cancel_token: jlong,
+) -> jint {
+    guard(&mut env, 0, |env| {
+        let vol = bridge::volume_ref(volume).map_err(bad_handle)?;
+        let fh = bridge::file_ref(file).map_err(bad_handle)?;
+        if fh.volume_id() != vol.id {
+            return Err(bad_handle("file belongs to another volume"));
+        }
+        let token = if cancel_token > 0 { cancel_token as u64 } else { 0 };
+        if token > 0 && bridge::is_cancelled(token) {
+            return Err(Fail::Luks(luks_core::error::LuksError::Cancelled));
+        }
+        if offset < 0 || len <= 0 {
+            return Err(Fail::Msg(
+                bridge::code::GENERIC,
+                format!("bad read request file={file} offset={offset} len={len}"),
+            ));
+        }
+        let len = usize::try_from(len)
+            .map_err(|_| Fail::Msg(bridge::code::GENERIC, "negative chunk length".into()))?;
+
+        let ptr = env.get_direct_buffer_address(&data)
+            .map_err(|e| Fail::Msg(bridge::code::GENERIC, format!("not a direct ByteBuffer: {e}")))?;
+        let cap = env.get_direct_buffer_capacity(&data)
+            .map_err(|e| Fail::Msg(bridge::code::GENERIC, format!("cannot query direct buffer capacity: {e}")))?;
+
+        if len > cap {
+            return Err(Fail::Msg(bridge::code::GENERIC, "chunk length exceeds buffer capacity".into()));
+        }
+        if ptr.is_null() {
+            return Err(Fail::Msg(bridge::code::GENERIC, "direct buffer address is null".into()));
+        }
+
+        let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+        let got = vol.read_at(&fh, offset as u64, slice).map_err(|e| {
+            Fail::Msg(
+                bridge::error_code(&e),
+                format!("read of file handle {file} at offset {offset} failed: {e}"),
+            )
+        })?;
+        Ok(got as jint)
     })
 }
 

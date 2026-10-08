@@ -128,6 +128,8 @@ internal object LuksNative {
      * replaced or modified since [nativeOpenFile]; it never returns another file's bytes.
      */
     external fun nativeReadAt(volume: Long, file: Long, offset: Long, len: Int): ByteArray
+    external fun nativeReadAtDirect(volume: Long, file: Long, offset: Long, data: java.nio.ByteBuffer, len: Int): Int
+    external fun nativeReadAtDirectWithCancel(volume: Long, file: Long, offset: Long, data: java.nio.ByteBuffer, len: Int, cancelToken: Long): Int
 
     /**
      * Size of an open file, from the handle: identity-checked, no second path lookup. Throws

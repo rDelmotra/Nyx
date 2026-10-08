@@ -520,4 +520,15 @@ class TransferIoIntegrityTest {
         runBlocking { c.importFileWithProgress(ctx, vol, "/", uri!!, source = Src(declared = 10, bytes = payload(10))) }
         assertEquals(55L, vol.tokenSeenByWrite)
     }
+
+    @Test
+    fun `export reads via direct buffer pipeline and produces identical output`() {
+        val data = payload(TransferController.CHUNK_SIZE * 2 + 1024)
+        val vol = SrcVolume(data)
+        val t = Target()
+        val id = export(vol, t)
+        val item = TransferManager.getTransfer(id)!!
+        assertEquals(TransferState.COMPLETED, item.state)
+        assertArrayEquals(data, t.out.toByteArray())
+    }
 }

@@ -412,6 +412,30 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
     }
 
     /**
+     * Reads up to [len] bytes directly into a direct off-heap [buffer].
+     * Avoids intermediate allocations and copies across JNI. Returns bytes read, or 0 at EOF.
+     */
+    open fun readAt(file: Long, offset: Long, buffer: java.nio.ByteBuffer, len: Int = buffer.remaining()): Int {
+        if (handle != 0L) {
+            checkOpen(handle, "volume")
+            require(buffer.isDirect) { "buffer must be direct" }
+            require(len in 0..buffer.capacity()) { "read length exceeds buffer capacity" }
+            val token = currentNativeCancelToken()
+            return if (token > 0L) {
+                LuksNative.nativeReadAtDirectWithCancel(handle, file, offset, buffer, len, token)
+            } else {
+                LuksNative.nativeReadAtDirect(handle, file, offset, buffer, len)
+            }
+        }
+        val bytes = readAt(file, offset, len)
+        if (bytes.isEmpty()) return 0
+        val toCopy = minOf(bytes.size, buffer.capacity())
+        buffer.clear()
+        buffer.put(bytes, 0, toCopy)
+        return toCopy
+    }
+
+    /**
      * Size of the file [file] was opened as, from the handle (identity-checked; never a second
      * path lookup). Throws [LuksException.FILE_CHANGED] if it changed since [openFile].
      */

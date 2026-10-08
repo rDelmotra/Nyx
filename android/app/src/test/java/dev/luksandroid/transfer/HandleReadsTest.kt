@@ -185,4 +185,15 @@ class HandleReadsTest {
         assertEquals(0, stream.read(buf, 0, 0))
         stream.close()
     }
+
+    @Test
+    fun `VolumeInputStream scrubs its direct scratch buffer on close`() {
+        val data = ByteArray(4096) { 0x77.toByte() }
+        val vol = HandleVolume(mutableMapOf("/secret.bin" to data))
+        val stream = VolumeSourceBytes(vol, chunkBytes = 4096).open("/secret.bin")
+        val buf = ByteArray(1024)
+        assertEquals(1024, stream.read(buf))
+        stream.close()
+        assertEquals(1, vol.closed)
+    }
 }

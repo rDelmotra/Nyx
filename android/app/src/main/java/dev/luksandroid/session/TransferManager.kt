@@ -1187,48 +1187,81 @@ open class TransferController {
                 val readStartNs = System.nanoTime()
                 if (totalBytes > 0L) {
                     var readerError: Throwable? = null
-                    coroutineScope {
-                        val channel = Channel<ByteArray>(capacity = 2)
-                        val readerJob = launch {
-                            try {
-                                var readOffset = 0L
-                                while (readOffset < totalBytes) {
-                                    currentCoroutineContext().ensureActive()
-                                    if (isTransferCancelled(transferId)) throw CancellationException("Transfer cancelled")
+                    val buf1 = java.nio.ByteBuffer.allocateDirect(CHUNK_SIZE)
+                    val buf2 = java.nio.ByteBuffer.allocateDirect(CHUNK_SIZE)
+                    try {
+                        coroutineScope {
+                            val bufferPool = Channel<java.nio.ByteBuffer>(capacity = 2)
+                            bufferPool.send(buf1)
+                            bufferPool.send(buf2)
+                            val dataChannel = Channel<java.nio.ByteBuffer>(capacity = 2)
 
-                                    val toRead = (totalBytes - readOffset).coerceAtMost(CHUNK_SIZE.toLong()).toInt()
-                                    val chunk = stats.read {
-                                        withNativeCancel(token) {
-                                            volume.readAt(file, readOffset, toRead)
+                            val readerJob = launch {
+                                try {
+                                    var readOffset = 0L
+                                    while (readOffset < totalBytes) {
+                                        currentCoroutineContext().ensureActive()
+                                        if (isTransferCancelled(transferId)) throw CancellationException("Transfer cancelled")
+
+                                        val buf = bufferPool.receive()
+                                        buf.clear()
+                                        val toRead = (totalBytes - readOffset).coerceAtMost(CHUNK_SIZE.toLong()).toInt()
+                                        val got = stats.read {
+                                            withNativeCancel(token) {
+                                                volume.readAt(file, readOffset, buf, toRead)
+                                            }
                                         }
+                                        if (got <= 0) {
+                                            buf.clear()
+                                            bufferPool.send(buf)
+                                            break
+                                        }
+                                        buf.position(0)
+                                        buf.limit(got)
+                                        dataChannel.send(buf)
+                                        readOffset += got
                                     }
-                                    if (chunk.isEmpty()) break
-                                    channel.send(chunk)
-                                    readOffset += chunk.size
+                                } catch (t: Throwable) {
+                                    readerError = t
+                                } finally {
+                                    dataChannel.close()
                                 }
+                            }
+
+                            try {
+                                val outChannel = java.nio.channels.Channels.newChannel(out)
+                                for (buf in dataChannel) {
+                                    try {
+                                        currentCoroutineContext().ensureActive()
+                                        if (isTransferCancelled(transferId)) throw CancellationException("Transfer cancelled")
+
+                                        if (digest != null) {
+                                            val dup = buf.duplicate()
+                                            digest.update(dup)
+                                        }
+                                        val len = buf.remaining()
+                                        stats.write {
+                                            while (buf.hasRemaining()) {
+                                                outChannel.write(buf)
+                                            }
+                                        }
+                                        done += len
+                                        meter.tick(done)
+                                    } finally {
+                                        buf.clear()
+                                        bufferPool.send(buf)
+                                    }
+                                }
+                                readerError?.let { throw it }
                             } catch (t: Throwable) {
-                                readerError = t
-                            } finally {
-                                channel.close()
+                                readerJob.cancel()
+                                dataChannel.cancel(CancellationException("Writer failed", t))
+                                throw t
                             }
                         }
-
-                        try {
-                            for (chunk in channel) {
-                                currentCoroutineContext().ensureActive()
-                                if (isTransferCancelled(transferId)) throw CancellationException("Transfer cancelled")
-
-                                stats.write { out.write(chunk) }
-                                digest?.update(chunk)
-                                done += chunk.size
-                                meter.tick(done)
-                            }
-                            readerError?.let { throw it }
-                        } catch (t: Throwable) {
-                            readerJob.cancel()
-                            channel.cancel(CancellationException("Writer failed", t))
-                            throw t
-                        }
+                    } finally {
+                        buf1.zeroEntireCapacity()
+                        buf2.zeroEntireCapacity()
                     }
                 }
                 out.flush()

@@ -181,7 +181,7 @@ fn h4_home_batch_into_two_folders_cancel_and_rename_over() {
     }
     // Documents holds exactly the original entries plus the added files.
     let docs = files_print(&fs, &dd);
-    assert_eq!(docs.len(), 1 + exp_d.len(), "h4 Documents: notes.txt + added files, got {:?}", docs.keys());
+    assert_eq!(docs.len(), 2 + exp_d.len(), "h4 Documents: notes.txt + hl_c (hardlink fixture) + added files, got {:?}", docs.keys());
     drop(fs);
 
     // Rename across folders, then over an existing file (frees its data).

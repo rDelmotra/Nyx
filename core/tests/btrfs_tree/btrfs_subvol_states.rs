@@ -100,9 +100,15 @@ impl Frame {
         let fs = mount(&self.dev);
         self.untouched.assert_same(&fs, step);
         for (rel, want) in &self.originals {
-            let got = fs
-                .read_file(&format!("/home/user/{rel}"))
-                .unwrap_or_else(|e| panic!("[{step}] original /home/user/{rel} unreadable: {e}"));
+            // `files_print` keys a symlink as `name@` with its target as the value.
+            let got = if let Some(link) = rel.strip_suffix('@') {
+                fs.read_link(&format!("/home/user/{link}"))
+                    .unwrap_or_else(|e| panic!("[{step}] original symlink /home/user/{link} unreadable: {e}"))
+                    .into_bytes()
+            } else {
+                fs.read_file(&format!("/home/user/{rel}"))
+                    .unwrap_or_else(|e| panic!("[{step}] original /home/user/{rel} unreadable: {e}"))
+            };
             assert!(&got == want, "[{step}] original /home/user/{rel} changed ({} -> {} bytes)", want.len(), got.len());
         }
         drop(fs);

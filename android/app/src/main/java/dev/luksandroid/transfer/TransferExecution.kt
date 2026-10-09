@@ -216,6 +216,28 @@ internal class StatsRecorder {
 class TransferCancelledException : CancellationException("transfer cancelled")
 
 /**
+ * The REPLACE-mode temp name `.transfer-tmp-<name>-<nanoTime>`, clamped to
+ * [maxBytes] UTF-8 bytes. Only the `<name>` part is shortened, on a code point
+ * boundary, so the prefix and the uniquifying suffix always survive.
+ */
+internal fun transferTempName(name: String, nanos: Long = System.nanoTime(), maxBytes: Int = 255): String {
+    val prefix = ".transfer-tmp-"
+    val suffix = "-$nanos"
+    var budget = maxBytes - prefix.toByteArray(Charsets.UTF_8).size - suffix.toByteArray(Charsets.UTF_8).size
+    val sb = StringBuilder()
+    var i = 0
+    while (i < name.length) {
+        val cp = name.codePointAt(i)
+        val len = String(Character.toChars(cp)).toByteArray(Charsets.UTF_8).size
+        if (len > budget) break
+        sb.appendCodePoint(cp)
+        budget -= len
+        i += Character.charCount(cp)
+    }
+    return "$prefix$sb$suffix"
+}
+
+/**
  * Picks a name that does not collide with any of [existingNames], starting
  * from [desiredName] and appending " (1)", " (2)", ... before the extension --
  * the same scheme [LuksDocumentsProvider][dev.luksandroid.documents.LuksDocumentsProvider.uniqueDocumentName]

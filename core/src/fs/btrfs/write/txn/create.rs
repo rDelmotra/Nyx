@@ -26,11 +26,13 @@ impl Transaction {
         now_nsec: u32,
     ) -> Result<Self> {
         gate::check_writeable_fs(fs.superblock())?;
+        gate::check_entry_name(filename)?;
 
         let located_parent = fs.resolve_no_follow(fs.fs_tree(), parent_path)?;
         if !located_parent.inode.file_type().is_dir() {
             return Err(LuksError::NotADirectory(parent_path.to_string()));
         }
+        gate::check_dir_allows_create(located_parent.inode.flags)?;
         gate::check_writeable_subvolume(&located_parent.tree)?;
 
         let target_tree = TargetTree::new(located_parent.tree);
@@ -309,7 +311,9 @@ impl Transaction {
         now_nsec: u32,
     ) -> Result<(Self, u64)> {
         gate::check_writeable_fs(fs.superblock())?;
+        gate::check_entry_name(name)?;
         gate::check_writeable_subvolume(&parent_tree.root)?;
+        gate::check_dir_allows_create(fs.read_inode(parent_tree.bytenr(), parent_ino)?.flags)?;
 
         // Check if entry already exists in parent directory
         let name_hash = crate::fs::btrfs::crc32c::name_hash(name.as_bytes());

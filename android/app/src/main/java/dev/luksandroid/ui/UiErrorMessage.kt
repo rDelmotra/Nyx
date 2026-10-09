@@ -49,6 +49,9 @@ object UiErrorMessage {
             "The file was changed or replaced while it was being read, so the copy was stopped. " +
                 "Refresh the folder and try again."
         LuksException.HEALTH_READ_ONLY -> HEALTH_READ_ONLY_MESSAGE
+        LuksException.WRITES_UNSAFE ->
+            "This USB adapter cannot guarantee writes reach the disk; writing is disabled to protect it. " +
+                "You can still read files."
         else -> "An unexpected error occurred (code $code)."
     }
 

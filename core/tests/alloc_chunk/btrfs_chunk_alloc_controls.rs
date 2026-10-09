@@ -207,6 +207,10 @@ fn test_pass_i1_enabled_exclusions_keeps_image_clean() {
 
     let dev = FileDevice::open_writable(&temp_img, file_len).expect("open writable");
     let mut fs = Btrfs::mount(dev).expect("mount writable btrfs");
+    // Premise of this test is allocating the last free device bytes of a tiny
+    // fixture; the production unallocated-space reserve is waived here (the
+    // reserve itself is covered by btrfs_unallocated_reserve).
+    fs.set_unallocated_reserve_for_tests(0);
 
     // 1. Verify computed exclusions include 58720256..58785792
     let exclusions = compute_sb_exclusions(fs.chunk_map());
@@ -575,6 +579,10 @@ fn test_pass_i3_chunk_map_refresh_omission_fails_commit() {
 
     let dev = FileDevice::open_writable(&temp_img, file_len).expect("open writable");
     let mut fs = Btrfs::mount(dev).expect("mount writable btrfs");
+    // Premise of this test is allocating the last free device bytes of a tiny
+    // fixture; the production unallocated-space reserve is waived here (the
+    // reserve itself is covered by btrfs_unallocated_reserve).
+    fs.set_unallocated_reserve_for_tests(0);
 
     // 1. Prepare chunk allocation transaction
     let (mut txn, new_chunk) = Transaction::allocate_data_chunk(&fs)

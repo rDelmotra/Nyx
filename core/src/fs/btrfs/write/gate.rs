@@ -225,6 +225,67 @@ pub fn check_free_space_tree_no_bitmaps<D: crate::device::ReadAt>(
     Ok(())
 }
 
+/// Maximum length in bytes of a btrfs directory entry name (`BTRFS_NAME_LEN`).
+pub const BTRFS_NAME_LEN: usize = 255;
+
+/// Validate a name about to become a directory entry (file, directory, or the
+/// destination of a rename).
+///
+/// Refuses: empty, `.`, `..`, any `/` or NUL, and anything longer than
+/// [`BTRFS_NAME_LEN`] **bytes** (UTF-8 length, not characters). Must run before
+/// anything is written. The error text never includes the name (it crosses into
+/// logs); it reuses `UnsupportedFsFeature`, which the JNI layer reports as code
+/// `UNSUPPORTED`.
+pub fn check_entry_name(name: &str) -> Result<()> {
+    let reason = if name.is_empty() {
+        "is empty"
+    } else if name == "." || name == ".." {
+        "is a reserved name"
+    } else if name.contains('/') {
+        "contains '/'"
+    } else if name.contains('\0') {
+        "contains a NUL byte"
+    } else if name.len() > BTRFS_NAME_LEN {
+        "is longer than 255 bytes"
+    } else {
+        return Ok(());
+    };
+    Err(LuksError::UnsupportedFsFeature(format!(
+        "invalid btrfs file name: name {reason}"
+    )))
+}
+
+/// `BTRFS_INODE_IMMUTABLE` (`1 << 6`) from the kernel's `btrfs_tree.h`
+/// (`chattr +i`). Note `1 << 4` is `PREALLOC` and `1 << 5` is `SYNC`.
+pub const BTRFS_INODE_IMMUTABLE: u64 = 1 << 6;
+/// `BTRFS_INODE_APPEND` (`1 << 7`, `chattr +a`).
+pub const BTRFS_INODE_APPEND: u64 = 1 << 7;
+
+/// Refuse to remove, replace, rename, or otherwise modify an inode (or remove
+/// an entry from a directory) whose `INODE_ITEM.flags` carry immutable or
+/// append-only. `flags` is `Inode::flags`; `what` is a static description for
+/// the message (never a user name).
+pub fn check_inode_mutable(flags: u64, what: &str) -> Result<()> {
+    if flags & (BTRFS_INODE_IMMUTABLE | BTRFS_INODE_APPEND) != 0 {
+        return Err(LuksError::UnsupportedFsFeature(format!(
+            "{what} is immutable or append-only"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse to add an entry to a directory flagged immutable. Append-only
+/// directories still allow creation (but not removal/rename: use
+/// [`check_inode_mutable`] for those).
+pub fn check_dir_allows_create(dir_flags: u64) -> Result<()> {
+    if dir_flags & BTRFS_INODE_IMMUTABLE != 0 {
+        return Err(LuksError::UnsupportedFsFeature(
+            "directory is immutable".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

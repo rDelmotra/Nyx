@@ -334,6 +334,11 @@ path = "tests/alloc_chunk/btrfs_valves.rs"
 required-features = ["dangerous-write-support"]
 
 [[test]]
+name = "btrfs_unallocated_reserve"
+path = "tests/alloc_chunk/btrfs_unallocated_reserve.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
 name = "btrfs_extent_tree"
 path = "tests/alloc_chunk/btrfs_extent_tree.rs"
 required-features = ["dangerous-write-support"]
@@ -367,6 +372,11 @@ required-features = ["dangerous-write-support"]
 [[test]]
 name = "btrfs_rename"
 path = "tests/btrfs_ops/btrfs_rename.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_real_kinds"
+path = "tests/btrfs_ops/btrfs_real_kinds.rs"
 required-features = ["dangerous-write-support"]
 
 [[test]]
@@ -508,4 +518,9 @@ required-features = ["dangerous-write-support"]
 [[test]]
 name = "btrfs_owner_gate"
 path = "tests/btrfs_ops/btrfs_owner_gate.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_delete_all_or_nothing"
+path = "tests/btrfs_ops/btrfs_delete_all_or_nothing.rs"
 required-features = ["dangerous-write-support"]

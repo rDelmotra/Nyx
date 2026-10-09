@@ -181,7 +181,7 @@ object TreeImporter {
                         // The temp name is dedup'd against real siblings the same way
                         // keep-both is, so a leftover temp file from an earlier
                         // aborted run can never collide with this one either.
-                        val tempName = uniqueName(destination.namesOf(parentDir), ".transfer-tmp-${name}-${System.nanoTime()}")
+                        val tempName = uniqueName(destination.namesOf(parentDir), transferTempName(name))
                         val written = try {
                             streamFile(volume, source, stats, entry, parentDir, tempName, onFileDone) { liveBytes ->
                                 fireProgress(entry.relativePath, bytesCopied + liveBytes, force = false)

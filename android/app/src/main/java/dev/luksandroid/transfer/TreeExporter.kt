@@ -225,7 +225,7 @@ object TreeExporter {
             val requestedName = when {
                 // REPLACE writes to a temp document first so the target is only
                 // destroyed once the new bytes are safely on the destination.
-                replacing -> uniqueName(state.namesOf(parentId), ".transfer-tmp-$name-${System.nanoTime()}")
+                replacing -> uniqueName(state.namesOf(parentId), transferTempName(name))
                 existing == false -> uniqueName(state.namesOf(parentId), name)
                 else -> name
             }

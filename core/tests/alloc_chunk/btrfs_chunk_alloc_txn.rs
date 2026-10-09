@@ -105,6 +105,10 @@ fn test_allocate_data_chunk_on_plain_img_and_verify() {
 
     let dev = FileDevice::open_writable(&temp_img, file_len).expect("open writable");
     let mut fs = Btrfs::mount(dev).expect("mount writable btrfs");
+    // Premise of this test is allocating the last free device bytes of a tiny
+    // fixture; the production unallocated-space reserve is waived here (the
+    // reserve itself is covered by btrfs_unallocated_reserve).
+    fs.set_unallocated_reserve_for_tests(0);
 
     let original_sb_gen = fs.superblock().generation;
     let initial_chunk_count = fs.chunk_map().len();
@@ -163,6 +167,10 @@ fn test_allocate_data_chunk_device_exhaustion_refusal() {
 
     let dev = FileDevice::open_writable(&temp_img, file_len).expect("open writable");
     let mut fs = Btrfs::mount(dev).expect("mount writable btrfs");
+    // Premise of this test is allocating the last free device bytes of a tiny
+    // fixture; the production unallocated-space reserve is waived here (the
+    // reserve itself is covered by btrfs_unallocated_reserve).
+    fs.set_unallocated_reserve_for_tests(0);
 
     let initial_chunk_count = fs.chunk_map().len();
 
@@ -195,6 +203,10 @@ fn test_allocate_data_chunk_across_all_fixtures() {
 
         let dev = FileDevice::open_writable(&temp_img, file_len).expect("open writable");
         let mut fs = Btrfs::mount(dev).expect("mount writable btrfs");
+        // Premise of this test is allocating the last free device bytes of a tiny
+        // fixture; the production unallocated-space reserve is waived here (the
+        // reserve itself is covered by btrfs_unallocated_reserve).
+        fs.set_unallocated_reserve_for_tests(0);
 
         let initial_chunk_count = fs.chunk_map().len();
         let log = fs.allocate_data_chunk().unwrap_or_else(|e| panic!("{name}: allocate chunk failed: {e}"));

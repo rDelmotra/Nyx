@@ -38,6 +38,16 @@ pub trait WriteAt: ReadAt {
     fn flush_support(&self) -> Option<bool> {
         None
     }
+
+    /// Decide, before the first write, whether this device can honour the
+    /// write ordering a filesystem commit depends on (tree blocks durable
+    /// before the superblock that points at them). Issues no write. A device
+    /// that cannot guarantee it returns [`LuksError::UnsafeWriteCache`].
+    /// The default is `Ok`: files and in-memory images have no volatile cache
+    /// this layer could learn about.
+    fn check_write_safety(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub trait ReadAt {
@@ -88,6 +98,10 @@ impl<D: WriteAt + ?Sized> WriteAt for &D {
 
     fn flush_support(&self) -> Option<bool> {
         (**self).flush_support()
+    }
+
+    fn check_write_safety(&self) -> Result<()> {
+        (**self).check_write_safety()
     }
 }
 

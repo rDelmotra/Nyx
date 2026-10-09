@@ -43,7 +43,7 @@ use crate::fs::btrfs::Btrfs;
 
 /// How deep `delete_file`'s directory recursion may descend before refusing.
 /// See `delete_file_at_depth`.
-const MAX_DELETE_DEPTH: usize = 1024;
+pub(crate) const MAX_DELETE_DEPTH: usize = 1024;
 
 impl<D: WriteAt> Btrfs<D> {
     /// Commit any active batch session before performing non-batch operations.
@@ -202,11 +202,13 @@ impl<D: WriteAt> Btrfs<D> {
     }
 
     /// Delete the file or directory at `path`. A directory is emptied first,
-    /// depth-first, one committed transaction per child — the same shape as
-    /// deleting each child by hand, so a mid-tree failure (an unsupported
-    /// child type, a symlink, a subvolume boundary) leaves exactly what it
-    /// would if a caller had stopped there themselves, rather than a
-    /// half-applied larger operation.
+    /// depth-first, one committed transaction per child. Before anything is
+    /// written the whole subtree is walked read-only and every refusal the
+    /// per-item delete would raise (subvolume roots, hardlinks, immutable or
+    /// append-only items, shared extents, ...) is applied up front, so a
+    /// delete that cannot complete is refused whole. Only a power cut can
+    /// leave a partial delete, and then each committed child is a consistent
+    /// state.
     pub fn delete_file(&mut self, path: &str) -> Result<()> {
         self.commit_active_batch()?;
         // `.` and `..` are never real stored entries on btrfs (see
@@ -226,6 +228,10 @@ impl<D: WriteAt> Btrfs<D> {
                 "delete path containing '.' or '..' components".into(),
             ));
         }
+        // Refuse the whole delete up front if any part of it would be refused
+        // (a subvolume root, a nested subvolume, a hardlink, an immutable
+        // item, a shared extent, ...), so nothing is half-deleted.
+        txn::delete::preflight_recursive_delete(self, path)?;
         self.delete_file_at_depth(path, 0)
     }
 

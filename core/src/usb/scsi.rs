@@ -1328,4 +1328,23 @@ impl<T: BulkTransport> crate::device::WriteAt for ScsiBlockDevice<T> {
     fn flush_support(&self) -> Option<bool> {
         ScsiBlockDevice::flush_support(self)
     }
+
+    /// Writes are allowed only if a flush command works, or the drive reports
+    /// a write-through cache (Caching page WCE clear). If the adapter rejects
+    /// SYNCHRONIZE CACHE and WCE is set or unreadable, the superblock could
+    /// reach the medium before the tree blocks it points at.
+    ///
+    /// The probe is a SYNCHRONIZE CACHE for the whole medium with nothing
+    /// pending: a no-op for the drive, and the same command the kernel issues
+    /// at unmount.
+    fn check_write_safety(&self) -> Result<()> {
+        self.synchronize_cache()?;
+        if ScsiBlockDevice::flush_support(self) == Some(true) {
+            return Ok(());
+        }
+        if self.write_cache_state() == WriteCacheState::Disabled {
+            return Ok(());
+        }
+        Err(LuksError::UnsafeWriteCache)
+    }
 }

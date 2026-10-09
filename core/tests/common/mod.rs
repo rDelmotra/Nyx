@@ -90,6 +90,10 @@ pub struct MockUsbDrive {
     pub vpd_reject: std::cell::Cell<bool>,
     pub stall_transfers_larger_than: std::cell::Cell<Option<usize>>,
     pub stalled_endpoints: std::cell::Cell<bool>,
+    /// What MODE SENSE(6) reports for the Caching page's WCE bit. `None`
+    /// (the default) means the command is rejected like any other opcode this
+    /// mock does not implement.
+    pub write_cache_enabled: std::cell::Cell<Option<bool>>,
 }
 
 impl MockUsbDrive {
@@ -109,7 +113,14 @@ impl MockUsbDrive {
             vpd_reject: std::cell::Cell::new(false),
             stall_transfers_larger_than: std::cell::Cell::new(None),
             stalled_endpoints: std::cell::Cell::new(false),
+            write_cache_enabled: std::cell::Cell::new(None),
         }
+    }
+
+    /// Answer MODE SENSE(6) for the Caching page with the given WCE bit.
+    pub fn with_write_cache(self, wce: bool) -> Self {
+        self.write_cache_enabled.set(Some(wce));
+        self
     }
 
     /// Refuse `opcode` with CSW status 1, reporting `sense` when asked why.
@@ -395,6 +406,16 @@ impl MockUsbDrive {
             0x35 | 0x91 => {
                 self.stats.borrow_mut().sync_commands += 1;
                 Vec::new()
+            }
+            // MODE SENSE(6), only when the test configured a cache state.
+            0x1A if self.write_cache_enabled.get().is_some() => {
+                let wce = self.write_cache_enabled.get().unwrap();
+                let mut d = vec![0u8; 24];
+                d[0] = 23;
+                d[4] = 0x08; // Caching page
+                d[5] = 18;
+                d[6] = if wce { 0x04 } else { 0x00 };
+                d
             }
             _ => {
                 self.set_csw(tag, expected_len, 1);

@@ -16,7 +16,7 @@
 mod chunk;
 mod create;
 mod data;
-mod delete;
+pub(crate) mod delete;
 mod mtime;
 mod rename;
 

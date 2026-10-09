@@ -158,3 +158,106 @@ fn info_json_does_not_block_behind_a_device_in_the_middle_of_a_flush() {
     flusher.join().expect("flusher thread").expect("flush ok");
     infos.expect("info_json blocked behind the device lock");
 }
+
+// ---------------------------------------------------------------------------
+// Write refusal when ordering cannot be guaranteed.
+//
+// Rule: writes are allowed only if SYNCHRONIZE CACHE works, or MODE SENSE
+// reports the write cache disabled (write-through). Rejected flush plus WCE
+// set or unknown -> refused before any byte is written; reads keep working.
+// These run on the shared device layer that both ext4 and btrfs sit on, over a
+// plain btrfs image (no LUKS fixture needed).
+// ---------------------------------------------------------------------------
+
+use luks_core::device::ReadAt;
+use luks_core::error::LuksError;
+use luks_core::fs::btrfs::Btrfs;
+use luks_jni::bridge::{code, error_code, SharedDevice};
+
+fn shared_over(drive: MockUsbDrive) -> SharedDevice {
+    SharedDevice::new(ScsiBlockDevice::open(drive).expect("open mock drive"))
+}
+
+fn btrfs_drive() -> MockUsbDrive {
+    MockUsbDrive::new(fixture("btrfs/states-4k.img"))
+}
+
+fn no_flush(d: MockUsbDrive) -> MockUsbDrive {
+    d.failing(0x35, NO_SUCH_OPCODE).failing(0x91, NO_SUCH_OPCODE)
+}
+
+/// First 1 MiB at the superblock region, to prove nothing was written.
+fn head(dev: &SharedDevice) -> Vec<u8> {
+    let mut b = vec![0u8; 1 << 20];
+    dev.read_at(0, &mut b).expect("read");
+    b
+}
+
+fn assert_refused_and_untouched(dev: &SharedDevice) {
+    let before = head(dev);
+    let err = dev.ensure_writes_safe().expect_err("writes must be refused");
+    assert!(matches!(err, LuksError::UnsafeWriteCache), "{err:?}");
+    assert_eq!(error_code(&err), code::WRITES_UNSAFE);
+    assert!(err.to_string().contains("cannot guarantee writes reach the disk"));
+    // The backstop in write_at refuses too, whatever path got there.
+    let w = dev.write_at(0x10000, &[0xAB; 4096]).expect_err("raw write refused");
+    assert!(matches!(w, LuksError::UnsafeWriteCache), "{w:?}");
+    assert_eq!(head(dev), before, "a refused write changed the device");
+    // Reads continue, filesystem included.
+    let fs = Btrfs::mount(dev.clone()).expect("reads still work");
+    fs.statfs().expect("statfs");
+}
+
+#[test]
+fn rejected_flush_with_unknown_cache_state_refuses_writes() {
+    // The mock does not implement MODE SENSE here: WCE is Unknown.
+    let dev = shared_over(no_flush(btrfs_drive()));
+    assert_refused_and_untouched(&dev);
+}
+
+#[test]
+fn rejected_flush_with_write_cache_enabled_refuses_writes() {
+    let dev = shared_over(no_flush(btrfs_drive().with_write_cache(true)));
+    assert_refused_and_untouched(&dev);
+}
+
+#[test]
+fn rejected_flush_refuses_a_btrfs_write_before_anything_is_written() {
+    let dev = shared_over(no_flush(btrfs_drive().with_write_cache(true)));
+    let before = head(&dev);
+    let mut fs = Btrfs::mount(dev.clone()).expect("mount");
+    // No ensure_writes_safe call by the caller: the device itself refuses.
+    let err = fs.create_file_with_data("/", "x", b"data").expect_err("refused");
+    assert!(matches!(err, LuksError::UnsafeWriteCache), "{err:?}");
+    assert_eq!(head(&dev), before);
+}
+
+#[test]
+fn rejected_flush_with_write_cache_disabled_allows_writes() {
+    let dev = shared_over(no_flush(btrfs_drive().with_write_cache(false)));
+    dev.ensure_writes_safe().expect("write-through drive is safe without flush");
+    let mut fs = Btrfs::mount(dev.clone()).expect("mount");
+    fs.create_file_with_data("/", "wt.txt", b"write-through").expect("write allowed");
+    let fs = Btrfs::mount(dev.clone()).expect("remount");
+    assert_eq!(fs.read_file("/wt.txt").expect("read back"), b"write-through");
+}
+
+#[test]
+fn a_working_flush_allows_writes_even_with_write_cache_enabled() {
+    let dev = shared_over(btrfs_drive().with_write_cache(true));
+    dev.ensure_writes_safe().expect("flush works");
+    let mut fs = Btrfs::mount(dev.clone()).expect("mount");
+    fs.create_file_with_data("/", "wb.txt", b"flushed").expect("write allowed");
+    let fs = Btrfs::mount(dev.clone()).expect("remount");
+    assert_eq!(fs.read_file("/wb.txt").expect("read back"), b"flushed");
+}
+
+/// The decision is made by the probe, before any commit could write: the
+/// device reports flush support without a single write having happened.
+#[test]
+fn the_probe_runs_before_the_first_write() {
+    let dev = shared_over(btrfs_drive());
+    assert_eq!(luks_core::device::WriteAt::flush_support(&dev), None);
+    dev.ensure_writes_safe().expect("safe");
+    assert_eq!(luks_core::device::WriteAt::flush_support(&dev), Some(true));
+}

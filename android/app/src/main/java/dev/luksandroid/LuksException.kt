@@ -127,6 +127,14 @@ class LuksException(message: String, val code: Int) : Exception(message) {
          * the session stays open and nothing is torn down.
          */
         const val HEALTH_READ_ONLY = 24
+
+        /**
+         * The USB adapter rejected SYNCHRONIZE CACHE and does not report a write-through
+         * cache, so tree blocks cannot be ordered before the superblock. Refused before any
+         * byte was written; reads still work and the session stays open. Mirrors
+         * `bridge::code::WRITES_UNSAFE`.
+         */
+        const val WRITES_UNSAFE = 25
     }
 }
 

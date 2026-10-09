@@ -107,6 +107,30 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
             .map(|bg| bg.total_free_bytes)
             .sum();
 
+        // Refuse before anything is written (or any chunk is committed) when
+        // the request cannot fit without eating the unallocated-space reserve,
+        // or when too little metadata space is left for a commit to succeed.
+        let free_metadata: u64 = allocator
+            .block_groups
+            .iter()
+            .filter(|bg| bg.block_group.flags & 0x4 != 0)
+            .map(|bg| bg.total_free_bytes)
+            .sum();
+        if free_metadata < crate::fs::btrfs::write::chunk_alloc::metadata_floor(self.superblock().node_size) {
+            return Err(LuksError::FilesystemFull);
+        }
+        if total_free_data < disk_num_bytes {
+            let dev_extents = crate::fs::btrfs::write::chunk_alloc::read_dev_extents(self, self.superblock().dev_id)?;
+            let headroom = crate::fs::btrfs::write::chunk_alloc::data_chunk_headroom(
+                self.unallocated_reserve(),
+                self.superblock().total_bytes,
+                &dev_extents,
+            );
+            if total_free_data.saturating_add(headroom) < disk_num_bytes {
+                return Err(LuksError::FilesystemFull);
+            }
+        }
+
         while total_free_data < disk_num_bytes {
             self.commit_active_batch()?;
             self.allocate_data_chunk_excluding(&[])?;

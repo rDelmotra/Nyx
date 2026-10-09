@@ -398,7 +398,8 @@ IMG="$OUT/fedora-4k.img"
 rm -f "$IMG"
 FED="$WORK/fedora"
 mkdir -p "$FED/root/etc" "$FED/root/usr/bin" "$FED/root/usr/share/doc" \
-    "$FED/home/user/Documents" "$FED/home/user/Photos" "$FED/home/user/.config"
+    "$FED/home/user/Documents" "$FED/home/user/Photos" "$FED/home/user/.config" \
+    "$FED/root/usr/lib"
 python3 - "$FED" <<'PY'
 import sys, pathlib, hashlib
 d = pathlib.Path(sys.argv[1])
@@ -425,6 +426,36 @@ def noise(tag, n):
     "".join(f"note {i:05d}: remember to back up the Photos directory\n" for i in range(3600)))
 (d / "home/user/Photos/img1.bin").write_bytes(noise("img1", 150000))
 (d / "home/user/.config/app.conf").write_text("[app]\ntheme=dark\nautosave=true\n")
+
+# --- real Fedora file kinds (hardlinks, symlink, fifo, xattrs) ---------------
+# The writer's rename/delete must refuse or handle each of these without
+# corrupting the filesystem. mkfs --rootdir preserves hardlinks, symlinks,
+# fifos and user.* xattrs (security.selinux cannot be set unprivileged here).
+import os
+bin_ = d / "root/usr/bin"
+# 3 hardlinks in one directory + 1 in another (nlink == 4).
+(bin_ / "hl_a").write_bytes(b"hardlinked tool body\n" * 40)
+os.link(bin_ / "hl_a", bin_ / "hl_b")
+os.link(bin_ / "hl_a", bin_ / "hl_c")
+os.link(bin_ / "hl_a", d / "root/usr/lib/hl_d")
+os.symlink("tool", bin_ / "link")
+os.mkfifo(bin_ / "fifo")
+(bin_ / "tagged").write_bytes(b"xattr file in usr/bin\n")
+os.setxattr(bin_ / "tagged", "user.nyx.test", b"root-value")
+os.setxattr(bin_ / "tagged", "user.nyx.second", b"2")
+(bin_ / "tagged2").write_bytes(b"second xattr file\n")
+os.setxattr(bin_ / "tagged2", "user.nyx.other", b"v")
+# home/user: a hardlinked trio (two names here, one in Documents), a symlink,
+# and xattr files (one to rename over another).
+h = d / "home/user"
+(h / "hl_a").write_bytes(b"home hardlink body\n" * 30)
+os.link(h / "hl_a", h / "hl_b")
+os.link(h / "hl_a", h / "Documents/hl_c")
+os.symlink("hello.txt", h / "link")
+(h / "tagged.txt").write_bytes(b"home xattr file\n")
+os.setxattr(h / "tagged.txt", "user.nyx.test", b"home-value")
+(h / "tagged_other.txt").write_bytes(b"home xattr file two\n")
+os.setxattr(h / "tagged_other.txt", "user.nyx.test", b"other-value")
 PY
 truncate -s 256M "$IMG"
 "$MKFS" -q -f -n 4096 --compress zstd:1 -L BTRFSFEDORA -U "$UUID_FEDORA" \

@@ -354,6 +354,8 @@ impl Batch {
         now_nsec: u32,
         already_reserved: bool,
     ) -> Result<u64> {
+        // Validate the name before any batch state (ledger, allocator) changes.
+        gate::check_entry_name(name)?;
         if !is_streaming && written_bytes != declared_size {
             return Err(LuksError::OutOfBounds);
         }
@@ -404,6 +406,7 @@ impl Batch {
                     return Err(LuksError::NotADirectory(parent_path.to_string()));
                 }
                 gate::check_writeable_subvolume(&located_parent.tree)?;
+                gate::check_dir_allows_create(located_parent.inode.flags)?;
 
                 if let Some((ref target_tree, _)) = self.target {
                     if target_tree.objectid != located_parent.tree.objectid {

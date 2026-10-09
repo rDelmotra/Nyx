@@ -388,6 +388,25 @@ class TreeImporterTest {
         assertTrue(volume.deletedPaths.isNotEmpty())
     }
 
+    // ---- transferTempName: REPLACE temp name stays within 255 bytes -------------
+
+    @Test
+    fun `transferTempName keeps short names intact`() {
+        assertEquals(".transfer-tmp-a.txt-42", transferTempName("a.txt", 42L))
+    }
+
+    @Test
+    fun `transferTempName clamps a long multibyte name to 255 bytes on a character boundary`() {
+        val name = "\u00e9".repeat(200) + "\uD83D\uDE00".repeat(50)
+        val temp = transferTempName(name, 123456789L)
+        val bytes = temp.toByteArray(Charsets.UTF_8)
+        assertTrue("temp name is ${bytes.size} bytes", bytes.size <= 255)
+        assertTrue(temp.startsWith(".transfer-tmp-"))
+        assertTrue(temp.endsWith("-123456789"))
+        // Round-trips as valid UTF-8 (no split code point / lone surrogate).
+        assertEquals(temp, String(bytes, Charsets.UTF_8))
+    }
+
     // ---- uniqueName: pure name suffixing --------------------------------------
 
     @Test

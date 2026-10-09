@@ -141,6 +141,10 @@ pub mod code {
     /// not reused.
     #[allow(dead_code)]
     pub const HEALTH_READ_ONLY: i32 = 24;
+    /// The USB adapter cannot flush its write cache and does not report a
+    /// write-through cache, so writes are refused before any is issued.
+    /// Reads keep working. Distinct from `TRANSPORT`: nothing failed.
+    pub const WRITES_UNSAFE: i32 = 25;
 }
 
 pub fn error_code(e: &LuksError) -> i32 {
@@ -164,6 +168,7 @@ pub fn error_code(e: &LuksError) -> i32 {
         | AmbiguousFs => code::UNSUPPORTED,
         ReadOnlyVolume => code::READ_ONLY_VOLUME,
         FileChanged => code::FILE_CHANGED,
+        UnsafeWriteCache => code::WRITES_UNSAFE,
         FsNeedsRecovery => code::NEEDS_FSCK,
         FilesystemFull | NoFreeInodes => code::NO_SPACE,
         BtrfsItemTooLarge { .. } => code::ITEM_TOO_LARGE,
@@ -239,6 +244,10 @@ pub struct SharedDevice {
         allow(dead_code, reason = "only the write path flushes")
     )]
     flush_state: Arc<std::sync::atomic::AtomicU8>,
+    /// Write-safety verdict (`WriteAt::check_write_safety`): 0 not yet
+    /// decided, 1 writes allowed, 2 refused. Shared by every clone.
+    #[cfg(feature = "dangerous-write-support")]
+    write_gate: Arc<std::sync::atomic::AtomicU8>,
 }
 
 /// What a device must be able to do for this build: read only by default,
@@ -259,7 +268,37 @@ impl SharedDevice {
             inner: Arc::new(Mutex::new(device)),
             writer: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             flush_state: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            #[cfg(feature = "dangerous-write-support")]
+            write_gate: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         }
+    }
+
+    /// Decide once per device session whether writes may start, and refuse
+    /// with `UnsafeWriteCache` if the adapter cannot guarantee ordering.
+    /// Probes with a flush (no write) the first time. A transport error is
+    /// returned without latching a verdict.
+    #[cfg(feature = "dangerous-write-support")]
+    pub fn ensure_writes_safe(&self) -> Result<()> {
+        use std::sync::atomic::Ordering::{Acquire, Release};
+        match self.write_gate.load(Acquire) {
+            1 => return Ok(()),
+            2 => return Err(LuksError::UnsafeWriteCache),
+            _ => {}
+        }
+        let dev = self.lock();
+        let verdict = dev.check_write_safety();
+        let state = match dev.flush_support() {
+            None => 0,
+            Some(true) => 1,
+            Some(false) => 2,
+        };
+        self.flush_state.store(state, Release);
+        match &verdict {
+            Ok(()) => self.write_gate.store(1, Release),
+            Err(LuksError::UnsafeWriteCache) => self.write_gate.store(2, Release),
+            Err(_) => {}
+        }
+        verdict
     }
 
     /// Whether a panic ever unwound through the device lock. Poison is never
@@ -302,6 +341,9 @@ impl ReadAt for SharedDevice {
 #[cfg(feature = "dangerous-write-support")]
 impl luks_core::device::WriteAt for SharedDevice {
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+        // Backstop: no byte goes out before the verdict exists, whatever path
+        // (ext4, btrfs, raw) reached the device.
+        self.ensure_writes_safe()?;
         self.lock().write_at(offset, buf)
     }
 
@@ -641,6 +683,10 @@ impl VolumeHandle {
         if let Some(reason) = self.fence_reason() {
             return Err(LuksError::WriteSessionFenced(reason));
         }
+        // Refuse before any write is issued when the adapter cannot guarantee
+        // that tree blocks reach the disk before the superblock.
+        #[cfg(feature = "dangerous-write-support")]
+        self.dev.ensure_writes_safe()?;
         let guard = match self.fs.lock() {
             Ok(g) => g,
             Err(poisoned) => {

@@ -306,6 +306,12 @@ pub enum LuksError {
     #[error("cannot write to read-only plain volume")]
     ReadOnlyVolume,
 
+    /// The USB adapter rejected SYNCHRONIZE CACHE and does not report a
+    /// write-through cache, so there is no way to order tree blocks before the
+    /// superblock. Nothing has been written; reads keep working.
+    #[error("this USB adapter cannot guarantee writes reach the disk; writing is disabled to protect it")]
+    UnsafeWriteCache,
+
     /// A file that was open for reading is no longer the file it was opened
     /// as: deleted, replaced by another file that reused its inode number, or
     /// modified in place. The read is refused rather than answered with
@@ -401,6 +407,7 @@ impl LuksError {
             WriteSessionFenced(_) => 21,
             ReadOnlyVolume => 22,
             FileChanged => 23,
+            UnsafeWriteCache => 25,
         }
     }
 
@@ -538,6 +545,7 @@ mod fence_classification {
             LuksError::Cancelled,
             LuksError::OutOfBounds,
             LuksError::ReadOnlyVolume,
+            LuksError::UnsafeWriteCache,
             LuksError::UnsupportedFs("test"),
         ];
         assert!(!benign.is_empty(), "vacuity: the benign list is empty");

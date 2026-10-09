@@ -125,6 +125,9 @@ pub struct Btrfs<D: ReadAt> {
     pub(crate) commit_pending: bool,
     #[cfg(feature = "dangerous-write-support")]
     pub(crate) statfs_cache: std::sync::Mutex<Option<crate::fs::StatFs>>,
+    /// Test-only replacement for the unallocated-space reserve.
+    #[cfg(feature = "dangerous-write-support")]
+    pub(crate) reserve_override: Option<u64>,
 }
 
 impl<D: ReadAt> Btrfs<D> {
@@ -176,6 +179,8 @@ impl<D: ReadAt> Btrfs<D> {
             commit_pending: false,
             #[cfg(feature = "dangerous-write-support")]
             statfs_cache: std::sync::Mutex::new(None),
+            #[cfg(feature = "dangerous-write-support")]
+            reserve_override: None,
         };
         fs.load_chunk_tree()?;
         fs.chunks.check_single_device(fs.sb.dev_id)?;
@@ -514,6 +519,25 @@ impl<D: ReadAt> Btrfs<D> {
         }
     }
 
+    /// Unallocated device bytes writes must leave alone (see
+    /// `chunk_alloc::unallocated_reserve`).
+    #[cfg(feature = "dangerous-write-support")]
+    pub fn unallocated_reserve(&self) -> u64 {
+        self.reserve_override
+            .unwrap_or_else(|| write::chunk_alloc::unallocated_reserve(self.sb.total_bytes))
+    }
+
+    /// Replace the reserve. For tests that deliberately allocate the last
+    /// free device bytes of a tiny fixture; never called by the app.
+    #[doc(hidden)]
+    #[cfg(feature = "dangerous-write-support")]
+    pub fn set_unallocated_reserve_for_tests(&mut self, bytes: u64) {
+        self.reserve_override = Some(bytes);
+        if let Ok(mut g) = self.statfs_cache.lock() {
+            *g = None;
+        }
+    }
+
     /// Read all `DEV_EXTENT` items for `devid` from the `DEV_TREE`.
     #[cfg(feature = "dangerous-write-support")]
     pub fn read_dev_extents(&self, devid: u64) -> Result<Vec<(u64, u64)>> {
@@ -583,7 +607,12 @@ impl<D: ReadAt> Btrfs<D> {
                     .saturating_sub(write::chunk_alloc::BTRFS_BLOCK_RESERVED_1M_FOR_SUPER)
                     .saturating_sub(allocated_dev_bytes);
 
-                let allocatable_unalloc_dev_bytes = (unalloc_dev_bytes / (64 * 1024)) * (64 * 1024);
+                // Writes never take the unallocated reserve (see
+                // `chunk_alloc::unallocated_reserve`), so do not advertise it.
+                let allocatable_unalloc_dev_bytes = (unalloc_dev_bytes
+                    .saturating_sub(self.unallocated_reserve())
+                    / (64 * 1024))
+                    * (64 * 1024);
 
                 let total_free_data = free_data.saturating_add(allocatable_unalloc_dev_bytes);
 

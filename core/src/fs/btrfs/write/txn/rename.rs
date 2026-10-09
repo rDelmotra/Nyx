@@ -17,6 +17,9 @@ use crate::fs::btrfs::tree::{
     Key, CSUM_TREE_OBJECTID, DIR_INDEX_KEY, DIR_ITEM_KEY, EXTENT_DATA_KEY, INODE_ITEM_KEY,
     INODE_REF_KEY,
 };
+
+/// `BTRFS_INODE_EXTREF_KEY`.
+const INODE_EXTREF_KEY: u8 = 13;
 use crate::fs::btrfs::write::alloc::FreeSpaceMap;
 use crate::fs::btrfs::write::cow::{cow_tree_insert, cow_tree_mutate};
 use crate::fs::btrfs::write::extent_tree::{
@@ -210,17 +213,10 @@ fn resolve_rename<D: ReadAt>(
     now_sec: u64,
     now_nsec: u32,
 ) -> Result<RenameResolution> {
-    if old_name.is_empty()
-        || new_name.is_empty()
-        || old_name == "."
-        || old_name == ".."
-        || new_name == "."
-        || new_name == ".."
-        || old_name.contains('/')
-        || new_name.contains('/')
-    {
+    if old_name.is_empty() || old_name == "." || old_name == ".." || old_name.contains('/') {
         return Err(LuksError::NotFound("invalid filename for rename".into()));
     }
+    gate::check_entry_name(new_name)?;
 
     let located_old_parent = fs.resolve_no_follow(fs.fs_tree(), old_parent_path)?;
     let located_new_parent = fs.resolve_no_follow(fs.fs_tree(), new_parent_path)?;
@@ -242,6 +238,11 @@ fn resolve_rename<D: ReadAt>(
         return Err(LuksError::NotADirectory(new_parent_path.to_string()));
     }
 
+    // Removing an entry needs a directory that is neither immutable nor
+    // append-only; adding one needs a directory that is not immutable.
+    gate::check_inode_mutable(located_old_parent.inode.flags, "source directory")?;
+    gate::check_dir_allows_create(located_new_parent.inode.flags)?;
+
     let old_parent_ino = located_old_parent.inode.objectid;
     let new_parent_ino = located_new_parent.inode.objectid;
 
@@ -258,6 +259,29 @@ fn resolve_rename<D: ReadAt>(
 
     let child_ino = old_entry.location.objectid;
     let child_is_dir = old_entry.file_type.is_dir();
+
+    // The source inode must be single-linked and mutable. A hardlinked inode
+    // has several names in one INODE_REF item (or INODE_EXTREF items) and the
+    // swap below rewrites that item as a one-name item, which would drop the
+    // other names' back-references.
+    {
+        let child_inode = fs.read_inode(target_tree.bytenr(), child_ino)?;
+        if child_inode.nlink > 1 {
+            return Err(LuksError::UnsupportedFsFeature(
+                "renaming files with hardlinks (nlink > 1) is not supported".into(),
+            ));
+        }
+        gate::check_inode_mutable(child_inode.flags, "rename source")?;
+        let extref = fs.search(target_tree.bytenr(), &Key::new(child_ino, INODE_EXTREF_KEY, 0))?;
+        if extref.valid() {
+            let k = extref.key()?;
+            if k.objectid == child_ino && k.item_type == INODE_EXTREF_KEY {
+                return Err(LuksError::UnsupportedFsFeature(
+                    "renaming files with extended inode references is not supported".into(),
+                ));
+            }
+        }
+    }
     let child_file_type = match old_entry.file_type {
         crate::fs::FileType::Directory => 2u8,
         crate::fs::FileType::CharDevice => 3u8,
@@ -330,6 +354,10 @@ fn resolve_rename<D: ReadAt>(
             ));
         }
         let dest_ino = dest_entry.location.objectid;
+        if dest_ino != child_ino {
+            let dest_inode = fs.read_inode(target_tree.bytenr(), dest_ino)?;
+            gate::check_inode_mutable(dest_inode.flags, "rename destination")?;
+        }
         if dest_ino == child_ino {
             // Same file
             return Ok(RenameResolution::NoOp(Transaction::update_inode_mtime(
@@ -425,13 +453,37 @@ fn resolve_rename<D: ReadAt>(
         }
     }
 
-    // Find old_dir_index of child in old_parent
+    // Find old_dir_index of child in old_parent: the INODE_REF entry whose name
+    // is old_name. A single-link inode has exactly one entry per parent; refuse
+    // if the item is present but does not hold exactly that one entry.
     let inode_ref_key = Key::new(child_ino, INODE_REF_KEY, old_parent_ino);
     let old_dir_index = if let Some(ref_data) = fs.find_item(target_tree.bytenr(), &inode_ref_key)? {
-        if ref_data.len() >= 8 {
-            u64::from_le_bytes(ref_data[0..8].try_into().unwrap())
-        } else {
-            0
+        let mut found: Option<u64> = None;
+        let mut count = 0usize;
+        let mut off = 0usize;
+        while off < ref_data.len() {
+            if off + 10 > ref_data.len() {
+                return Err(LuksError::CorruptFs("truncated INODE_REF entry"));
+            }
+            let idx = u64::from_le_bytes(ref_data[off..off + 8].try_into().unwrap());
+            let nlen = u16::from_le_bytes(ref_data[off + 8..off + 10].try_into().unwrap()) as usize;
+            if off + 10 + nlen > ref_data.len() {
+                return Err(LuksError::CorruptFs("truncated INODE_REF name"));
+            }
+            if &ref_data[off + 10..off + 10 + nlen] == old_name.as_bytes() {
+                found = Some(idx);
+            }
+            count += 1;
+            off += 10 + nlen;
+        }
+        if count != 1 {
+            return Err(LuksError::UnsupportedFsFeature(
+                "renaming an inode with multiple back-references is not supported".into(),
+            ));
+        }
+        match found {
+            Some(idx) => idx,
+            None => return Err(LuksError::CorruptFs("INODE_REF does not name the renamed entry")),
         }
     } else {
         0

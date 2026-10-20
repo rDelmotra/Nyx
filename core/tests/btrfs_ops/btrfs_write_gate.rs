@@ -30,6 +30,7 @@ fn dummy_superblock() -> Superblock {
         root_dir_objectid: 6,
         num_devices: 1,
         dev_id: 1,
+        dev_bytes_used: 0,
         sector_size: 4096,
         node_size: 16384,
         stripe_size: 65536,

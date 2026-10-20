@@ -11,26 +11,13 @@ class LuksException(message: String, val code: Int) : Exception(message) {
 
     /** True when the user simply typed the wrong password, and can retry. */
     val isWrongPassword: Boolean get() = code == WRONG_PASSWORD
-    val isNotLuks: Boolean get() = code == NOT_LUKS
-    val isUnsupported: Boolean get() = code == UNSUPPORTED
-    val isCorrupt: Boolean get() = code == CORRUPT
-    val isNotFound: Boolean get() = code == NOT_FOUND
-    val isTransport: Boolean get() = code == TRANSPORT
-    val isNeedsFsck: Boolean get() = code == NEEDS_FSCK
     val isIo: Boolean get() = code == IO
-    val isBadHandle: Boolean get() = code == BAD_HANDLE
     val isPanic: Boolean get() = code == PANIC
-    val isNoSpace: Boolean get() = code == NO_SPACE
-    val isWrongTarget: Boolean get() = code == WRONG_TARGET
-    val isUnverifiableTarget: Boolean get() = code == UNVERIFIABLE_TARGET
     val isAlreadyExists: Boolean get() = code == ALREADY_EXISTS
-    val isWriterBusy: Boolean get() = code == WRITER_BUSY
-    val isItemTooLarge: Boolean get() = code == ITEM_TOO_LARGE
     val isMutexPoisoned: Boolean get() = code == MUTEX_POISONED
     val isCancelled: Boolean get() = code == CANCELLED
-    val isDirectoryNotEmpty: Boolean get() = code == DIRECTORY_NOT_EMPTY
     val isWriteSessionFenced: Boolean get() = code == WRITE_SESSION_FENCED
-    val isReadOnlyVolume: Boolean get() = code == READ_ONLY_VOLUME
+    val isFileChanged: Boolean get() = code == FILE_CHANGED
 
     /**
      * Whether this failure means no further write on this volume can be
@@ -123,5 +110,37 @@ class LuksException(message: String, val code: Int) : Exception(message) {
          * The UI's answer is a confirmation prompt, not an error.
          */
         const val READ_ONLY_VOLUME = 22
+
+        /**
+         * A file open for reading was deleted, replaced or modified since it was opened. The
+         * read was refused instead of returning another file's bytes. Re-list and start the
+         * transfer again; retrying the same read cannot succeed.
+         */
+        const val FILE_CHANGED = 23
+
+        /**
+         * The drive health check found errors (corruption, or leftovers a write could trip
+         * over), so this write was refused before it reached the drive. Reads still work.
+         *
+         * Raised in Kotlin only (`HealthMonitor` latch), never by the native layer; 24 is
+         * reserved in `bridge::code` so the number is never reused. Not a write-session failure:
+         * the session stays open and nothing is torn down.
+         */
+        const val HEALTH_READ_ONLY = 24
+
+        /**
+         * The USB adapter rejected SYNCHRONIZE CACHE and does not report a write-through
+         * cache, so tree blocks cannot be ordered before the superblock. Refused before any
+         * byte was written; reads still work and the session stays open. Mirrors
+         * `bridge::code::WRITES_UNSAFE`.
+         */
+        const val WRITES_UNSAFE = 25
     }
 }
+
+/**
+ * A call on a closed native handle, or on a session that is locking or not
+ * unlocked. A distinct type so the UI can classify it without reading the
+ * message text (see `UiErrorMessage`).
+ */
+class SessionClosedException(message: String) : IllegalStateException(message)

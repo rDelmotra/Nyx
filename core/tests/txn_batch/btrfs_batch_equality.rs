@@ -2,6 +2,10 @@
 //! produces a valid, verified, and oracle-clean Btrfs transaction.
 #![cfg(feature = "dangerous-write-support")]
 
+#[path = "../common/temp_guard.rs"]
+mod temp_guard;
+use temp_guard::{TempPath};
+
 #[path = "../common/mod.rs"]
 mod common;
 
@@ -26,7 +30,7 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
-fn copy_to_temp(src_name: &str) -> PathBuf {
+fn copy_to_temp(src_name: &str) -> TempPath {
     let src = fixture(src_name);
     let temp_dir = std::env::temp_dir();
     let count = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -40,7 +44,7 @@ fn copy_to_temp(src_name: &str) -> PathBuf {
         count
     ));
     fs::copy(&src, &dst).expect("copy fixture to temp");
-    dst
+    TempPath::new(dst)
 }
 
 fn run_verify_btrfs(img_path: &std::path::Path) -> (bool, String) {

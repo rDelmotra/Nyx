@@ -101,6 +101,7 @@ pub const DEV_TREE_OBJECTID: u64 = 4;
 pub const FS_TREE_OBJECTID: u64 = 5;
 pub const ROOT_TREE_DIR_OBJECTID: u64 = 6;
 pub const CSUM_TREE_OBJECTID: u64 = 7;
+pub const QUOTA_TREE_OBJECTID: u64 = 8;
 pub const FREE_SPACE_TREE_OBJECTID: u64 = 10;
 pub const BLOCK_GROUP_TREE_OBJECTID: u64 = 11;
 pub const FIRST_CHUNK_TREE_OBJECTID: u64 = 256;
@@ -157,6 +158,47 @@ pub struct KeyPtr {
     /// Logical address of the child node.
     pub blockptr: u64,
     pub generation: u64,
+}
+
+impl KeyPtr {
+    /// Refuse a child whose header generation differs from the one this
+    /// pointer recorded.
+    ///
+    /// A mismatch means the device returned an older copy of the block: the
+    /// checksum, address and fsid of a stale block are all valid, so only the
+    /// parent's recorded generation can tell. Writing copy-on-write copies on
+    /// top of such a block would turn a lost write into permanent corruption.
+    pub fn check_child(&self, child: &Node) -> Result<()> {
+        check_generation(self.generation, child)
+    }
+}
+
+/// Same check as [`KeyPtr::check_child`], for callers that hold the expected
+/// generation rather than the pointer (a root item, or a recursion argument).
+pub fn check_generation(expected: u64, child: &Node) -> Result<()> {
+    if child.generation != expected {
+        return Err(LuksError::CorruptFs(
+            "btrfs child node generation does not match its parent pointer (stale block)",
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a node whose header `owner` is not the tree being descended.
+///
+/// Write path only. The write gate has already refused volumes with
+/// snapshot/reflink/shared-block history, so every node reached while
+/// descending tree X must be stamped X. A different owner means pages of
+/// another tree are linked into this one, and modifying them would bleed the
+/// change into that other tree. (Reads must not use this: blocks are
+/// legitimately shared between trees on snapshot volumes.)
+pub fn check_owner(expected: u64, node: &Node) -> Result<()> {
+    if node.owner != expected {
+        return Err(LuksError::CorruptFs(
+            "btrfs node owner does not match the tree being written",
+        ));
+    }
+    Ok(())
 }
 
 /// A verified tree node, holding the whole block.

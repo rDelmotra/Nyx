@@ -1,6 +1,7 @@
 package dev.luksandroid.ui.diagnostics
 
 import android.content.Context
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -58,7 +59,7 @@ fun DiagnosticsScreen(
         try {
             LuksNative.nativeVersion()
         } catch (t: Throwable) {
-            "Error loading native library: ${t.message}"
+            "Error loading native library: ${dev.luksandroid.Trace.throwableSummary(t)}"
         }
     }
 
@@ -102,6 +103,7 @@ fun DiagnosticsScreen(
             modifier = Modifier.fillMaxWidth(),
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
             shape = RoundedCornerShape(12.dp),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
         ) {
             Column(
                 modifier = Modifier
@@ -132,6 +134,7 @@ fun DiagnosticsScreen(
             modifier = Modifier.fillMaxWidth(),
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
             shape = RoundedCornerShape(12.dp),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
         ) {
             Column(
                 modifier = Modifier
@@ -167,7 +170,7 @@ fun DiagnosticsScreen(
                                 }
                                 "$cpu\n\n--- Reflection Probes ---\n$probe"
                             } catch (e: Exception) {
-                                "Self-test failed: ${e.message}"
+                                "Self-test failed: ${dev.luksandroid.Trace.throwableSummary(e)}"
                             } finally {
                                 isRunningSelfTest = false
                             }
@@ -211,6 +214,7 @@ fun DiagnosticsScreen(
             modifier = Modifier.fillMaxWidth(),
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
             shape = RoundedCornerShape(12.dp),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
         ) {
             Column(
                 modifier = Modifier
@@ -278,6 +282,7 @@ fun DiagnosticsScreen(
             modifier = Modifier.fillMaxWidth(),
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
             shape = RoundedCornerShape(12.dp),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
         ) {
             Column(
                 modifier = Modifier
@@ -286,12 +291,12 @@ fun DiagnosticsScreen(
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 Text(
-                    text = "Session File Log (On-Disk)",
+                    text = "Event Log (On-Disk, structured)",
                     style = MaterialTheme.typography.titleMedium,
                     color = MaterialTheme.colorScheme.onSurface,
                 )
                 Text(
-                    text = "Persistent rolling log file saved to internal storage (luks_session.log). Zero password / zero file contents exposure.",
+                    text = "JSON Lines event log under files/logs (events.0..4.jsonl, 5 x 4 MiB), debug builds only. The view shows the newest part; pull the whole set with tools/pull-logs.sh. No passphrases, file names or paths.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -300,8 +305,11 @@ fun DiagnosticsScreen(
                 ) {
                     Button(
                         onClick = {
-                            val dump = dev.luksandroid.Trace.readSessionLog()
-                            sessionLogText = if (dump.isBlank()) "(Empty log - no events recorded yet)" else dump
+                            // Disk I/O (and a bounded wait for the writer): never on the main thread.
+                            scope.launch {
+                                val dump = withContext(Dispatchers.IO) { dev.luksandroid.Trace.readSessionLog() }
+                                sessionLogText = if (dump.isBlank()) "(Empty log - no events recorded yet)" else dump
+                            }
                         },
                         shape = RoundedCornerShape(8.dp),
                     ) {
@@ -309,9 +317,11 @@ fun DiagnosticsScreen(
                     }
                     Button(
                         onClick = {
-                            val dump = dev.luksandroid.Trace.readSessionLog()
-                            if (dump.isNotBlank()) {
-                                clipboardManager.setText(AnnotatedString(dump))
+                            scope.launch {
+                                val dump = withContext(Dispatchers.IO) { dev.luksandroid.Trace.readSessionLog() }
+                                if (dump.isNotBlank()) {
+                                    clipboardManager.setText(AnnotatedString(dump))
+                                }
                             }
                         },
                         shape = RoundedCornerShape(8.dp),
@@ -320,8 +330,10 @@ fun DiagnosticsScreen(
                     }
                     Button(
                         onClick = {
-                            dev.luksandroid.Trace.clearSessionLog()
-                            sessionLogText = "(Log cleared)"
+                            scope.launch {
+                                withContext(Dispatchers.IO) { dev.luksandroid.Trace.clearSessionLog() }
+                                sessionLogText = "(Log cleared)"
+                            }
                         },
                         shape = RoundedCornerShape(8.dp),
                     ) {
@@ -363,7 +375,7 @@ private fun probeReflectionSurface(context: Context): String {
             results.add("PROBE: CONTROL_GOOD = FAIL (unexpected value $res)")
         }
     } catch (t: Throwable) {
-        results.add("PROBE: CONTROL_GOOD = FAIL (${t.javaClass.simpleName}: ${t.message})")
+        results.add("PROBE: CONTROL_GOOD = FAIL (${dev.luksandroid.Trace.throwableSummary(t)})")
     }
 
     try {
@@ -372,7 +384,7 @@ private fun probeReflectionSurface(context: Context): String {
     } catch (e: NoSuchFieldException) {
         results.add("PROBE: CONTROL_BAD = OK (NoSuchFieldException)")
     } catch (t: Throwable) {
-        results.add("PROBE: CONTROL_BAD = FAIL (${t.javaClass.simpleName}: ${t.message})")
+        results.add("PROBE: CONTROL_BAD = FAIL (${dev.luksandroid.Trace.throwableSummary(t)})")
     }
 
     try {
@@ -385,7 +397,7 @@ private fun probeReflectionSurface(context: Context): String {
             results.add("PROBE: SSB_MTEXT = FAIL (array mismatch)")
         }
     } catch (t: Throwable) {
-        results.add("PROBE: SSB_MTEXT = BLOCKED (${t.javaClass.simpleName}: ${t.message})")
+        results.add("PROBE: SSB_MTEXT = BLOCKED (${dev.luksandroid.Trace.throwableSummary(t)})")
     }
 
     try {
@@ -406,13 +418,13 @@ private fun probeReflectionSurface(context: Context): String {
                 val undoMethods = methods.filter { it.contains("undo", ignoreCase = true) }
                 results.add("PROBE: EDITOR_METHODS_UNDO = ${undoMethods.ifEmpty { listOf("NONE_MATCHED") }.joinToString(", ")}")
             } catch (t: Throwable) {
-                results.add("PROBE: EDITOR_FIELDS = BLOCKED (${t.javaClass.simpleName}: ${t.message})")
+                results.add("PROBE: EDITOR_FIELDS = BLOCKED (${dev.luksandroid.Trace.throwableSummary(t)})")
             }
         } else {
             results.add("PROBE: TEXTVIEW_MEDITOR = BLOCKED (mEditor null)")
         }
     } catch (t: Throwable) {
-        results.add("PROBE: TEXTVIEW_MEDITOR = BLOCKED (${t.javaClass.simpleName}: ${t.message})")
+        results.add("PROBE: TEXTVIEW_MEDITOR = BLOCKED (${dev.luksandroid.Trace.throwableSummary(t)})")
     }
 
     return results.joinToString("\n")

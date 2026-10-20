@@ -27,6 +27,10 @@
 //! by name. Our own reader is never the judge.
 #![cfg(feature = "dangerous-write-support")]
 
+#[path = "../common/temp_guard.rs"]
+mod temp_guard;
+use temp_guard::{TempStr};
+
 #[path = "../common/mod.rs"]
 mod common;
 
@@ -44,11 +48,11 @@ fn fixture(rel: &str) -> String {
     format!("{}/../fixtures/{rel}", env!("CARGO_MANIFEST_DIR"))
 }
 
-fn scratch(rel: &str, test: &str) -> String {
+fn scratch(rel: &str, test: &str) -> TempStr {
     let leaf = rel.rsplit('/').next().unwrap();
     let dst = std::env::temp_dir().join(format!("luks-ext4-{test}-{leaf}"));
     std::fs::copy(fixture(rel), &dst).expect("copy fixture");
-    dst.to_string_lossy().into_owned()
+    TempStr::new(dst.to_string_lossy().into_owned())
 }
 
 /// Bare LUKS containers. The 4096 one matters most: its cipher sector is

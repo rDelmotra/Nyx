@@ -7,6 +7,10 @@
 
 #![cfg(feature = "dangerous-write-support")]
 
+#[path = "../common/temp_guard.rs"]
+mod temp_guard;
+use temp_guard::{TempPath};
+
 #[path = "../common/mod.rs"]
 mod common;
 
@@ -30,7 +34,7 @@ fn fixture_path(name: &str) -> PathBuf {
         .join(name)
 }
 
-fn copy_to_temp(name: &str) -> PathBuf {
+fn copy_to_temp(name: &str) -> TempPath {
     let src = fixture_path(name);
     let tmp_dir = std::env::temp_dir();
     let count = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -45,7 +49,7 @@ fn copy_to_temp(name: &str) -> PathBuf {
         count
     ));
     fs::copy(&src, &dst).expect("copy fixture to temp");
-    dst
+    TempPath::new(dst)
 }
 
 fn run_verify_btrfs(img_path: &Path) -> Option<(bool, String)> {

@@ -262,6 +262,32 @@ fn asking_why_a_failure_happened_does_not_ask_why_that_failed() {
     );
 }
 
+/// F1.3 on the OUT path (`command_out_inner` is a separate copy of the
+/// exchange): an invalid CSW after a WRITE must reset too.
+#[test]
+fn invalid_csw_or_short_cbw_after_a_write_triggers_reset_recovery() {
+    use common::{Tamper, TamperTransport};
+    let cases = [
+        (Tamper::BadCswSignature, "bad CSW signature"),
+        (Tamper::CswTagMismatch, "CSW tag mismatch"),
+        (Tamper::ReservedCswStatus, "reserved CSW status"),
+        (Tamper::ShortCbwWrite, "short CBW write"),
+    ];
+    assert!(!cases.is_empty(), "vacuity: no cases");
+    for (tamper, why) in cases {
+        let dev = ScsiBlockDevice::open(TamperTransport::new(MockUsbDrive::new(image(64)))).unwrap();
+        dev.transport().arm(tamper);
+        let err = dev.write_at(0, &[0xAB; 512]).expect_err("tampered wrapper is an error");
+        assert!(
+            matches!(err, luks_core::error::LuksError::ScsiProtocol(m) if m == why),
+            "{tamper:?}: wrong error: {err}"
+        );
+        assert_eq!(dev.transport().resets.get(), 1, "{tamper:?}: must reset exactly once");
+        dev.write_at(0, &[0xCD; 512]).expect("pipe usable after recovery");
+        assert_eq!(dev.transport().resets.get(), 1, "{tamper:?}: clean write reset again");
+    }
+}
+
 // --- a drive with no flush command ------------------------------------------
 
 /// INVALID COMMAND OPERATION CODE: key 5, ASC 0x20/0x00.
@@ -299,6 +325,34 @@ fn a_drive_with_neither_flush_command_does_not_fail_every_write() {
         dev.flush_is_a_no_op(),
         "the caller has to be able to find out that durability is not confirmed"
     );
+}
+
+#[test]
+fn flush_support_is_tri_state_and_only_reports_what_the_drive_said() {
+    use luks_core::device::WriteAt;
+    // Never asked: unknown, not a guess in either direction.
+    let none = MockUsbDrive::new(fixture("disks/gpt-luks.img"));
+    let dev = ScsiBlockDevice::open(none).unwrap();
+    assert_eq!(WriteAt::flush_support(&dev), None);
+
+    // Accepted on the 16-byte form after a rejection of the 10-byte form.
+    let one = MockUsbDrive::new(fixture("disks/gpt-luks.img")).failing(0x35, NO_SUCH_OPCODE);
+    let dev = ScsiBlockDevice::open(one).unwrap();
+    dev.flush().unwrap();
+    assert_eq!(WriteAt::flush_support(&dev), Some(true));
+
+    // A real flush failure is neither: it stays unknown.
+    let bad = MockUsbDrive::new(fixture("disks/gpt-luks.img")).failing(0x35, [0x4, 0x03, 0x00]);
+    let dev = ScsiBlockDevice::open(bad).unwrap();
+    dev.flush().expect_err("real failure surfaces");
+    assert_eq!(WriteAt::flush_support(&dev), None);
+
+    let both = MockUsbDrive::new(fixture("disks/gpt-luks.img"))
+        .failing(0x35, NO_SUCH_OPCODE)
+        .failing(0x91, NO_SUCH_OPCODE);
+    let dev = ScsiBlockDevice::open(both).unwrap();
+    dev.flush().unwrap();
+    assert_eq!(WriteAt::flush_support(&dev), Some(false));
 }
 
 #[test]

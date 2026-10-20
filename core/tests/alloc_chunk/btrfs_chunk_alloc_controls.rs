@@ -32,6 +32,10 @@
 //!   logical to physical blocks.
 #![cfg(feature = "dangerous-write-support")]
 
+#[path = "../common/temp_guard.rs"]
+mod temp_guard;
+use temp_guard::{TempPath};
+
 #[path = "../common/mod.rs"]
 mod common;
 
@@ -66,7 +70,7 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
-fn copy_to_temp(src_name: &str) -> PathBuf {
+fn copy_to_temp(src_name: &str) -> TempPath {
     let src = fixture(src_name);
     let temp_dir = std::env::temp_dir();
     let count = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -80,7 +84,7 @@ fn copy_to_temp(src_name: &str) -> PathBuf {
             .as_nanos()
     ));
     fs::copy(&src, &dst).expect("copy fixture to temp");
-    dst
+    TempPath::new(dst)
 }
 
 fn run_verify_script(image_path: &Path) -> Option<(bool, String)> {
@@ -203,6 +207,10 @@ fn test_pass_i1_enabled_exclusions_keeps_image_clean() {
 
     let dev = FileDevice::open_writable(&temp_img, file_len).expect("open writable");
     let mut fs = Btrfs::mount(dev).expect("mount writable btrfs");
+    // Premise of this test is allocating the last free device bytes of a tiny
+    // fixture; the production unallocated-space reserve is waived here (the
+    // reserve itself is covered by btrfs_unallocated_reserve).
+    fs.set_unallocated_reserve_for_tests(0);
 
     // 1. Verify computed exclusions include 58720256..58785792
     let exclusions = compute_sb_exclusions(fs.chunk_map());
@@ -571,6 +579,10 @@ fn test_pass_i3_chunk_map_refresh_omission_fails_commit() {
 
     let dev = FileDevice::open_writable(&temp_img, file_len).expect("open writable");
     let mut fs = Btrfs::mount(dev).expect("mount writable btrfs");
+    // Premise of this test is allocating the last free device bytes of a tiny
+    // fixture; the production unallocated-space reserve is waived here (the
+    // reserve itself is covered by btrfs_unallocated_reserve).
+    fs.set_unallocated_reserve_for_tests(0);
 
     // 1. Prepare chunk allocation transaction
     let (mut txn, new_chunk) = Transaction::allocate_data_chunk(&fs)
@@ -581,15 +593,23 @@ fn test_pass_i3_chunk_map_refresh_omission_fails_commit() {
     let dummy_data = vec![0x42u8; 4096];
     txn.pending_data.push((new_chunk_logical, dummy_data));
 
-    // 2. Control: Skipping chunks.insert(new_chunk) MUST fail to map and fail commit_transaction
-    let commit_res = commit_transaction(&mut fs, txn.clone());
+    // 2. Control: a transaction that does not carry its new chunk cannot map the
+    // pending data it wrote into that chunk, so the commit MUST fail (and, B4,
+    // must leave the live chunk map untouched).
+    let mut without_chunk = txn.clone();
+    without_chunk.new_chunks.clear();
+    let commit_res = commit_transaction(&mut fs, without_chunk);
     assert!(
         commit_res.is_err(),
-        "commit_transaction MUST fail when ChunkMap refresh was skipped"
+        "commit_transaction MUST fail when the new chunk is not available for mapping"
+    );
+    assert!(
+        fs.chunk_map().chunks().iter().all(|c| c.logical != new_chunk_logical),
+        "a failed commit must not add the chunk to the live chunk map"
     );
 
-    // 3. Now perform the ChunkMap refresh and commit successfully
-    fs.chunk_map_mut().insert(new_chunk);
+    // 3. The real transaction carries `new_chunks`; the commit resolves through it
+    // and registers the chunk only once it has succeeded (F3/B4).
     let commit_success = commit_transaction(&mut fs, txn);
     assert!(
         commit_success.is_ok(),

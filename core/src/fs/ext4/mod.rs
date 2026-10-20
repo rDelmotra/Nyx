@@ -12,6 +12,7 @@
 #[cfg(feature = "dangerous-write-support")]
 pub mod alloc;
 pub mod csum;
+pub mod health;
 #[cfg(feature = "dangerous-write-support")]
 pub mod dirent;
 #[cfg(feature = "dangerous-write-support")]
@@ -71,6 +72,32 @@ const STATE_CLEANLY_UNMOUNTED: u16 = 0x0001;
 /// The kernel saw errors on this filesystem. `e2fsck` gets it first.
 const STATE_ERRORS_SEEN: u16 = 0x0002;
 
+// Write-gate bits. Values are from the kernel's ext4.h as mirrored by
+// e2fsprogs 1.47.4 `ext2fs/ext2_fs.h` (checked with offsetof/#define on this
+// machine; the kernel header itself is not present).
+// (`EXT4_FEATURE_COMPAT_ORPHAN_FILE` = 0x1000 is deliberately NOT a gate bit:
+// it is on by default in mke2fs 1.47; only a non-empty orphan file,
+// `ORPHAN_PRESENT` below, matters.)
+/// `EXT4_FEATURE_INCOMPAT_MMP`: multi-mount protection; another host may have
+/// the filesystem mounted.
+const INCOMPAT_MMP: u32 = 0x0100;
+/// `EXT4_FEATURE_INCOMPAT_CASEFOLD`: case-insensitive names, so `find_entry`'s
+/// byte compare disagrees with the kernel's duplicate rules.
+const INCOMPAT_CASEFOLD: u32 = 0x2_0000;
+/// `EXT4_FEATURE_RO_COMPAT_READONLY`: the filesystem asks not to be written.
+const RO_COMPAT_READONLY: u32 = 0x1000;
+/// `EXT4_FEATURE_RO_COMPAT_PROJECT`: project quota, same hazard as `QUOTA`.
+const RO_COMPAT_PROJECT: u32 = 0x2000;
+/// `EXT4_FEATURE_RO_COMPAT_SHARED_BLOCKS`: blocks shared between inodes;
+/// freeing one would free it for the others.
+const RO_COMPAT_SHARED_BLOCKS: u32 = 0x4000;
+/// `EXT4_FEATURE_RO_COMPAT_ORPHAN_PRESENT`: the orphan file is non-empty;
+/// inodes are pending cleanup that a writer would stomp on.
+const RO_COMPAT_ORPHAN_PRESENT: u32 = 0x1_0000;
+/// `s_last_orphan` offset in the superblock (`offsetof(struct ext2_super_block,
+/// s_last_orphan)` = 0xE8).
+const SB_LAST_ORPHAN: usize = 0xE8;
+
 // s_feature_ro_compat bits
 /// Group descriptors carry a crc16 and bitmaps may be lazily initialised.
 const RO_COMPAT_GDT_CSUM: u32 = 0x0010;
@@ -107,6 +134,14 @@ pub const BG_BLOCK_UNINIT: u16 = 0x0002;
 const INODE_FL_EXTENTS: u32 = 0x0008_0000;
 const INODE_FL_INLINE_DATA: u32 = 0x1000_0000;
 
+/// A directory entry whose inode could not be read during a listing.
+#[derive(Debug)]
+pub struct UnreadableEntry {
+    pub name: String,
+    pub inode: u64,
+    pub error: LuksError,
+}
+
 fn u16le(b: &[u8], o: usize) -> u16 {
     u16::from_le_bytes([b[o], b[o + 1]])
 }
@@ -125,8 +160,12 @@ pub struct Superblock {
     pub blocks_per_group: u32,
     pub inodes_per_group: u32,
     pub inode_size: u16,
+    pub feature_compat: u32,
     pub feature_incompat: u32,
     pub feature_ro_compat: u32,
+    /// `s_last_orphan` (0xE8): head of the orphan inode list. Non-zero means
+    /// inodes are pending truncate/delete that a writer would stomp on.
+    pub last_orphan: u32,
     pub desc_size: u16,
     pub uuid: [u8; 16],
     pub volume_name: String,
@@ -246,8 +285,10 @@ impl Superblock {
             blocks_per_group,
             inodes_per_group,
             inode_size,
+            feature_compat,
             feature_incompat,
             feature_ro_compat,
+            last_orphan: u32le(b, SB_LAST_ORPHAN),
             desc_size,
             uuid,
             volume_name,
@@ -419,6 +460,25 @@ pub struct Inode {
 }
 
 impl Inode {
+    /// Whether `now` (a fresh read of the same inode number) is still the file
+    /// this value was read as. A freed inode, a reused inode number and an
+    /// in-place modification all answer no.
+    ///
+    /// Identity is (number, `i_generation`, type, size, ctime, mtime). The
+    /// generation is the part that survives delete-and-reuse of the inode
+    /// number; on a file written before the driver stamped generations
+    /// (generation 0) the times and size carry the check.
+    pub fn same_file_as(&self, now: &Inode) -> bool {
+        now.links != 0
+            && now.mode != 0
+            && self.number == now.number
+            && self.generation == now.generation
+            && self.mode & 0xF000 == now.mode & 0xF000
+            && self.size == now.size
+            && self.ctime == now.ctime
+            && self.mtime == now.mtime
+    }
+
     pub fn file_type(&self) -> FileType {
         match self.mode & 0xF000 {
             0x8000 => FileType::Regular,
@@ -455,17 +515,57 @@ impl Inode {
     }
 }
 
+/// 32 bits of OS randomness without a dependency: `RandomState` is seeded from
+/// the OS RNG per process and per instance, and std documents it as such.
+#[cfg(feature = "dangerous-write-support")]
+fn random_seed_u32() -> u32 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u8(0x47);
+    let v = h.finish();
+    (v ^ (v >> 32)) as u32
+}
+
 /// A mounted, read-only ext2/3/4 filesystem.
 ///
 /// Owns its device. `D` is usually a reference (`&LuksVolume<..>`) via the
 /// blanket `impl ReadAt for &D`, so `Ext4::mount(&volume)` still works; the
 /// owning form is what lets a JNI handle hold the whole stack. See the note on
 /// [`crate::luks::LuksVolume`].
+static NEXT_EXT4_INSTANCE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub struct Ext4<D: ReadAt> {
     device: D,
+    /// Listing entries whose inode could not be read, over the life of this
+    /// mount. See [`Ext4::listing_read_errors`].
+    listing_read_errors: std::sync::atomic::AtomicU64,
+    /// Monotonically unique instance ID for this mount, distinguishing remounts.
+    instance_id: u64,
+    /// Incremented on every metadata or data mutation to detect when open file
+    /// identity checks can be safely skipped or must be re-evaluated.
+    pub(crate) mutation_seq: std::sync::atomic::AtomicU64,
     sb: Superblock,
     /// Every block group descriptor, parsed at mount.
     groups: Vec<GroupDesc>,
+    /// Blocks promised to open file writers (F2a deferred allocation). Memory
+    /// only: nothing on disk says these are taken until `finish_file`
+    /// publishes them, so every allocator in this crate must treat them as
+    /// used. Absolute block numbers. See [`alloc`].
+    #[cfg(feature = "dangerous-write-support")]
+    reserved_blocks: crate::fs::btrfs::write::IntervalSet,
+    /// Inodes promised to open file writers. Memory only, like
+    /// `reserved_blocks`.
+    #[cfg(feature = "dangerous-write-support")]
+    reserved_inodes: std::collections::BTreeSet<u64>,
+    /// Secondary failure of the last rollback that failed. See
+    /// [`Ext4::take_cleanup_failure`].
+    #[cfg(feature = "dangerous-write-support")]
+    cleanup_failure: Option<LuksError>,
+    /// Next `i_generation` to hand out. Per-mount counter seeded from OS
+    /// randomness, like the kernel's `s_next_generation`. See
+    /// [`Ext4::next_generation`].
+    #[cfg(feature = "dangerous-write-support")]
+    next_generation: u32,
 }
 
 impl<D: ReadAt> Ext4<D> {
@@ -500,8 +600,19 @@ impl<D: ReadAt> Ext4<D> {
         let groups = Self::read_group_descriptors(&device, &sb)?;
         Ok(Ext4 {
             device,
+            listing_read_errors: std::sync::atomic::AtomicU64::new(0),
+            instance_id: NEXT_EXT4_INSTANCE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            mutation_seq: std::sync::atomic::AtomicU64::new(1),
             sb,
             groups,
+            #[cfg(feature = "dangerous-write-support")]
+            reserved_blocks: crate::fs::btrfs::write::IntervalSet::new(),
+            #[cfg(feature = "dangerous-write-support")]
+            reserved_inodes: std::collections::BTreeSet::new(),
+            #[cfg(feature = "dangerous-write-support")]
+            cleanup_failure: None,
+            #[cfg(feature = "dangerous-write-support")]
+            next_generation: random_seed_u32(),
         })
     }
 
@@ -541,14 +652,42 @@ impl<D: ReadAt> Ext4<D> {
         self.sb.uuid
     }
 
+    pub fn mutation_seq(&self) -> u64 {
+        self.mutation_seq.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
+
+    /// Blocks and inodes currently promised to open writers (always 0 in a
+    /// read-only build, which has no writers).
+    fn reserved_counts(&self) -> (u64, u64) {
+        #[cfg(feature = "dangerous-write-support")]
+        {
+            (
+                self.reserved_blocks.covered_within(0, u64::MAX),
+                self.reserved_inodes.len() as u64,
+            )
+        }
+        #[cfg(not(feature = "dangerous-write-support"))]
+        {
+            (0, 0)
+        }
+    }
+
     pub fn statfs(&self) -> Result<crate::fs::StatFs> {
         let bs = self.sb.block_size as u64;
         let total_bytes = self.sb.blocks_count * bs;
-        let free_bytes = self.sb.free_blocks_count * bs;
-        let available_blocks = self.sb.free_blocks_count.saturating_sub(self.sb.s_r_blocks_count);
+        // Space promised to open file writers is not free, even though it is
+        // still free on disk until they publish.
+        let (reserved_blocks, reserved_inodes) = self.reserved_counts();
+        let free_blocks = self.sb.free_blocks_count.saturating_sub(reserved_blocks);
+        let free_bytes = free_blocks * bs;
+        let available_blocks = free_blocks.saturating_sub(self.sb.s_r_blocks_count);
         let available_bytes = available_blocks * bs;
         let total_inodes = self.sb.inodes_count as u64;
-        let free_inodes = self.sb.free_inodes_count as u64;
+        let free_inodes = (self.sb.free_inodes_count as u64).saturating_sub(reserved_inodes);
         let block_size = self.sb.block_size;
 
         Ok(crate::fs::StatFs {
@@ -922,15 +1061,36 @@ impl<D: ReadAt> Ext4<D> {
 
     /// List a directory. `.` and `..` are omitted; callers browsing a tree
     /// never want them, and navigation uses paths rather than those entries.
+    ///
+    /// An entry whose inode cannot be read is still listed (size and mtime 0),
+    /// but never silently: it is counted in [`listing_read_errors`](Self::listing_read_errors).
+    /// [`list_dir_checked`](Self::list_dir_checked) returns the details.
     pub fn list_dir(&self, path: &str) -> Result<Vec<DirEntry>> {
+        let (entries, _unreadable) = self.list_dir_checked(path)?;
+        Ok(entries)
+    }
+
+    /// [`list_dir`](Self::list_dir) plus the entries whose inode read failed
+    /// (a dangling or corrupt entry), with the error for each.
+    pub fn list_dir_checked(&self, path: &str) -> Result<(Vec<DirEntry>, Vec<UnreadableEntry>)> {
         let inode = self.resolve(path)?;
         if !inode.file_type().is_dir() {
             return Err(LuksError::NotADirectory(path.to_string()));
         }
-        self.list_inode(&inode)
+        let mut unreadable = Vec::new();
+        let entries = self.list_inode(&inode, &mut unreadable)?;
+        self.listing_read_errors
+            .fetch_add(unreadable.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok((entries, unreadable))
     }
 
-    fn list_inode(&self, inode: &Inode) -> Result<Vec<DirEntry>> {
+    /// How many directory entries, across every listing on this mount, could
+    /// not have their inode read and so showed size 0 and mtime 0.
+    pub fn listing_read_errors(&self) -> u64 {
+        self.listing_read_errors.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn list_inode(&self, inode: &Inode, unreadable: &mut Vec<UnreadableEntry>) -> Result<Vec<DirEntry>> {
         let has_filetype = self.sb.feature_incompat & INCOMPAT_FILETYPE != 0;
         let bs = self.sb.block_size as usize;
         let mut out = Vec::new();
@@ -961,8 +1121,19 @@ impl<D: ReadAt> Ext4<D> {
                     // feature, since the size/mtime read doubles as the type
                     // fallback below. A read failure (a dangling or corrupt
                     // entry) degrades to zero/Unknown rather than failing the
-                    // whole listing.
-                    let full = self.read_inode(ino).ok();
+                    // whole listing, and is reported in `unreadable`.
+                    let full = match self.read_inode(ino) {
+                        Ok(i) => Some(i),
+                        Err(error) => {
+                            let end = (pos + 8 + block_buf[pos + 6] as usize).min(bs);
+                            unreadable.push(UnreadableEntry {
+                                name: String::from_utf8_lossy(&block_buf[(pos + 8).min(end)..end]).into_owned(),
+                                inode: ino,
+                                error,
+                            });
+                            None
+                        }
+                    };
                     let file_type = if has_filetype {
                         match block_buf[pos + 7] {
                             1 => FileType::Regular,
@@ -1069,7 +1240,9 @@ impl<D: ReadAt> Ext4<D> {
                 return Err(LuksError::NotADirectory(format!("/{}", walked.join("/"))));
             }
 
-            let entries = self.list_inode(&current)?;
+            // Path resolution needs names and inode numbers only; size/mtime
+            // decoration failures are irrelevant here and reported by listings.
+            let entries = self.list_inode(&current, &mut Vec::new())?;
             let found = entries
                 .iter()
                 .find(|e| e.name == *component)
@@ -1113,14 +1286,22 @@ impl<D: ReadAt> Ext4<D> {
 const MAX_DELETE_DEPTH: usize = 1024;
 
 #[cfg(feature = "dangerous-write-support")]
+use crate::forensic::{record_ext4, Ext4Event};
+
+#[cfg(feature = "dangerous-write-support")]
 impl<D: WriteAt> Ext4<D> {
     /// Delete the file or directory at `path`. Refuses hardlinks. A directory
     /// is emptied first, depth-first, one flushed operation per child — the
     /// same shape as deleting each child by hand, so a mid-tree failure (a
     /// hardlinked file, an indirect-block-mapped file our writer refuses)
     /// leaves exactly what it would if a caller had stopped there themselves.
-    /// Follows the Phase 0–4 ordering: collect -> sever name -> zero inode -> free blocks -> flush.
+    /// Follows the Phase 0–4 ordering: collect and validate everything -> sever name -> zero inode -> free blocks -> flush.
     pub fn delete_file(&mut self, path: &str) -> Result<()> {
+        note_err(self.delete_file_inner(path), "delete_file")
+    }
+
+    /// Body of [`delete_file`](Self::delete_file), separated so that every error return is recorded in one place.
+    fn delete_file_inner(&mut self, path: &str) -> Result<()> {
         // `.` and `..` are never real stored entries (`list_inode` filters
         // both), but `resolve`/`resolve_no_follow` silently collapse them
         // during path resolution while the plain string split below does
@@ -1206,33 +1387,65 @@ impl<D: WriteAt> Ext4<D> {
             ));
         }
 
-        // Phase 0: Collect extents (read-only)
+        // Phase 0: collect the extents and validate EVERYTHING that can fail
+        // (read-only, so every refusal here writes nothing and leaves the fs
+        // clean, W14): the extent tree, every block bound and double free,
+        // the inode's own free, and the parent's link count. Only then does
+        // anything destructive start.
         let (data_extents, index_extents) = self.collect_extents(&target_inode)?;
-
-        // Phase 1: Sever the name (1 disk write)
-        let removed_ino = self.unlink_file(parent_dir.number, name)?;
-        if removed_ino != target_inode.number {
-            return Err(LuksError::CorruptFs("unlinked inode number mismatch"));
+        let mut all_extents = data_extents;
+        all_extents.extend(index_extents);
+        self.check_free_blocks(&all_extents)?;
+        self.check_free_inode(target_inode.number)?;
+        if target_is_dir && self.read_inode(parent_dir.number)?.links == 0 {
+            return Err(LuksError::CorruptFs("inode links count underflow/overflow"));
         }
 
-        // Phase 1b: a subdirectory's own ".." is what gave its parent the
-        // extra link `create_directory` bumped on the way in — removing the
-        // subdirectory has to give it back, or the parent's i_links_count
-        // only ever grows.
-        if target_is_dir {
-            self.patch_inode_links_count(parent_dir.number as u32, -1)?;
-        }
+        // Phases 1-4 write, so they run inside the dirty bracket: a crash
+        // between "name severed" and "blocks freed" is a leak, and the fs says
+        // so instead of looking clean.
+        self.dirty_window(|fs| {
+            // Phase 1: Sever the name (1 disk write)
+            let removed_ino = fs
+                .unlink_file(parent_dir.number, name)
+                .map_err(alloc::Aborted::step)?;
+            if removed_ino != target_inode.number {
+                return Err(LuksError::CorruptFs("unlinked inode number mismatch").into());
+            }
 
-        // Phase 2: Invalidate the Inode (1 disk write inside free_inode)
-        self.free_inode(target_inode.number, target_is_dir)?;
+            // Phase 1b: a subdirectory's own ".." is what gave its parent the
+            // extra link `create_directory` bumped on the way in — removing the
+            // subdirectory has to give it back, or the parent's i_links_count
+            // only ever grows.
+            if target_is_dir {
+                fs.patch_inode_links_count(parent_dir.number as u32, -1)?;
+            }
 
-        // Phase 3: Return Blocks to the Free Pool
-        self.free_blocks(&data_extents)?;
-        if !index_extents.is_empty() {
-            self.free_blocks(&index_extents)?;
-        }
+            // Phase 2: zero the inode record, then clear its bitmap bit. The
+            // inode goes BEFORE its blocks on purpose: interrupted between
+            // the two, the blocks are merely marked used with no owner (a
+            // leak, the only state e2fsck calls leak-class). The other order
+            // leaves a live, unattached inode pointing at blocks the bitmap
+            // calls free, which e2fsck reports as a `+` difference.
+            fs.free_inode(target_inode.number, target_is_dir)?;
 
-        // Phase 4: Flush
-        self.flush()
+            // Phase 3: Return Blocks to the Free Pool (already validated)
+            fs.free_blocks(&all_extents)?;
+
+            // Phase 4: Flush
+            fs.flush()?;
+            Ok(())
+        })
+        .inspect(|()| {
+            record_ext4(Ext4Event::DeleteFile { parent: parent_dir.number, ino: target_inode.number })
+        })
     }
+}
+
+/// Record an error return from a public ext4 write entry point as
+/// `Ext4Event::Error { stage, code }` (numbers and a fixed literal only) and
+/// pass the result through unchanged. `stage` names the entry point.
+#[cfg(feature = "dangerous-write-support")]
+pub(crate) fn note_err<T>(r: Result<T>, stage: &'static str) -> Result<T> {
+    r.inspect_err(|e| record_ext4(Ext4Event::Error { stage, code: e.forensic_code() }))
 }

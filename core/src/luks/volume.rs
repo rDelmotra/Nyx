@@ -15,6 +15,7 @@ use crate::luks::keyslot::{self, xts_decrypt};
 #[cfg(feature = "dangerous-write-support")]
 use crate::luks::keyslot::xts_encrypt;
 use crate::secret::Secret;
+use zeroize::{Zeroize, Zeroizing};
 use std::cell::RefCell;
 
 /// Owns its device rather than borrowing it.
@@ -37,7 +38,19 @@ pub struct LuksVolume<D: ReadAt> {
     iv_tweak: u128,
     tweak_step: u128,
     master_key: Secret,
-    write_buf: RefCell<Vec<u8>>,
+    /// Per-call scratch: decrypted plaintext on the read path, plaintext and
+    /// then ciphertext on the write path. `Zeroizing` scrubs it when the volume
+    /// is dropped (locked); see [`grow_scratch`] for the growth case.
+    write_buf: RefCell<Zeroizing<Vec<u8>>>,
+}
+
+/// Make `buf` at least `span` bytes. Growing may reallocate, which would free
+/// the old block with plaintext still in it, so the contents are scrubbed first.
+fn grow_scratch(buf: &mut Zeroizing<Vec<u8>>, span: usize) {
+    if buf.len() < span {
+        buf.zeroize();
+        buf.resize(span, 0);
+    }
 }
 
 impl<D: ReadAt> LuksVolume<D> {
@@ -123,12 +136,18 @@ impl<D: ReadAt> LuksVolume<D> {
             iv_tweak: seg.iv_tweak as u128,
             tweak_step: seg.tweak_step(),
             master_key,
-            write_buf: RefCell::new(Vec::new()),
+            write_buf: RefCell::new(Zeroizing::new(Vec::new())),
         })
     }
 
     pub fn sector_size(&self) -> usize {
         self.sector_size
+    }
+
+    /// Length of the master key this volume opened with, in bits. A number
+    /// only: the key itself never leaves [`Secret`].
+    pub fn key_bits(&self) -> u32 {
+        (self.master_key.len() * 8) as u32
     }
 
     /// The device underneath, for callers that need to keep talking to it
@@ -169,9 +188,7 @@ impl<D: ReadAt> LuksVolume<D> {
         let span = ((last_sector - first_sector) * ss) as usize;
 
         let mut scratch_guard = self.write_buf.borrow_mut();
-        if scratch_guard.len() < span {
-            scratch_guard.resize(span, 0);
-        }
+        grow_scratch(&mut scratch_guard, span);
         let scratch = &mut scratch_guard[..span];
         let disk_offset = self
             .partition_offset
@@ -300,9 +317,7 @@ impl<D: crate::device::WriteAt> LuksVolume<D> {
             .ok_or(LuksError::OutOfBounds)?;
 
         let mut scratch = self.write_buf.borrow_mut();
-        if scratch.len() < span {
-            scratch.resize(span, 0);
-        }
+        grow_scratch(&mut scratch, span);
         let scratch = &mut scratch[..span];
         if aligned {
             scratch[..buf.len()].copy_from_slice(buf);

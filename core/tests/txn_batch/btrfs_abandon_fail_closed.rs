@@ -2,12 +2,15 @@
 //! and finish_file error rollback.
 #![cfg(feature = "dangerous-write-support")]
 
+#[path = "../common/temp_guard.rs"]
+mod temp_guard;
+use temp_guard::{TempPath};
+
 #[path = "../common/mod.rs"]
 mod common;
 
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -25,7 +28,7 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
-fn copy_to_temp(src_name: &str, tag: &str) -> PathBuf {
+fn copy_to_temp(src_name: &str, tag: &str) -> TempPath {
     let src = fixture(src_name);
     let count = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dst = std::env::temp_dir().join(format!(
@@ -34,26 +37,7 @@ fn copy_to_temp(src_name: &str, tag: &str) -> PathBuf {
         count
     ));
     fs::copy(&src, &dst).expect("copy fixture to temp");
-    dst
-}
-
-fn run_verify_btrfs(img_path: &Path) -> bool {
-    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("tools")
-        .join("verify-btrfs.sh");
-    assert!(script.exists(), "verify-btrfs.sh must exist at {:?}", script);
-
-    if !common::oracle::gate() {
-        return true;
-    }
-
-    let output = Command::new("bash")
-        .arg(&script)
-        .arg(img_path)
-        .output()
-        .expect("run verify-btrfs.sh");
-    output.status.success()
+    TempPath::new(dst)
 }
 
 struct FailNextWrite {
@@ -101,7 +85,7 @@ impl WriteAt for FailNextWrite {
 }
 
 #[test]
-fn abandon_file_transport_failure_during_commit_discards_batch_and_returns_error() {
+fn abandon_file_transport_failure_during_commit_keeps_batch_and_returns_error() {
     let img = copy_to_temp("plain.img", "abandon-err");
     let file_len = fs::metadata(&img).unwrap().len();
 
@@ -130,16 +114,20 @@ fn abandon_file_transport_failure_during_commit_discards_batch_and_returns_error
         other => panic!("expected UsbTransfer error, got: {:?}", other),
     }
 
-    // Active batch was discarded on commit failure, so has_open_writer is false and
-    // no active batch remains.
+    // F3 (D2/N7): the failed commit must NOT drop the acknowledged `saved.dat`;
+    // the batch is kept, and a retry after recovery publishes it.
     fail_flag.store(false, Ordering::SeqCst);
-    assert!(!fs.discard_active_batch(), "batch should already have been discarded");
+    assert!(fs.active_batch().expect("batch kept").has_uncommitted_files());
+    fs.commit_active_batch().expect("retry commit");
+    drop(fs);
+    let fs = Btrfs::mount(FileDevice::open(&img).expect("open ro")).expect("remount");
+    assert_eq!(fs.read_file("/saved.dat").expect("saved.dat present"), payload);
 
     let _ = fs::remove_file(&img);
 }
 
 #[test]
-fn finish_file_rollback_transport_failure_discards_batch_and_returns_error() {
+fn finish_file_name_collision_rolls_back_only_that_file_and_keeps_batch() {
     let img = copy_to_temp("plain.img", "finish-rollback-err");
     let file_len = fs::metadata(&img).unwrap().len();
 
@@ -157,20 +145,18 @@ fn finish_file_rollback_transport_failure_discards_batch_and_returns_error() {
     let mut writer2 = fs.begin_file(payload.len() as u64).expect("begin 2");
     fs.write_chunk(&mut writer2, payload).expect("write 2");
 
-    // 3. Enable write failure so the commit of file1 during file2's collision rollback fails
+    // 3. The collision error arm must not touch the device (the earlier commit-in-
+    // the-error-arm was the D2/N14 batch-drop site), so even a dead device cannot
+    // change the outcome: AlreadyExists, with file1 still pending in the batch.
     fail_flag.store(true, Ordering::SeqCst);
-
     let err = fs.finish_file(writer2, "/", "file1.dat").unwrap_err();
-    match err {
-        LuksError::UsbTransfer(msg) => {
-            assert!(msg.contains("simulated transport failure"));
-        }
-        other => panic!("expected UsbTransfer error, got: {:?}", other),
-    }
-
-    // Active batch was discarded on commit failure
+    assert!(matches!(err, LuksError::AlreadyExists(_)), "expected AlreadyExists, got {err:?}");
     fail_flag.store(false, Ordering::SeqCst);
-    assert!(!fs.discard_active_batch(), "batch should already have been discarded");
+    assert!(fs.active_batch().expect("batch kept").has_uncommitted_files());
+    fs.commit_active_batch().expect("commit file1");
+    drop(fs);
+    let fs = Btrfs::mount(FileDevice::open(&img).expect("open ro")).expect("remount");
+    assert_eq!(fs.read_file("/file1.dat").expect("file1 present"), payload);
 
     let _ = fs::remove_file(&img);
 }

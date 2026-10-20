@@ -1,5 +1,9 @@
 #![cfg(feature = "dangerous-write-support")]
 
+#[path = "../common/temp_guard.rs"]
+mod temp_guard;
+use temp_guard::{TempStr};
+
 #[path = "../common/mod.rs"]
 mod common;
 
@@ -8,14 +12,17 @@ use luks_core::fs::ext4::Ext4;
 use luks_core::fs::FileType;
 use std::process::Command;
 
+#[path = "leak_class.rs"]
+mod leak_class;
+
 fn fixture(name: &str) -> String {
     format!("{}/../fixtures/ext4/{name}", env!("CARGO_MANIFEST_DIR"))
 }
 
-fn scratch(name: &str, test: &str) -> String {
+fn scratch(name: &str, test: &str) -> TempStr {
     let dst = std::env::temp_dir().join(format!("ext4-delete-{test}-{name}"));
     std::fs::copy(fixture(name), &dst).expect("copy fixture");
-    dst.to_string_lossy().into_owned()
+    TempStr::new(dst.to_string_lossy().into_owned())
 }
 
 fn open(path: &str) -> Ext4<FileDevice> {
@@ -567,4 +574,206 @@ fn break_verification_missing_free_inode_leaves_orphan_inode() {
         text.contains("unattached") || text.contains("Free inodes count") || text.contains("bitmap differences"),
         "e2fsck did not complain about unattached/leaked inode:\n{text}"
     );
+}
+
+// --- W14: validate before destroying -----------------------------------------
+
+/// A device that starts failing reads of one block once armed. Reads at any
+/// other offset, and every write, behave normally.
+struct FailReadsAt {
+    inner: FileDevice,
+    armed: std::sync::atomic::AtomicBool,
+    at: u64,
+    len: u64,
+}
+
+impl ReadAt for FailReadsAt {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> luks_core::error::Result<()> {
+        use std::sync::atomic::Ordering;
+        if self.armed.load(Ordering::SeqCst) && offset < self.at + self.len && offset + buf.len() as u64 > self.at {
+            return Err(luks_core::error::LuksError::Io {
+                path: "simulated-bitmap-read-failure".to_string(),
+                source: std::io::Error::other("injected read failure"),
+            });
+        }
+        self.inner.read_at(offset, buf)
+    }
+    fn len(&self) -> Option<u64> {
+        self.inner.len()
+    }
+}
+
+impl WriteAt for FailReadsAt {
+    fn write_at(&self, offset: u64, buf: &[u8]) -> luks_core::error::Result<()> {
+        self.inner.write_at(offset, buf)
+    }
+    fn flush(&self) -> luks_core::error::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// W14 (L2-O9), e2fsck-graded: the block bitmap of the file's group cannot be
+/// read when the delete needs it. Nothing about the file may change: it is
+/// still listed, still readable, the image is byte-identical, and the kernel
+/// finds nothing wrong.
+#[test]
+fn w14_delete_whose_block_free_cannot_be_planned_leaves_the_file_intact_and_clean() {
+    let Some(script) = verify_script() else {
+        panic!("oracle required: this test cannot pass without e2fsck");
+    };
+    for name in FIXTURES {
+        let path = scratch(name, "w14-readfail");
+        let content: Vec<u8> = (0..3 * 4096u32).map(|i| (i % 253) as u8).collect();
+        let (bitmap_off, len) = {
+            let mut fs = open(&path);
+            fs.create_file(2, "keep.bin", &content, FileType::Regular).expect("create");
+            fs.flush().expect("flush");
+            let ino = fs.resolve("/keep.bin").expect("resolve");
+            let (data, _) = fs.collect_extents(&ino).expect("extents");
+            let bs = fs.block_size() as u64;
+            let g = ((data[0].physical - fs.superblock().first_data_block as u64)
+                / fs.superblock().blocks_per_group as u64) as usize;
+            (fs.groups()[g].block_bitmap * bs, bs)
+        };
+        let before = std::fs::read(&path).expect("read image");
+        let flen = before.len() as u64;
+        let dev = FailReadsAt {
+            inner: FileDevice::open_writable(&path, flen).expect("open"),
+            armed: std::sync::atomic::AtomicBool::new(false),
+            at: bitmap_off,
+            len,
+        };
+        {
+            let mut fs = Ext4::mount(dev).expect("mount");
+            fs.device_mut().armed.store(true, std::sync::atomic::Ordering::SeqCst);
+            let err = fs.delete_file("/keep.bin").expect_err("the bitmap read fails, so must the delete");
+            assert!(err.to_string().contains("injected read failure"), "{name}: wrong error: {err}");
+            fs.device_mut().armed.store(false, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(fs.read_file("/keep.bin").expect("file must still be readable"), content, "{name}");
+        }
+        assert!(std::fs::read(&path).expect("read image") == before, "{name}: a refused delete changed the image");
+        let out = Command::new("bash").arg(&script).arg(&path).output().expect("run verifier");
+        assert!(
+            out.status.success(),
+            "{name}: e2fsck after a refused delete:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// W14, crafted corruption: one of the file's blocks is marked free in the
+/// bitmap, so `free_blocks` would refuse a double free. The delete must refuse
+/// *before* it removes the name or frees the inode: the image is untouched.
+#[test]
+fn w14_delete_refused_for_a_double_free_leaves_the_image_untouched() {
+    for name in FIXTURES {
+        let path = scratch(name, "w14-doublefree");
+        let content: Vec<u8> = (0..3 * 4096u32).map(|i| (i % 251) as u8).collect();
+        {
+            let mut fs = open(&path);
+            fs.create_file(2, "keep.bin", &content, FileType::Regular).expect("create");
+            fs.flush().expect("flush");
+            let ino = fs.resolve("/keep.bin").expect("resolve");
+            let (data, _) = fs.collect_extents(&ino).expect("extents");
+            let victim = data[0].physical + data[0].len - 1;
+            let sb = fs.superblock();
+            let rel = victim - sb.first_data_block as u64;
+            let g = (rel / sb.blocks_per_group as u64) as usize;
+            let bit = rel % sb.blocks_per_group as u64;
+            let off = fs.groups()[g].block_bitmap * fs.block_size() as u64 + bit / 8;
+            let mut img = std::fs::read(&path).expect("read image");
+            assert!(img[off as usize] & (1 << (bit % 8)) != 0, "{name}: the victim bit must start set");
+            img[off as usize] &= !(1 << (bit % 8));
+            std::fs::write(&path, &img).expect("craft image");
+        }
+        let before = std::fs::read(&path).expect("read image");
+        {
+            let mut fs = open(&path);
+            let err = fs.delete_file("/keep.bin").expect_err("a double free must be refused");
+            assert!(err.to_string().contains("double free"), "{name}: wrong error: {err}");
+            assert_eq!(fs.read_file("/keep.bin").expect("file must still be readable"), content, "{name}");
+        }
+        assert!(
+            std::fs::read(&path).expect("read image") == before,
+            "{name}: a refused delete changed the image (name or inode destroyed before validation)"
+        );
+    }
+}
+
+/// W14 ordering, graded at every write boundary: the device dies after N
+/// writes of a delete. The file is either entirely there (readable, intact)
+/// or gone, and what e2fsck finds is leak-class only (the deleted inode's
+/// unattached/zeroed record, blocks marked used with no owner), flagged by
+/// the not-clean bit. This is what pins "inode before blocks": the other order
+/// leaves an unattached inode over blocks the bitmap calls free (a `+`
+/// difference), which the classifier rejects.
+#[test]
+fn w14_delete_fail_sweep_is_leak_class_only_at_every_boundary() {
+    let Some(script) = verify_script() else {
+        panic!("oracle required: this test cannot pass without e2fsck");
+    };
+    let content: Vec<u8> = (0..5 * 4096u32).map(|i| (i % 249) as u8).collect();
+    for name in FIXTURES {
+        let base = scratch(name, "w14-sweep-base");
+        let ino = {
+            let mut fs = open(&base);
+            fs.create_file(2, "gone.bin", &content, FileType::Regular).expect("create");
+            fs.flush().expect("flush");
+            fs.resolve("/gone.bin").expect("resolve").number
+        };
+        let len = std::fs::metadata(&base).expect("stat").len();
+        let total = {
+            let img = scratch(name, "w14-sweep-count");
+            std::fs::copy(&base, &img).expect("copy");
+            let dev = common::fail_after::FailAfterNWrites::new(FileDevice::open_writable(&img, len).expect("open"), usize::MAX);
+            let mut fs = Ext4::mount(dev).expect("mount");
+            fs.delete_file("/gone.bin").expect("unlimited delete");
+            let n = fs.device_mut().attempted.load(std::sync::atomic::Ordering::SeqCst);
+            assert!(n >= 5, "{name}: a delete made only {n} writes");
+            n
+        };
+        let mut violations = Vec::new();
+        let mut flagged = 0;
+        for n in 0..=total {
+            let img = scratch(name, &format!("w14-sweep-{n}"));
+            std::fs::copy(&base, &img).expect("copy");
+            {
+                let budget = if n == total { usize::MAX } else { n };
+                let dev = common::fail_after::FailAfterNWrites::new(FileDevice::open_writable(&img, len).expect("open"), budget);
+                let mut fs = Ext4::mount(dev).expect("mount");
+                let r = fs.delete_file("/gone.bin");
+                if n == total {
+                    r.expect("the unlimited run must succeed");
+                }
+            }
+            let fs = Ext4::mount(FileDevice::open(&img).expect("reopen")).expect("mount after failure");
+            match fs.read_file("/gone.bin") {
+                Ok(got) => assert_eq!(got, content, "{name} N={n}: a surviving file must be intact"),
+                Err(luks_core::error::LuksError::NotFound(_)) => {}
+                Err(e) => violations.push(format!("N={n}/{total}: neither intact nor gone: {e}")),
+            }
+            use std::os::unix::fs::FileExt;
+            let mut st = [0u8; 2];
+            std::fs::File::open(&img).expect("open").read_exact_at(&mut st, 1024 + 0x3A).expect("s_state");
+            let clean_flag = u16::from_le_bytes(st) & 1 == 1;
+            let out = Command::new("bash").arg(&script).arg(&img).output().expect("run verifier");
+            if !out.status.success() {
+                let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+                let bad = leak_class::non_leak_lines(&text, &[ino]);
+                if !bad.is_empty() {
+                    violations.push(format!("N={n}/{total}: not leak-class: {bad:?}"));
+                }
+                if clean_flag {
+                    violations.push(format!("N={n}/{total}: e2fsck dirty but the image reads clean"));
+                } else {
+                    flagged += 1;
+                }
+            } else if n == total {
+                assert!(clean_flag, "{name}: a complete delete must end marked clean");
+            }
+        }
+        assert!(flagged > 0, "{name}: vacuity: some boundary must leave a flagged, dirty image");
+        assert!(violations.is_empty(), "{name}: {} violations:\n{}", violations.len(), violations.join("\n"));
+    }
 }

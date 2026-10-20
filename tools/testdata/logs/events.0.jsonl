@@ -1,0 +1,7 @@
+{"t":1790003660098,"seq":14,"sid":"0a1b2c3d","src":"rs","ev":"native_ring","xfer":2,"kind":"usb_submit","gen":4,"nseq":99,"nt":1790003664990,"bytes":1048576,"count":1,"ep":129}
+{"t":1790003660105,"seq":15,"sid":"0a1b2c3d","src":"rs","ev":"native_ring","xfer":2,"kind":"scsi_command","nseq":100,"nt":1790003664995,"blocks":2048,"data_len":1048576,"lba":204800,"tag":9,"opcode":40,"direction":"in"}
+{"t":1790003660112,"seq":16,"sid":"0a1b2c3d","src":"rs","ev":"native_ring","xfer":2,"kind":"usb_timeout","active_urbs":1,"gen":4,"nseq":101,"nt":1790003665000,"elapsed_ms":5000,"ep":129}
+{"t":1790003660119,"seq":17,"sid":"0a1b2c3d","src":"kt","ev":"detach","reason":"usb_detach"}
+{"t":1790003660133,"seq":18,"sid":"-","src":"kt","ev":"dropped","n":5}
+{"t":1790003660126,"seq":19,"sid":"0a1b2c3d","src":"kt","ev":"trace","lvl":"E","msg":"luks_err: [tid=12] code=7 op=export"}
+{"t":1790003670000,"seq":99,"sid":"-","src":"kt","ev":"xfer_end","xfe

@@ -80,6 +80,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -110,6 +111,8 @@ import dev.luksandroid.formatTimestamp
 import dev.luksandroid.session.DirectoryTransferRequest
 import dev.luksandroid.session.LuksSession
 import dev.luksandroid.session.SessionState
+import dev.luksandroid.ui.theme.DestructiveRed
+import dev.luksandroid.ui.theme.StateLocked
 import dev.luksandroid.session.TransferManager
 import dev.luksandroid.session.TransferState
 import dev.luksandroid.session.TransferType
@@ -126,8 +129,12 @@ import dev.luksandroid.ui.components.CapacityBar
 import dev.luksandroid.ui.components.DeleteConfirmDialog
 import dev.luksandroid.ui.components.NewFolderDialog
 import dev.luksandroid.ui.components.RenameDialog
+import dev.luksandroid.ui.components.SessionStatusHeader
+import dev.luksandroid.ui.components.VolumeNotices
+import dev.luksandroid.ui.components.mergeFlushSupported
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.isActive
@@ -545,13 +552,19 @@ fun BrowserScreen(
                     imageVector = Icons.Default.Lock,
                     contentDescription = null,
                     modifier = Modifier.size(48.dp),
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    tint = StateLocked,
                 )
                 Text(
-                    text = "Drive is not unlocked",
+                    text = "Drive is locked",
                     style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                Text(
+                    text = "No key in memory. Unlock a partition to browse files.",
+                    style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                Spacer(modifier = Modifier.height(4.dp))
                 Button(onClick = onNavigateToDevices) {
                     Text("Go to Devices")
                 }
@@ -608,6 +621,27 @@ fun BrowserScreen(
     // The transfer itself lives and runs in TransferManager regardless of this
     // screen's lifecycle; this id is only used to pick which one to show inline.
     var activeTransferId by remember { mutableStateOf<Long?>(null) }
+    // Both are null until the native layer reports them (VolumeInfo.flushSupported and the listing's
+    // unreadable-entry count). Null shows nothing; see VolumeNotices.
+    var flushSupported by remember(volume) { mutableStateOf(volumeInfo.flushSupported) }
+    // flushSupported is only known after the first flush, so re-read it after each commit/transfer.
+    suspend fun refreshFlushSupported() {
+        val fresh = try {
+            withContext(Dispatchers.IO) { LuksSession.withLease { v -> v.info.flushSupported } }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            null
+        }
+        flushSupported = mergeFlushSupported(flushSupported, fresh)
+    }
+    var unreadableCount by remember { mutableStateOf<Int?>(null) }
+    val transferTracker = remember { TransferTracker() }
+    var transferTrackVersion by remember { mutableStateOf(0) }
+    fun trackTransfer(id: Long) {
+        transferTracker.track(id)
+        transferTrackVersion++
+    }
     val allTransfers by TransferManager.transfers.collectAsState()
     val activeTransferItem = activeTransferId?.let { id -> allTransfers.find { it.id == id } }
 
@@ -668,10 +702,12 @@ fun BrowserScreen(
         isRefreshing = true
         scope.launch {
             try {
-                val list = withContext(Dispatchers.IO) {
-                    LuksSession.withLease { v -> v.listDir(path) }
+                val listing = withContext(Dispatchers.IO) {
+                    LuksSession.withLease { v -> v.listDirCounted(path) }
                 }
+                val list = listing.entries
                 entries = list
+                unreadableCount = listing.unreadable
                 currentPath = path
                 isSlackLimitReached = false
                 selectedPaths = emptySet()
@@ -681,7 +717,7 @@ fun BrowserScreen(
                 Trace.err(e.code, "list_dir")
                 if (scope.isActive) {
                     scope.launch {
-                        snackbarHostState.showSnackbar("Cannot open folder: [${e.code}] ${e.message}")
+                        snackbarHostState.showSnackbar("Cannot open folder: ${UiErrorMessage.getBaseMessage(e.code)}")
                     }
                 }
             } catch (e: Exception) {
@@ -689,7 +725,7 @@ fun BrowserScreen(
                 Trace.err(-1, "list_dir")
                 if (scope.isActive) {
                     scope.launch {
-                        snackbarHostState.showSnackbar("Cannot open folder: ${e.message}")
+                        snackbarHostState.showSnackbar("Cannot open folder: ${UiErrorMessage.getBaseMessage(LuksException.GENERIC)}")
                     }
                 }
             } finally {
@@ -710,47 +746,37 @@ fun BrowserScreen(
     // this effect: it runs on TransferManager's own scope (see
     // TransferManager.startExport/startImport/startHash) and keeps going even
     // if this Composable is disposed before this effect observes completion.
-    LaunchedEffect(activeTransferId) {
-        val id = activeTransferId ?: return@LaunchedEffect
-        val terminal = TransferManager.transfers
-            .map { list -> list.find { it.id == id } }
-            .first { it == null || (it.state != TransferState.RUNNING && it.state != TransferState.QUEUED) }
-
-        when (terminal?.state) {
-            TransferState.COMPLETED -> {
-                when (terminal.type) {
-                    TransferType.IMPORT -> {
-                        snackbarHostState.showSnackbar("Imported \"${terminal.name}\" successfully")
-                        loadDirectory(currentPath)
-                    }
-                    TransferType.EXPORT -> {
-                        snackbarHostState.showSnackbar("Exported \"${terminal.name}\" successfully")
-                    }
-                    TransferType.HASH -> {} // ChecksumResultDialog is driven by startHash's onResult callback.
+    // Collects the tracker's pending ids together with the transfer list, so a transfer that is
+    // already terminal when tracked is still seen. Snackbars are launched, never awaited here:
+    // showSnackbar suspends for the whole display time and would freeze inline progress.
+    LaunchedEffect(Unit) {
+        combine(TransferManager.transfers, snapshotFlow { transferTrackVersion }) { list, _ -> list }
+            .collect { transferList ->
+                val update = transferTracker.update(transferList)
+                if (update.finished.any { it.state == TransferState.COMPLETED && it.type == TransferType.IMPORT }) {
+                    loadDirectory(currentPath)
                 }
-            }
-            TransferState.FAILED -> {
-                val code = terminal.errorCode
-                if (terminal.type == TransferType.IMPORT &&
-                    (code == LuksException.NO_SPACE || code == LuksException.ITEM_TOO_LARGE || code == LuksException.UNSUPPORTED)
-                ) {
-                    if (volumeInfo.fsType == "ext4") {
-                        isSlackLimitReached = true
+                if (update.finished.any { it.state == TransferState.COMPLETED && it.type != TransferType.HASH }) {
+                    refreshFlushSupported()
+                }
+                for (terminal in update.finished) {
+                    if (terminal.state == TransferState.FAILED && terminal.type == TransferType.IMPORT) {
+                        val code = terminal.errorCode
+                        if ((code == LuksException.NO_SPACE || code == LuksException.ITEM_TOO_LARGE || code == LuksException.UNSUPPORTED) &&
+                            volumeInfo.fsType == "ext4"
+                        ) {
+                            isSlackLimitReached = true
+                        }
+                    }
+                    TransferOutcomes.message(terminal)?.let { msg ->
+                        scope.launch {
+                            snackbarHostState.currentSnackbarData?.dismiss()
+                            snackbarHostState.showSnackbar(msg)
+                        }
                     }
                 }
-                val label = when (terminal.type) {
-                    TransferType.IMPORT -> "Import"
-                    TransferType.EXPORT -> "Export"
-                    TransferType.HASH -> "Checksum calculation"
-                }
-                snackbarHostState.showSnackbar("$label failed: ${terminal.error ?: "unknown error"}")
+                activeTransferId = update.activeId
             }
-            TransferState.CANCELLED -> {
-                snackbarHostState.showSnackbar("Transfer cancelled")
-            }
-            else -> {}
-        }
-        if (activeTransferId == id) activeTransferId = null
     }
 
     // SAF Exporter
@@ -764,7 +790,7 @@ fun BrowserScreen(
         // Routed through TransferManager (N.2): the actual copy runs on
         // TransferManager's own scope, not this screen's, and is visible on
         // the Transfers screen for the whole time it runs.
-        activeTransferId = TransferManager.startExport(context, source.fullPath, uri)
+        trackTransfer(TransferManager.startExport(context, source.fullPath, uri))
     }
 
     // SAF Importer
@@ -774,7 +800,7 @@ fun BrowserScreen(
         if (uris.isEmpty()) return@rememberLauncherForActivityResult
 
         for (uri in uris) {
-            activeTransferId = TransferManager.startImport(context, currentPath, uri)
+            trackTransfer(TransferManager.startImport(context, currentPath, uri))
         }
     }
 
@@ -817,17 +843,19 @@ fun BrowserScreen(
                         collisionChoice = prompt
                     }
                     is TransferPrompt.ReadyToRun -> {
-                        activeTransferId = TransferManager.startDirectoryTransfer(
-                            context, direction, request, treeUri, CollisionMode.SKIP,
+                        trackTransfer(
+                            TransferManager.startDirectoryTransfer(
+                                context, direction, request, treeUri, CollisionMode.SKIP,
+                            ),
                         )
                     }
                 }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Throwable) {
-                Trace.err(-1, "prepare_directory_transfer")
+                Trace.e("prepare_directory_transfer failed: ${Trace.throwableSummary(e)}")
                 snackbarHostState.showSnackbar(
-                    "Could not read that folder: ${e.message ?: e::class.simpleName}",
+                    UiErrorMessage.getUserMessage(e, "Reading that folder"),
                 )
             } finally {
                 preparingDirection = null
@@ -853,7 +881,7 @@ fun BrowserScreen(
 
     // SHA-256 Checksum Calculation
     fun calculateChecksum(item: BrowserItem) {
-        activeTransferId = TransferManager.startHash(item.fullPath) { result ->
+        trackTransfer(TransferManager.startHash(item.fullPath) { result ->
             result.onSuccess { digest ->
                 activeChecksum = ChecksumResult(
                     fileName = item.name,
@@ -863,7 +891,7 @@ fun BrowserScreen(
                     bytesPerSec = digest.bytesPerSec,
                 )
             }
-        }
+        })
     }
 
     // Create Directory
@@ -874,8 +902,9 @@ fun BrowserScreen(
         scope.launch {
             try {
                 withContext(Dispatchers.IO) {
-                    LuksSession.withLease { v -> v.createDirectory(currentPath, name) }
+                    TransferManager.withExclusiveWrite(op = "mkdir") { v -> v.createDirectory(currentPath, name) }
                 }
+                refreshFlushSupported()
                 showNewFolderDialog = false
                 if (scope.isActive) {
                     scope.launch {
@@ -890,11 +919,11 @@ fun BrowserScreen(
                 if ((e.code == LuksException.NO_SPACE || e.code == LuksException.ITEM_TOO_LARGE || e.code == LuksException.UNSUPPORTED) && volumeInfo.fsType == "ext4") {
                     isSlackLimitReached = true
                 }
-                newFolderError = "[${e.code}] ${e.message}"
+                newFolderError = UiErrorMessage.getBaseMessage(e.code)
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
                 Trace.err(-1, "create_directory")
-                newFolderError = e.message ?: "Failed to create folder"
+                newFolderError = UiErrorMessage.getBaseMessage(LuksException.GENERIC)
             } finally {
                 isCreatingFolder = false
             }
@@ -918,10 +947,11 @@ fun BrowserScreen(
         scope.launch {
             try {
                 withContext(Dispatchers.IO) {
-                    LuksSession.withLease { v ->
+                    TransferManager.withExclusiveWrite(op = "rename") { v ->
                         v.rename(currentPath, item.name, currentPath, newName)
                     }
                 }
+                refreshFlushSupported()
                 renamingItem = null
                 if (scope.isActive) {
                     scope.launch {
@@ -933,11 +963,11 @@ fun BrowserScreen(
                 throw e
             } catch (e: LuksException) {
                 Trace.err(e.code, "rename")
-                renameError = "[${e.code}] ${e.message}"
+                renameError = UiErrorMessage.getBaseMessage(e.code)
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
                 Trace.err(-1, "rename")
-                renameError = e.message ?: "Failed to rename"
+                renameError = UiErrorMessage.getBaseMessage(LuksException.GENERIC)
             } finally {
                 isRenaming = false
             }
@@ -952,8 +982,9 @@ fun BrowserScreen(
         scope.launch {
             try {
                 withContext(Dispatchers.IO) {
-                    LuksSession.withLease { v -> v.deleteFile(item.fullPath) }
+                    TransferManager.withExclusiveWrite(op = "delete") { v -> v.deleteFile(item.fullPath) }
                 }
+                refreshFlushSupported()
                 deletingItem = null
                 if (scope.isActive) {
                     scope.launch {
@@ -965,11 +996,11 @@ fun BrowserScreen(
                 throw e
             } catch (e: LuksException) {
                 Trace.err(e.code, "delete_file")
-                deleteError = "[${e.code}] ${e.message}"
+                deleteError = UiErrorMessage.getBaseMessage(e.code)
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
                 Trace.err(-1, "delete_file")
-                deleteError = e.message ?: "Failed to delete"
+                deleteError = UiErrorMessage.getBaseMessage(LuksException.GENERIC)
             } finally {
                 isDeleting = false
             }
@@ -1010,33 +1041,28 @@ fun BrowserScreen(
         isDeletingSelection = true
         deleteSelectionError = null
         scope.launch {
-            var deleted = 0
             try {
-                withContext(Dispatchers.IO) {
-                    for (item in toDelete) {
-                        LuksSession.withLease { v -> v.deleteFile(item.fullPath) }
-                        deleted++
+                val result = withContext(Dispatchers.IO) {
+                    TransferManager.withExclusiveWrite(op = "delete") { v ->
+                        runBatchDelete(toDelete) { item -> v.deleteFile(item.fullPath) }
                     }
                 }
-                confirmingDeleteSelection = false
+                refreshFlushSupported()
                 selectedPaths = emptySet()
+                if (result.failed == 0) confirmingDeleteSelection = false else deleteSelectionError = result.message()
                 if (scope.isActive) {
-                    scope.launch {
-                        snackbarHostState.showSnackbar(
-                            if (deleted == 1) "Deleted 1 item" else "Deleted $deleted items",
-                        )
-                    }
+                    scope.launch { snackbarHostState.showSnackbar(result.message()) }
                 }
                 loadDirectory(currentPath)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: LuksException) {
                 Trace.err(e.code, "delete_file")
-                deleteSelectionError = "Deleted $deleted of ${toDelete.size}: [${e.code}] ${e.message}"
+                deleteSelectionError = UiErrorMessage.getBaseMessage(e.code)
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
                 Trace.err(-1, "delete_file")
-                deleteSelectionError = "Deleted $deleted of ${toDelete.size}: ${e.message ?: "failed"}"
+                deleteSelectionError = UiErrorMessage.getBaseMessage(LuksException.GENERIC)
             } finally {
                 isDeletingSelection = false
             }
@@ -1045,6 +1071,9 @@ fun BrowserScreen(
 
     Scaffold(
         modifier = modifier.fillMaxSize(),
+        topBar = {
+            SessionStatusHeader()
+        },
         snackbarHost = { SnackbarHost(snackbarHostState) },
         floatingActionButton = {
             if (!isWriteDisabled) {
@@ -1080,7 +1109,7 @@ fun BrowserScreen(
                                 )
 
                                 SpeedDialItem(
-                                    label = "Import folder",
+                                    label = "Copy folder to drive",
                                     icon = BrowserIcons.Folder,
                                     onClick = {
                                         isSpeedDialOpen = false
@@ -1091,7 +1120,7 @@ fun BrowserScreen(
                                 )
 
                                 SpeedDialItem(
-                                    label = "Import files",
+                                    label = "Copy files to drive",
                                     icon = BrowserIcons.Upload,
                                     onClick = {
                                         isSpeedDialOpen = false
@@ -1210,6 +1239,47 @@ fun BrowserScreen(
                     fsType = volumeInfo.fsType,
                     isReadOnly = isSubvolumeReadOnly || !canWriteVolume,
                 )
+
+                val commitFailure by TransferManager.commitFailure.collectAsState()
+                if (commitFailure != null) {
+                    Surface(
+                        color = MaterialTheme.colorScheme.errorContainer,
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            text = VolumeNotices.COMMIT_FAILURE_BANNER,
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                            modifier = Modifier.padding(10.dp),
+                        )
+                    }
+                }
+                if (VolumeNotices.showNoFlush(flushSupported)) {
+                    Surface(
+                        color = MaterialTheme.colorScheme.tertiaryContainer,
+                        shape = RoundedCornerShape(8.dp),
+                    ) {
+                        Text(
+                            text = "No flush",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onTertiaryContainer,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                        )
+                    }
+                    Text(
+                        text = "This adapter can't confirm data reached the disk. Don't unplug until copies finish, and expect a repair check after an interruption.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                VolumeNotices.unreadableNotice(unreadableCount)?.let { notice ->
+                    Text(
+                        text = notice,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
 
                 // Refusal Warning Banners
                 if (isSubvolumeReadOnly) {
@@ -1395,9 +1465,9 @@ fun BrowserScreen(
                             "$pctStr$speedStr"
                         }
                         val operation = when (transfer.type) {
-                            TransferType.IMPORT -> "Importing"
-                            TransferType.EXPORT -> "Exporting"
-                            TransferType.HASH -> "Hashing"
+                            TransferType.IMPORT -> "Writing to drive:"
+                            TransferType.EXPORT -> "Saving to phone:"
+                            TransferType.HASH -> "Checking integrity:"
                         }
 
                         Row(
@@ -1790,8 +1860,10 @@ fun BrowserScreen(
             collisionChoice = null
             pendingDirectory = null
             if (pending != null) {
-                activeTransferId = TransferManager.startDirectoryTransfer(
-                    context, pending.first, pending.second, pending.third, mode,
+                trackTransfer(
+                    TransferManager.startDirectoryTransfer(
+                        context, pending.first, pending.second, pending.third, mode,
+                    ),
                 )
             }
         }
@@ -1852,7 +1924,10 @@ fun BrowserScreen(
                         onClick = { run(CollisionMode.KEEP_BOTH) },
                         enabled = choice.allowKeepBoth,
                     ) { Text("Keep both") }
-                    TextButton(onClick = { run(CollisionMode.REPLACE) }) { Text("Replace") }
+                    TextButton(
+                        onClick = { run(CollisionMode.REPLACE) },
+                        colors = ButtonDefaults.textButtonColors(contentColor = DestructiveRed),
+                    ) { Text("Replace") }
                 }
             },
             dismissButton = {
@@ -2130,7 +2205,7 @@ fun BrowserItemRow(
                 // recursive copy (Pass 4). The caller routes by type -- a file
                 // through CreateDocument, a folder through OpenDocumentTree.
                 DropdownMenuItem(
-                    text = { Text(if (item.isDir) "Export folder to phone" else "Export to phone") },
+                    text = { Text(if (item.isDir) "Save folder to phone" else "Save to phone") },
                     leadingIcon = {
                         Icon(
                             imageVector = BrowserIcons.Download,

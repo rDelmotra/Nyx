@@ -14,8 +14,8 @@ use luks_core::usb::bot::{
     CommandBlockWrapper, CommandStatusWrapper, CswStatus, Direction, CBW_LEN, CBW_SIGNATURE,
     CSW_LEN, CSW_SIGNATURE,
 };
-use luks_core::usb::scsi::WriteCacheState;
-use luks_core::usb::ScsiBlockDevice;
+use luks_core::usb::scsi::{parse_vpd_block_limits, WriteCacheState};
+use luks_core::usb::{BulkTransport, ScsiBlockDevice};
 
 // --- Bulk-Only Transport wire format ---------------------------------------
 
@@ -388,6 +388,97 @@ fn a_clean_transfer_never_touches_reset() {
     assert_eq!(dev.transport().reset_count.get(), 0);
 }
 
+/// F1.3 (register T2): BOT 6.3 / 6.5 says a CSW that is not valid (bad
+/// signature, wrong tag) or not meaningful (reserved status), and a CBW the
+/// device did not take in full, put the pipe in an unknown phase; only reset
+/// recovery makes the next command safe. Each case must reset exactly once and
+/// still report the original failure.
+#[test]
+fn invalid_csw_or_short_cbw_triggers_reset_recovery() {
+    use common::{Tamper, TamperTransport};
+    let cases = [
+        (Tamper::BadCswSignature, "bad CSW signature"),
+        (Tamper::CswTagMismatch, "CSW tag mismatch"),
+        (Tamper::ReservedCswStatus, "reserved CSW status"),
+        (Tamper::ShortCbwWrite, "short CBW write"),
+    ];
+    assert!(!cases.is_empty(), "vacuity: no cases");
+    for (tamper, why) in cases {
+        let dev = ScsiBlockDevice::open(TamperTransport::new(MockUsbDrive::new(vec![0u8; 1024 * 1024])))
+            .unwrap();
+        assert_eq!(dev.transport().resets.get(), 0, "open must not reset");
+
+        dev.transport().arm(tamper);
+        let err = dev.test_unit_ready().expect_err("the tampered wrapper is an error");
+        assert!(
+            matches!(err, LuksError::ScsiProtocol(m) if m == why),
+            "{tamper:?}: wrong error: {err}"
+        );
+        assert_eq!(dev.transport().resets.get(), 1, "{tamper:?}: must reset exactly once");
+
+        // Control: the next, untampered command works and does not reset again.
+        dev.test_unit_ready().expect("pipe usable after recovery");
+        assert_eq!(dev.transport().resets.get(), 1, "{tamper:?}: clean command reset again");
+    }
+}
+
+/// Fails the next CBW write with a given errno, and optionally makes the BOT
+/// reset that follows fail as well.
+struct ErrnoTransport<T> {
+    inner: T,
+    fail_next_write_with: std::cell::Cell<Option<i32>>,
+    /// If set, the BOT reset fails with this errno.
+    reset_errno: Option<i32>,
+}
+
+impl<T: luks_core::usb::BulkTransport> luks_core::usb::BulkTransport for ErrnoTransport<T> {
+    fn write(&self, data: &[u8]) -> Result<usize, LuksError> {
+        if let Some(errno) = self.fail_next_write_with.take() {
+            return Err(LuksError::usb_errno(errno, "injected"));
+        }
+        self.inner.write(data)
+    }
+    fn read(&self, buf: &mut [u8]) -> Result<usize, LuksError> {
+        self.inner.read(buf)
+    }
+    fn max_transfer(&self) -> usize {
+        self.inner.max_transfer()
+    }
+    fn reset(&self) -> Result<(), LuksError> {
+        if let Some(errno) = self.reset_errno {
+            return Err(LuksError::usb_errno(errno, "reset failed"));
+        }
+        self.inner.reset()
+    }
+}
+
+/// F1.2 / R3: how the BOT reset's own outcome classifies the failure.
+#[test]
+fn the_reset_outcome_decides_disconnect_and_the_original_error_stays_primary() {
+    // (injected errno, errno the reset fails with, expected is_disconnected)
+    let cases = [
+        (71, None, false),      // EPROTO, reset fine: a glitch
+        (71, Some(110), true),  // EPROTO, reset also fails: gone
+        (110, Some(110), false), // timeout, reset times out: not provably gone
+        (110, Some(19), true),  // timeout, reset says ENODEV: gone
+    ];
+    for (errno, reset_errno, expect_gone) in cases {
+        let dev = ScsiBlockDevice::open(ErrnoTransport {
+            inner: MockUsbDrive::new(vec![0u8; 1024 * 1024]),
+            fail_next_write_with: std::cell::Cell::new(None),
+            reset_errno,
+        })
+        .unwrap();
+        dev.transport().fail_next_write_with.set(Some(errno));
+        let err = dev.test_unit_ready().expect_err("injected failure");
+        assert!(
+            matches!(err, LuksError::UsbErrno { errno: e, .. } if e == errno),
+            "the original error must be what the caller sees: {err}"
+        );
+        assert_eq!(err.is_disconnected(), expect_gone, "errno {errno} reset {reset_errno:?}: {err:?}");
+    }
+}
+
 #[test]
 fn guid_formatting_uses_mixed_endian_order() {
     // GPT stores the first three fields little-endian; printing must undo that.
@@ -468,17 +559,150 @@ fn csw_stall_recovers_via_clear_halt() {
 
 #[test]
 fn max_scsi_transfer_caps_single_read_commands() {
-    // A transport that allows 1 MiB transfers
-    let drive = MockUsbDrive::new(fixture("disks/gpt-luks.img")).with_max_transfer(1024 * 1024);
+    // A transport that allows 2 MiB transfers
+    let drive = MockUsbDrive::new(fixture("disks/gpt-luks.img")).with_max_transfer(2 * 1024 * 1024);
     let dev = ScsiBlockDevice::open(drive).unwrap();
 
-    let mut buf = vec![0u8; 1024 * 1024];
+    let mut buf = vec![0u8; 2 * 1024 * 1024];
     dev.read_at(0, &mut buf).unwrap();
 
     let stats = *dev.transport().stats.borrow();
-    // 1 MiB in 128 KiB commands = 8 commands
-    assert!(stats.read_commands >= 8, "must split into at least 8 commands");
-    assert_eq!(stats.largest_read_blocks, 256, "capped at 128 KiB / 512 = 256 blocks");
+    // 2 MiB in 1 MiB commands = 2 commands
+    assert!(stats.read_commands >= 2, "must split into at least 2 commands");
+    assert_eq!(stats.largest_read_blocks, 2048, "capped at 1 MiB / 512 = 2048 blocks");
+}
+
+/// Trap 2: A reply short by exactly 13 bytes counts the drive's status reply (CSW) as file data.
+/// During Direction::In, if a read yields 13 bytes matching CSW_SIGNATURE and tag, the drive
+/// ended the data phase early and sent the CSW into the data buffer. It must be captured into
+/// csw_buf, and NOT treated as file data.
+#[test]
+fn early_csw_in_data_buffer_is_captured_without_counting_as_file_data() {
+    struct EarlyCswTransport<T> {
+        inner: T,
+        step: std::cell::Cell<usize>,
+        last_tag: std::cell::Cell<u32>,
+    }
+
+    impl<T: luks_core::usb::BulkTransport> luks_core::usb::BulkTransport for EarlyCswTransport<T> {
+        fn write(&self, data: &[u8]) -> Result<usize, LuksError> {
+            if data.len() >= 8 && &data[0..4] == b"USBC" {
+                let tag = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+                self.last_tag.set(tag);
+            }
+            self.inner.write(data)
+        }
+
+        fn read(&self, buf: &mut [u8]) -> Result<usize, LuksError> {
+            let s = self.step.get();
+            self.step.set(s + 1);
+            if s == 1 && buf.len() >= 100 {
+                // First data read: return 100 bytes of data
+                buf[..100].fill(0x55);
+                return Ok(100);
+            } else if s == 2 && buf.len() >= 13 {
+                // Second data read: drive finishes early and sends CSW directly into data buffer!
+                let tag = self.last_tag.get();
+                let mut csw = [0u8; 13];
+                csw[0..4].copy_from_slice(b"USBS");
+                csw[4..8].copy_from_slice(&tag.to_le_bytes());
+                csw[8..12].copy_from_slice(&412u32.to_le_bytes()); // 512 - 100 = 412 residue
+                csw[12] = 0; // Passed
+                buf[..13].copy_from_slice(&csw);
+                return Ok(13);
+            }
+            self.inner.read(buf)
+        }
+
+        fn max_transfer(&self) -> usize {
+            self.inner.max_transfer()
+        }
+
+        fn clear_halt(&self, endpoint_in: bool) -> Result<(), LuksError> {
+            self.inner.clear_halt(endpoint_in)
+        }
+
+        fn reset(&self) -> Result<(), LuksError> {
+            self.inner.reset()
+        }
+    }
+
+    let inner = MockUsbDrive::new(vec![0u8; 1024 * 1024]);
+    let transport = EarlyCswTransport {
+        inner,
+        step: std::cell::Cell::new(0),
+        last_tag: std::cell::Cell::new(0u32),
+    };
+    let dev = ScsiBlockDevice::open(transport).unwrap();
+
+    // Arm step counter for the READ(10) command
+    dev.transport().step.set(1);
+    let mut data = vec![0u8; 512];
+    let got = dev.read_blocks(0, 1, &mut data).unwrap();
+
+    // Exactly 100 bytes of data were transferred — NOT 113!
+    assert_eq!(got, 100, "CSW bytes must not be counted as transferred data");
+}
+
+#[test]
+fn early_failed_csw_in_data_buffer_reports_command_failed() {
+    struct EarlyFailedCswTransport<T> {
+        inner: T,
+        armed: std::cell::Cell<bool>,
+        last_tag: std::cell::Cell<u32>,
+    }
+
+    impl<T: luks_core::usb::BulkTransport> luks_core::usb::BulkTransport for EarlyFailedCswTransport<T> {
+        fn write(&self, data: &[u8]) -> Result<usize, LuksError> {
+            if data.len() >= 8 && &data[0..4] == b"USBC" {
+                let tag = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+                self.last_tag.set(tag);
+            }
+            self.inner.write(data)
+        }
+
+        fn read(&self, buf: &mut [u8]) -> Result<usize, LuksError> {
+            if self.armed.get() && buf.len() >= 13 {
+                self.armed.set(false);
+                let tag = self.last_tag.get();
+                let mut csw = [0u8; 13];
+                csw[0..4].copy_from_slice(b"USBS");
+                csw[4..8].copy_from_slice(&tag.to_le_bytes());
+                csw[8..12].copy_from_slice(&512u32.to_le_bytes()); // residue
+                csw[12] = 1; // Failed status
+                buf[..13].copy_from_slice(&csw);
+                return Ok(13);
+            }
+            self.inner.read(buf)
+        }
+
+        fn max_transfer(&self) -> usize {
+            self.inner.max_transfer()
+        }
+
+        fn clear_halt(&self, endpoint_in: bool) -> Result<(), LuksError> {
+            self.inner.clear_halt(endpoint_in)
+        }
+
+        fn reset(&self) -> Result<(), LuksError> {
+            self.inner.reset()
+        }
+    }
+
+    let inner = MockUsbDrive::new(vec![0u8; 1024 * 1024]);
+    let transport = EarlyFailedCswTransport {
+        inner,
+        armed: std::cell::Cell::new(false),
+        last_tag: std::cell::Cell::new(0u32),
+    };
+    let dev = ScsiBlockDevice::open(transport).unwrap();
+
+    dev.transport().armed.set(true);
+    let mut data = vec![0u8; 512];
+    let err = dev.read_blocks(0, 1, &mut data).unwrap_err();
+
+    // The CSW reported Failed, so ScsiCommandFailed is returned with sense info
+    assert!(matches!(err, LuksError::ScsiCommandFailed { .. }));
 }
 
 // --- MODE SENSE / write-cache probe -----------------------------------------
@@ -704,3 +928,134 @@ fn write_cache_state_is_unknown_when_the_descriptor_overruns_the_response() {
 
     assert_eq!(dev.write_cache_state(), WriteCacheState::Unknown);
 }
+
+// --- SCSI VPD Page 0xB0 (Block Limits) & Dynamic Sizing -------------------
+
+#[test]
+fn parse_vpd_block_limits_tests() {
+    // 1. Valid buffer with max blocks and optimal blocks:
+    // Uses ONLY max_blocks (2048 * 512 = 1 MiB), ignoring optimal blocks (1024 * 512 = 512 KiB)
+    let mut buf = vec![0u8; 64];
+    buf[1] = 0xB0; // Block limits page code
+    // max_blocks = 2048 blocks (bytes 8..12) -> 2048 * 512 = 1 MiB
+    buf[8..12].copy_from_slice(&2048u32.to_be_bytes());
+    // opt_blocks = 1024 blocks (bytes 12..16) -> ignored
+    buf[12..16].copy_from_slice(&1024u32.to_be_bytes());
+    assert_eq!(
+        parse_vpd_block_limits(&buf, 512),
+        Some(1024 * 1024),
+        "should use max_blocks (1 MiB), ignoring optimal"
+    );
+
+    // 2. Only max_blocks set
+    let mut buf_max_only = vec![0u8; 64];
+    buf_max_only[1] = 0xB0;
+    buf_max_only[8..12].copy_from_slice(&512u32.to_be_bytes()); // 512 * 512 = 256 KiB
+    assert_eq!(
+        parse_vpd_block_limits(&buf_max_only, 512),
+        Some(256 * 1024)
+    );
+
+    // 3. Small max_blocks below 128 KiB is clamped up to 128 KiB floor
+    let mut buf_small = vec![0u8; 64];
+    buf_small[1] = 0xB0;
+    buf_small[8..12].copy_from_slice(&64u32.to_be_bytes()); // 64 * 512 = 32 KiB
+    assert_eq!(
+        parse_vpd_block_limits(&buf_small, 512),
+        Some(128 * 1024),
+        "must enforce 128 KiB floor"
+    );
+
+    // 4. Clamping to MAX_SCSI_TRANSFER (1 MiB)
+    let mut buf_huge = vec![0u8; 64];
+    buf_huge[1] = 0xB0;
+    buf_huge[8..12].copy_from_slice(&8192u32.to_be_bytes()); // 8192 * 512 = 4 MiB
+    assert_eq!(
+        parse_vpd_block_limits(&buf_huge, 512),
+        Some(1024 * 1024),
+        "must be clamped to 1 MiB"
+    );
+
+    // 5. Invalid page code
+    let mut buf_bad_page = vec![0u8; 64];
+    buf_bad_page[1] = 0x83; // Device ID page, not B0
+    buf_bad_page[8..12].copy_from_slice(&512u32.to_be_bytes());
+    assert_eq!(parse_vpd_block_limits(&buf_bad_page, 512), None);
+
+    // 6. Buffer too short (< 16 bytes)
+    assert_eq!(parse_vpd_block_limits(&buf[..15], 512), None);
+
+    // 7. Zero blocks or zero block size
+    let buf_zeroes = vec![0u8; 64];
+    assert_eq!(parse_vpd_block_limits(&buf_zeroes, 512), None);
+    assert_eq!(parse_vpd_block_limits(&buf, 0), None);
+}
+
+#[test]
+fn open_does_not_send_vpd_queries_to_usb_storage() {
+    let image = fixture("disks/gpt-luks.img");
+    let drive = MockUsbDrive::new(image)
+        .with_max_transfer(1024 * 1024)
+        .with_vpd_block_limits(512, 1024);
+    let dev = ScsiBlockDevice::open(drive).unwrap();
+
+    // open() does not query VPD Page 0xB0; max_transfer stays at transport cap (1 MiB)
+    assert_eq!(dev.max_transfer(), 1024 * 1024);
+    // Manual query via probe_vpd_block_limits still functions if explicitly called
+    let limit = dev.probe_vpd_block_limits().unwrap();
+    assert_eq!(limit, 256 * 1024);
+}
+
+#[test]
+fn dynamic_step_down_on_large_read_stall() {
+    let image = fixture("disks/gpt-luks.img");
+    let drive = MockUsbDrive::new(image.clone())
+        .with_max_transfer(1024 * 1024)
+        .with_stall_transfers_larger_than(128 * 1024);
+    let dev = ScsiBlockDevice::open(drive).unwrap();
+
+    assert_eq!(dev.max_transfer(), 1024 * 1024);
+
+    // Read 512 KiB (1024 blocks of 512 bytes)
+    let mut buf = vec![0u8; 512 * 1024];
+    let n = dev.read_blocks(0, 1024, &mut buf).expect("read should step down and succeed");
+    assert_eq!(n, 512 * 1024);
+    assert_eq!(&buf[..], &image[..512 * 1024]);
+
+    // max_transfer must have stepped down to 128 KiB
+    assert_eq!(dev.max_transfer(), 128 * 1024);
+    assert_eq!(dev.transport().max_transfer(), 128 * 1024);
+
+    // Subsequent read also succeeds without error
+    let mut buf2 = vec![0u8; 128 * 1024];
+    let n2 = dev.read_blocks(1024, 256, &mut buf2).unwrap();
+    assert_eq!(n2, 128 * 1024);
+    assert_eq!(&buf2[..], &image[512 * 1024..512 * 1024 + 128 * 1024]);
+}
+
+#[cfg(feature = "dangerous-write-support")]
+#[test]
+fn dynamic_step_down_on_large_write_stall() {
+    let image = fixture("disks/gpt-luks.img");
+    let drive = MockUsbDrive::new(image.clone())
+        .with_max_transfer(1024 * 1024)
+        .with_stall_transfers_larger_than(128 * 1024);
+    let dev = ScsiBlockDevice::open(drive).unwrap();
+
+    assert_eq!(dev.max_transfer(), 1024 * 1024);
+
+    // Write 512 KiB (1024 blocks of 512 bytes)
+    let payload = vec![0xA5u8; 512 * 1024];
+    let n = dev.write_blocks(0, 1024, &payload).expect("write should step down and succeed");
+    assert_eq!(n, 512 * 1024);
+
+    // max_transfer must have stepped down to 128 KiB
+    assert_eq!(dev.max_transfer(), 128 * 1024);
+    assert_eq!(dev.transport().max_transfer(), 128 * 1024);
+
+    // Verify written data matches
+    let mut verify_buf = vec![0u8; 512 * 1024];
+    dev.read_blocks(0, 1024, &mut verify_buf).unwrap();
+    assert_eq!(verify_buf, payload);
+}
+

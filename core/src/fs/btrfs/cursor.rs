@@ -29,6 +29,11 @@ pub struct Cursor<'a, D: ReadAt> {
     /// One entry per level, root first. The index is the entry *within* that
     /// node: a child index for interior nodes, an item index for the leaf.
     path: Vec<(Node, usize)>,
+    /// Set when a backward step ran off the front of the tree. The path still
+    /// ends in the first leaf (so `key()` and `retreat()` never read an
+    /// interior node as a leaf), but `valid()` is false and a forward step
+    /// goes to the first item rather than to the second leaf.
+    before_start: bool,
 }
 
 impl<'a, D: ReadAt> Cursor<'a, D> {
@@ -41,7 +46,11 @@ impl<'a, D: ReadAt> Cursor<'a, D> {
         let mut path = Vec::new();
         let mut node = fs.read_node(root)?;
 
-        while !node.is_leaf() && node.nr_items > 0 {
+        // An interior node with no children is damage, at the root as much as
+        // anywhere: only a *leaf* root can be an empty tree. `child_for`
+        // reports it as CorruptFs; stopping the loop silently here used to
+        // hand back an invalid cursor that read as "empty tree" (L3c-O3).
+        while !node.is_leaf() {
             let i = node.child_for(key)?;
             let ptr = node.key_ptr(i)?;
             let child = fs.read_node(ptr.blockptr)?;
@@ -50,6 +59,7 @@ impl<'a, D: ReadAt> Cursor<'a, D> {
                     "btrfs child node is not one level below its parent",
                 ));
             }
+            ptr.check_child(&child)?;
             path.push((node, i));
             node = child;
         }
@@ -57,7 +67,11 @@ impl<'a, D: ReadAt> Cursor<'a, D> {
         let i = node.lower_bound(key)?;
         path.push((node, i));
 
-        let mut cursor = Cursor { fs, path };
+        let mut cursor = Cursor {
+            fs,
+            path,
+            before_start: false,
+        };
         // `lower_bound` can land one past the end of this leaf when every key
         // in it is smaller than the target. The item wanted is then the first
         // one of the next leaf, so step across rather than reporting nothing —
@@ -99,6 +113,9 @@ impl<'a, D: ReadAt> Cursor<'a, D> {
     /// items (e.g. `ORPHAN_OBJECTID`) that can occupy the tail of the
     /// rightmost leaf, and `search_le` alone only steps back once.
     pub fn retreat(&mut self) -> Result<()> {
+        if self.before_start {
+            return Ok(());
+        }
         let last = self.path.len() - 1;
         let (_, i) = &mut self.path[last];
         if *i > 0 {
@@ -108,52 +125,62 @@ impl<'a, D: ReadAt> Cursor<'a, D> {
         self.retreat_leaf()
     }
 
-    /// Move to the last item of the previous leaf, mirroring [`advance_leaf`].
+    /// Move to the last item of the previous non-empty leaf, mirroring
+    /// [`advance_leaf`].
+    ///
+    /// A zero-item leaf is stepped over, not reported: the kernel never writes
+    /// one, but this project's own delete bug did (2026-08-23), and they may
+    /// still sit on real sticks. Reporting one as an error made every
+    /// `search_le` that crossed it fail, which is what WEIRD_INCIDENT.md saw.
+    ///
+    /// The probe for an ancestor with an earlier child is read-only, and the
+    /// path is only changed once one is found. If none exists the cursor is
+    /// parked on the first leaf, still leaf-terminated (L3c-O2: it used to be
+    /// left holding an interior root as its only frame).
     fn retreat_leaf(&mut self) -> Result<()> {
         loop {
-            if self.path.len() == 1 {
-                // Nothing precedes the first item. Park past the end of the
-                // leaf so `valid()` reports false rather than pointing at the
-                // wrong item.
-                let (node, i) = &mut self.path[0];
-                *i = node.nr_items;
+            let leaf_idx = self.path.len() - 1;
+            let Some(anc) = (0..leaf_idx).rev().find(|&idx| self.path[idx].1 > 0) else {
+                let (_, i) = &mut self.path[leaf_idx];
+                *i = 0;
+                self.before_start = true;
                 return Ok(());
-            }
-            self.path.pop();
+            };
 
-            let last = self.path.len() - 1;
-            let (node, i) = &mut self.path[last];
-            if *i == 0 {
-                continue;
-            }
+            self.path.truncate(anc + 1);
+            let (node, i) = &mut self.path[anc];
             *i -= 1;
 
             // Descend rightmost from here.
-            let mut ptr = node.key_ptr(*i)?.blockptr;
+            let mut kp = node.key_ptr(*i)?;
             let mut level = node.level;
             loop {
-                let child = self.fs.read_node(ptr)?;
+                let child = self.fs.read_node(kp.blockptr)?;
                 if child.level + 1 != level {
                     return Err(LuksError::CorruptFs(
                         "btrfs child node is not one level below its parent",
                     ));
                 }
+                kp.check_child(&child)?;
                 level = child.level;
+                let leaf = child.is_leaf();
                 if child.nr_items == 0 {
-                    return Err(LuksError::CorruptFs("btrfs node has no items"));
+                    if !leaf {
+                        return Err(LuksError::CorruptFs("btrfs node has no items"));
+                    }
+                    // Empty leaf: keep it as the leaf frame and climb again.
+                    self.path.push((child, 0));
+                    break;
                 }
                 let last_index = child.nr_items - 1;
-                let leaf = child.is_leaf();
-                let next = if leaf {
-                    0
-                } else {
-                    child.key_ptr(last_index)?.blockptr
-                };
+                let next = if leaf { None } else { Some(child.key_ptr(last_index)?) };
                 self.path.push((child, last_index));
                 if leaf {
                     return Ok(());
                 }
-                ptr = next;
+                if let Some(next) = next {
+                    kp = next;
+                }
             }
         }
     }
@@ -165,15 +192,21 @@ impl<'a, D: ReadAt> Cursor<'a, D> {
     /// Whether the cursor points at an item.
     pub fn valid(&self) -> bool {
         let (node, i) = self.leaf();
-        *i < node.nr_items
+        !self.before_start && *i < node.nr_items
     }
 
     pub fn key(&self) -> Result<Key> {
+        if self.before_start {
+            return Err(LuksError::CorruptFs("btrfs cursor is before the first item"));
+        }
         let (node, i) = self.leaf();
         node.key(*i)
     }
 
     pub fn data(&self) -> Result<&[u8]> {
+        if self.before_start {
+            return Err(LuksError::CorruptFs("btrfs cursor is before the first item"));
+        }
         let (node, i) = self.leaf();
         node.item_data(*i)
     }
@@ -181,6 +214,16 @@ impl<'a, D: ReadAt> Cursor<'a, D> {
     /// Step to the next item in key order, crossing into the next leaf when
     /// this one runs out.
     pub fn advance(&mut self) -> Result<()> {
+        if self.before_start {
+            // From before the start, the next item is the first one.
+            self.before_start = false;
+            let last = self.path.len() - 1;
+            self.path[last].1 = 0;
+            if !self.valid() {
+                self.advance_leaf()?;
+            }
+            return Ok(());
+        }
         {
             let last = self.path.len() - 1;
             let (node, i) = &mut self.path[last];
@@ -218,45 +261,62 @@ impl<'a, D: ReadAt> Cursor<'a, D> {
     /// rightmost leaf's *first* key) instead of retreating properly to
     /// 263276 (the true last key) on `fixtures/btrfs/plain.img`.
     fn advance_leaf(&mut self) -> Result<()> {
-        let leaf_idx = self.path.len() - 1;
-        let mut climb_to = None;
-        for idx in (0..leaf_idx).rev() {
-            let (node, i) = &self.path[idx];
-            if *i + 1 < node.nr_items {
-                climb_to = Some(idx);
-                break;
-            }
-        }
-        let last = match climb_to {
-            Some(idx) => idx,
-            // No ancestor has an unvisited child: end of tree. `self.path`
-            // was never touched, so it is still exactly the leaf-terminated,
-            // past-the-end state `search()` left it in.
-            None => return Ok(()),
-        };
-
-        self.path.truncate(last + 1);
-        let (node, i) = &mut self.path[last];
-        *i += 1;
-
-        // Descend leftmost from here.
-        let mut ptr = node.key_ptr(*i)?.blockptr;
-        let mut level = node.level;
+        // A zero-item leaf is stepped over rather than reported as the end of
+        // the tree (R1r, L3c-O1): while the leaf we land on is empty, climb
+        // again. Each pass moves strictly forward, so this terminates.
         loop {
-            let child = self.fs.read_node(ptr)?;
-            if child.level + 1 != level {
-                return Err(LuksError::CorruptFs(
-                    "btrfs child node is not one level below its parent",
-                ));
+            let leaf_idx = self.path.len() - 1;
+            let mut climb_to = None;
+            for idx in (0..leaf_idx).rev() {
+                let (node, i) = &self.path[idx];
+                if *i + 1 < node.nr_items {
+                    climb_to = Some(idx);
+                    break;
+                }
             }
-            level = child.level;
-            let leaf = child.is_leaf();
-            let next = if leaf { 0 } else { child.key_ptr(0)?.blockptr };
-            self.path.push((child, 0));
-            if leaf {
+            let last = match climb_to {
+                Some(idx) => idx,
+                // No ancestor has an unvisited child: end of tree.
+                // `self.path` was never touched by this pass, so it is still
+                // leaf-terminated and past the end (or on a trailing empty
+                // leaf, which is invalid too, and `retreat` steps over).
+                None => return Ok(()),
+            };
+
+            self.path.truncate(last + 1);
+            let (node, i) = &mut self.path[last];
+            *i += 1;
+
+            // Descend leftmost from here.
+            let mut kp = node.key_ptr(*i)?;
+            let mut level = node.level;
+            loop {
+                let child = self.fs.read_node(kp.blockptr)?;
+                if child.level + 1 != level {
+                    return Err(LuksError::CorruptFs(
+                        "btrfs child node is not one level below its parent",
+                    ));
+                }
+                kp.check_child(&child)?;
+                level = child.level;
+                let leaf = child.is_leaf();
+                if child.nr_items == 0 && !leaf {
+                    return Err(LuksError::CorruptFs(
+                        "btrfs interior node has no child pointers",
+                    ));
+                }
+                let next = if leaf { None } else { Some(child.key_ptr(0)?) };
+                self.path.push((child, 0));
+                if leaf {
+                    break;
+                }
+                if let Some(next) = next {
+                    kp = next;
+                }
+            }
+            if self.valid() {
                 return Ok(());
             }
-            ptr = next;
         }
     }
 }

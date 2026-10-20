@@ -5,23 +5,32 @@
 //! ```
 #![cfg(feature = "dangerous-write-support")]
 
+#[path = "../common/temp_guard.rs"]
+mod temp_guard;
+use temp_guard::{TempStr};
+
 #[path = "../common/mod.rs"]
 mod common;
 
+use common::fail_after::FailAfterNWrites;
 use luks_core::device::FileDevice;
 use luks_core::error::LuksError;
 use luks_core::fs::ext4::Ext4;
 use luks_core::fs::FileType;
 use std::process::Command;
+use std::sync::atomic::Ordering;
+
+#[path = "leak_class.rs"]
+mod leak_class;
 
 fn fixture(name: &str) -> String {
     format!("{}/../fixtures/ext4/{name}", env!("CARGO_MANIFEST_DIR"))
 }
 
-fn scratch(name: &str, test: &str) -> String {
+fn scratch(name: &str, test: &str) -> TempStr {
     let dst = std::env::temp_dir().join(format!("ext4-rename-{test}-{name}"));
     std::fs::copy(fixture(name), &dst).expect("copy fixture");
-    dst.to_string_lossy().into_owned()
+    TempStr::new(dst.to_string_lossy().into_owned())
 }
 
 fn open(path: &str) -> Ext4<FileDevice> {
@@ -161,4 +170,181 @@ fn rename_refusal_gates() {
         matches!(err_overwrite_dir, Err(LuksError::UnsupportedFsFeature(_))),
         "expected UnsupportedFsFeature when overwriting a directory, got: {err_overwrite_dir:?}"
     );
+}
+
+// --- W15: rename onto an existing name ------------------------------------
+
+/// Raw `s_state` bit 0 (cleanly unmounted), read from the file, not through
+/// the driver.
+fn marked_clean(path: &str) -> bool {
+    use std::os::unix::fs::FileExt;
+    let f = std::fs::File::open(path).expect("open image");
+    let mut b = [0u8; 2];
+    f.read_exact_at(&mut b, 1024 + 0x3A).expect("read s_state");
+    u16::from_le_bytes(b) & 1 == 1
+}
+
+fn kernel_verdict(script: &str, path: &str) -> Result<(), String> {
+    let out = Command::new("bash").arg(script).arg(path).output().expect("run verifier");
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    if out.status.success() { Ok(()) } else { Err(text) }
+}
+
+/// W15 (L2-O17): whatever write the device dies on, `rename_file` over an
+/// existing name must never leave the destination name unreachable. Either the
+/// old destination or the source's data answers to it; when the old
+/// destination does, the source is still under its old name. And what e2fsck
+/// finds is leak-class only, flagged by the not-clean bit.
+#[test]
+fn w15_rename_over_existing_never_loses_the_destination_name() {
+    let Some(script) = verify_script() else {
+        panic!("oracle required: this test cannot pass without e2fsck");
+    };
+    let src_data: Vec<u8> = (0..9000u32).map(|i| (i % 251) as u8).collect();
+    let dst_data: Vec<u8> = (0..13000u32).map(|i| (i % 241) as u8 ^ 0x5a).collect();
+
+    for name in ["big-4k.img", "csum-uuid-4k.img"] {
+        let base = scratch(name, "w15-base");
+        let (src_ino, dst_ino) = {
+            let mut fs = open(&base);
+            fs.create_file(2, "src.bin", &src_data, FileType::Regular).expect("create src");
+            fs.create_file(2, "dst.bin", &dst_data, FileType::Regular).expect("create dst");
+            fs.flush().expect("flush");
+            (fs.resolve("/src.bin").expect("src").number, fs.resolve("/dst.bin").expect("dst").number)
+        };
+        kernel_verdict(&script, &base).unwrap_or_else(|t| panic!("{name}: the base image is not clean:\n{t}"));
+        let len = std::fs::metadata(&base).expect("stat").len();
+
+        // Unlimited run: how many writes the rename makes.
+        let total = {
+            let img = scratch(name, "w15-count");
+            std::fs::copy(&base, &img).expect("copy base");
+            let dev = FailAfterNWrites::new(FileDevice::open_writable(&img, len).expect("open"), usize::MAX);
+            let mut fs = Ext4::mount(dev).expect("mount");
+            fs.rename_file(2, "src.bin", "dst.bin").expect("unlimited rename");
+            let n = fs.device_mut().attempted.load(Ordering::SeqCst);
+            assert!(n >= 4, "{name}: a rename over an existing name made only {n} writes");
+            n
+        };
+
+        let mut violations = Vec::new();
+        let mut flagged = 0;
+        for n in 0..=total {
+            let img = scratch(name, &format!("w15-{n}"));
+            std::fs::copy(&base, &img).expect("copy base");
+            {
+                // The last iteration is the unlimited control: a budget of exactly
+                // `total` would still fail the trailing flush.
+                let budget = if n == total { usize::MAX } else { n };
+                let dev = FailAfterNWrites::new(FileDevice::open_writable(&img, len).expect("open"), budget);
+                let mut fs = Ext4::mount(dev).expect("mount");
+                let r = fs.rename_file(2, "src.bin", "dst.bin");
+                if n == total {
+                    r.expect("the full budget must succeed");
+                }
+            }
+
+            // Reachability, through the driver, on the post-failure image.
+            let fs = Ext4::mount(FileDevice::open(&img).expect("reopen")).expect("mount after failure");
+            match fs.read_file("/dst.bin") {
+                Err(e) => violations.push(format!("N={n}/{total}: /dst.bin is unreachable: {e}")),
+                Ok(got) if got == src_data => {}
+                Ok(got) if got == dst_data => match fs.read_file("/src.bin") {
+                    Ok(s) if s == src_data => {}
+                    other => violations.push(format!(
+                        "N={n}/{total}: /dst.bin is the old destination but the source is lost: {:?}",
+                        other.map(|v| v.len())
+                    )),
+                },
+                Ok(got) => violations.push(format!("N={n}/{total}: /dst.bin holds {} unknown bytes", got.len())),
+            }
+
+            let clean_flag = marked_clean(&img);
+            match kernel_verdict(&script, &img) {
+                Ok(()) => {}
+                Err(text) => {
+                    let bad = leak_class::non_leak_lines(&text, &[src_ino, dst_ino]);
+                    if !bad.is_empty() {
+                        violations.push(format!("N={n}/{total}: not leak-class: {bad:?}"));
+                    }
+                    if clean_flag {
+                        violations.push(format!("N={n}/{total}: e2fsck dirty but the image reads clean"));
+                    } else {
+                        flagged += 1;
+                    }
+                }
+            }
+            if n == total {
+                assert!(clean_flag, "{name}: the complete rename must end marked clean");
+                assert!(fs.read_file("/src.bin").is_err(), "{name}: src.bin must be gone after the rename");
+            }
+        }
+        assert!(flagged > 0, "{name}: vacuity: some boundary must leave a flagged, dirty image");
+        assert!(
+            violations.is_empty(),
+            "{name}: {} of {} boundaries violate the rename contract:\n{}",
+            violations.len(),
+            total + 1,
+            violations.join("\n")
+        );
+    }
+}
+
+/// Logs every write and flush in order, passing them through.
+struct OpLog {
+    inner: FileDevice,
+    ops: std::sync::Mutex<Vec<(char, u64)>>,
+}
+
+impl luks_core::device::ReadAt for OpLog {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> luks_core::error::Result<()> {
+        self.inner.read_at(offset, buf)
+    }
+    fn len(&self) -> Option<u64> {
+        self.inner.len()
+    }
+}
+
+impl luks_core::device::WriteAt for OpLog {
+    fn write_at(&self, offset: u64, buf: &[u8]) -> luks_core::error::Result<()> {
+        self.ops.lock().expect("log").push(('W', offset));
+        self.inner.write_at(offset, buf)
+    }
+    fn flush(&self) -> luks_core::error::Result<()> {
+        self.ops.lock().expect("log").push(('F', 0));
+        self.inner.flush()
+    }
+}
+
+/// W15 barriers (reordering-cache sensitivity): a flush must separate the
+/// destination retarget, the old-name unlink, and the first write that frees
+/// the replaced inode. Without them a reordering cache can land the frees (or
+/// the unlink) ahead of the link, and a crash loses a file the sweep above
+/// (which models in-order writes only) cannot see. Verified to FAIL with the
+/// flushes removed.
+#[test]
+fn w15_rename_flushes_between_link_unlink_and_free() {
+    let base = scratch("big-4k.img", "w15-order");
+    let (dst_ino_off, len) = {
+        let mut fs = open(&base);
+        fs.create_file(2, "src.bin", &[1u8; 5000], FileType::Regular).expect("src");
+        fs.create_file(2, "dst.bin", &[2u8; 5000], FileType::Regular).expect("dst");
+        fs.flush().expect("flush");
+        let ino = fs.resolve("/dst.bin").expect("dst").number;
+        (fs.test_inode_offset(ino).expect("offset"), std::fs::metadata(&*base).expect("stat").len())
+    };
+    let dev = OpLog { inner: FileDevice::open_writable(&*base, len).expect("open"), ops: Default::default() };
+    let mut fs = Ext4::mount(dev).expect("mount");
+    fs.rename_file(2, "src.bin", "dst.bin").expect("rename");
+    let ops = fs.device_mut().ops.lock().expect("log").clone();
+
+    let zero = ops.iter().position(|&(k, o)| k == 'W' && o == dst_ino_off).expect("the replaced inode record is zeroed");
+    // The two directory-block writes are the writes just before the zeroing.
+    let writes: Vec<usize> = (0..zero).filter(|&i| ops[i].0 == 'W').collect();
+    assert!(writes.len() >= 2, "vacuity: expected retarget and unlink writes before the free");
+    let (retarget, unlink) = (writes[writes.len() - 2], writes[writes.len() - 1]);
+    assert_eq!(ops[retarget].1, ops[unlink].1, "retarget and unlink both rewrite the same directory block");
+    let flush_between = |a: usize, b: usize| ops[a + 1..b].iter().any(|&(k, _)| k == 'F');
+    assert!(flush_between(retarget, unlink), "no flush between the retarget and the old-name unlink: {ops:?}");
+    assert!(flush_between(unlink, zero), "no flush between the old-name unlink and freeing the replaced inode: {ops:?}");
 }

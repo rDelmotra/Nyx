@@ -9,32 +9,20 @@
 //! - `create`: `create_empty_file`, `create_directory`, `create_directory_in_dir`
 //! - `rename`: `rename` (927 lines on its own; further split into private
 //!   helpers within that module)
-//! - `data`: `write_file_data`, `create_file_with_data`
+//! - `data`: `write_file_data`
 //! - `delete`: `delete_file`
 //! - `chunk`: `allocate_data_chunk` (thin driver over `chunk_alloc`)
-//!
-//! The extent-tree reconciliation free functions previously colocated here
-//! (`record_cow_result`, `find_item_in_tree`, `find_max_inode`,
-//! `converge_and_finalize`) now live in `super::extent_tree`, which already
-//! owns the `ExtentTree`/`BlockGroupItem` types they mutate. They are
-//! re-exported below so existing `write::txn::{...}` import paths keep
-//! resolving unchanged.
 
 mod chunk;
 mod create;
 mod data;
-mod delete;
+pub(crate) mod delete;
 mod mtime;
 mod rename;
 
 use std::collections::HashMap;
 
 use crate::fs::btrfs::TreeRoot;
-
-#[allow(unused_imports)]
-pub(crate) use crate::fs::btrfs::write::extent_tree::{
-    converge_and_finalize, find_max_inode, record_cow_result,
-};
 
 /// A completed, self-consistent in-memory btrfs transaction.
 #[derive(Clone)]
@@ -48,4 +36,11 @@ pub struct Transaction {
     pub pending_blocks: HashMap<u64, Vec<u8>>,
     pub pending_data: Vec<(u64, Vec<u8>)>,
     pub final_allocator: Option<crate::fs::btrfs::write::alloc::FreeSpaceMap>,
+    /// Chunks created by this transaction. The commit resolves addresses
+    /// through them, but the live chunk map only learns them after the commit
+    /// succeeded (B4).
+    pub new_chunks: Vec<crate::fs::btrfs::chunk::Chunk>,
+    /// The chunk tree's DEV_ITEM `bytes_used` as written by this transaction
+    /// (absolute). The commit stores it in the superblock's embedded dev_item.
+    pub final_dev_bytes_used: Option<u64>,
 }

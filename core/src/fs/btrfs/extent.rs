@@ -27,7 +27,7 @@
 
 use super::inode::Inode;
 use super::tree;
-use super::{Btrfs, Key};
+use super::{Btrfs, Key, Verified};
 use crate::device::ReadAt;
 use crate::error::{LuksError, Result};
 
@@ -151,9 +151,32 @@ impl FileExtent {
     }
 }
 
+/// `BTRFS_INODE_NODATASUM`: the inode keeps no data checksums.
+pub const INODE_NODATASUM: u64 = 1;
+
+/// How much of a read was backed by data checksums.
+///
+/// A read that returns `Ok` is verified except where this says otherwise.
+/// Holes, preallocated ranges and inline data are not counted: holes have no
+/// bytes to check and inline data lives in a checksummed tree node.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReadCoverage {
+    /// Bytes read from data extents and matched against stored checksums.
+    pub verified_bytes: u64,
+    /// Bytes read from data extents of a `NODATASUM` inode: not verified, by
+    /// the file's own contract.
+    pub unverified_bytes: u64,
+}
+
 impl<D: ReadAt> Btrfs<D> {
     /// Read from a file by inode. Returns the number of bytes read, which is
     /// short only at end of file.
+    ///
+    /// Every byte returned is either read from the device or proven to be a
+    /// hole by the extent layout; anything else is an error (INV-4). Data
+    /// from a regular extent must be covered by a matching checksum unless the
+    /// inode is `NODATASUM`; see [`ReadCoverage`] for what was and was not
+    /// verified.
     pub fn read_inode_data(
         &self,
         tree: u64,
@@ -161,6 +184,65 @@ impl<D: ReadAt> Btrfs<D> {
         offset: u64,
         buf: &mut [u8],
     ) -> Result<usize> {
+        self.read_inode_data_covered(tree, inode, offset, buf)
+            .map(|(n, _)| n)
+    }
+
+    /// [`Btrfs::read_inode_data`], also reporting how much of what was read
+    /// was checksum-verified.
+    pub fn read_inode_data_covered(
+        &self,
+        tree: u64,
+        inode: &Inode,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> Result<(usize, ReadCoverage)> {
+        let mut cov = ReadCoverage::default();
+        let n = self.read_inode_data_inner(tree, inode, offset, buf, &mut cov)?;
+        Ok((n, cov))
+    }
+
+    /// Read `out.len()` bytes of file data at `logical`, enforcing the
+    /// checksum policy for this inode.
+    fn read_file_data(
+        &self,
+        logical: u64,
+        out: &mut [u8],
+        nodatasum: bool,
+        cov: &mut ReadCoverage,
+    ) -> Result<()> {
+        if nodatasum {
+            // The inode says it has no checksums, and the kernel does not look
+            // for them either: a leftover csum item from an earlier owner of
+            // these blocks must not turn a good read into an error.
+            self.read_logical(logical, out)?;
+            cov.unverified_bytes += out.len() as u64;
+            return Ok(());
+        }
+        match self.read_data(logical, out)? {
+            Verified::All => {
+                cov.verified_bytes += out.len() as u64;
+                Ok(())
+            }
+            Verified::Partial { .. } => Err(LuksError::CorruptFs(
+                "btrfs file data has no checksum although the inode is not NODATASUM",
+            )),
+            Verified::NoChecksumTree => Err(LuksError::CorruptFs(
+                "btrfs file data cannot be verified: the filesystem has no checksum tree",
+            )),
+        }
+    }
+
+    fn read_inode_data_inner(
+        &self,
+        tree: u64,
+        inode: &Inode,
+        offset: u64,
+        buf: &mut [u8],
+        cov: &mut ReadCoverage,
+    ) -> Result<usize> {
+        let nodatasum = inode.flags & INODE_NODATASUM != 0;
+        let no_holes = self.superblock().has_no_holes();
         if offset >= inode.size {
             return Ok(0);
         }
@@ -208,6 +290,11 @@ impl<D: ReadAt> Btrfs<D> {
             let extent = match covering {
                 // The item starts after `pos`: everything up to it is a gap.
                 Some(e) if e.file_offset > pos => {
+                    if !no_holes {
+                        return Err(LuksError::CorruptFs(
+                            "btrfs file has a gap with no hole extent on a filesystem without NO_HOLES",
+                        ));
+                    }
                     let gap = (e.file_offset - pos).min((want - done) as u64) as usize;
                     buf[done..done + gap].fill(0);
                     done += gap;
@@ -224,8 +311,16 @@ impl<D: ReadAt> Btrfs<D> {
                     continue;
                 }
                 Some(e) => e,
-                // No item at all from here on: the rest of the range is a hole.
+                // No item at all from here on. With NO_HOLES the rest of the
+                // range up to the inode size is a hole. Without it every hole
+                // has an item, so a missing one means the extent items are
+                // gone or unreachable, and zeros would be invented data.
                 None => {
+                    if !no_holes {
+                        return Err(LuksError::CorruptFs(
+                            "btrfs file extents end before the inode size on a filesystem without NO_HOLES",
+                        ));
+                    }
                     buf[done..want].fill(0);
                     done = want;
                     break;
@@ -246,7 +341,7 @@ impl<D: ReadAt> Btrfs<D> {
                 // will therefore decompress the same extent more than once;
                 // acceptable, and noted rather than cached, because the reads
                 // that matter are far larger than 128 KiB.
-                let plain = self.decompress_extent(&extent)?;
+                let plain = self.decompress_extent(&extent, nodatasum, cov)?;
                 let start = (extent.offset + within) as usize;
                 let end = start
                     .checked_add(take)
@@ -278,7 +373,7 @@ impl<D: ReadAt> Btrfs<D> {
                 // the checksum tree. This is the difference between "we copied
                 // the bytes that were there" and "we copied the bytes that
                 // were written", which on a failing drive is the whole point.
-                self.read_data(extent.disk_bytenr + start, out)?;
+                self.read_file_data(extent.disk_bytenr + start, out, nodatasum, cov)?;
             }
 
             done += take;
@@ -290,7 +385,12 @@ impl<D: ReadAt> Btrfs<D> {
     }
 
     /// Decompress a whole compressed extent, inline or not.
-    fn decompress_extent(&self, extent: &FileExtent) -> Result<Vec<u8>> {
+    fn decompress_extent(
+        &self,
+        extent: &FileExtent,
+        nodatasum: bool,
+        cov: &mut ReadCoverage,
+    ) -> Result<Vec<u8>> {
         let expected = extent.ram_bytes as usize;
         match &extent.inline {
             // An inline extent can be compressed too: the leaf holds the
@@ -308,7 +408,7 @@ impl<D: ReadAt> Btrfs<D> {
                 // corrupt extent is reported as corrupt rather than as a
                 // decompression failure, and the decompressor is never fed
                 // bytes the filesystem already knows are wrong.
-                self.read_data(extent.disk_bytenr, &mut raw)?;
+                self.read_file_data(extent.disk_bytenr, &mut raw, nodatasum, cov)?;
                 super::compress::decompress(
                     extent.compression,
                     &raw,

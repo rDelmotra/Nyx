@@ -12,61 +12,29 @@ object Trace {
     const val TAG = "luks"
     const val TAG_ERR = "luks_err"
 
-    private val logLock = Any()
-    private var sessionLogFile: java.io.File? = null
-    private var sessionOldLogFile: java.io.File? = null
-    private val logDateFormat = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", java.util.Locale.US)
-    private const val MAX_LOG_SIZE_BYTES = 2 * 1024 * 1024L // 2 MiB
+    /** Test seam: sees every line the debug build would write, after formatting. */
+    @Volatile
+    internal var testSink: ((String) -> Unit)? = null
 
-    fun initFileLogging(context: android.content.Context) {
-        synchronized(logLock) {
-            val base = context.filesDir
-            sessionLogFile = java.io.File(base, "luks_session.log")
-            sessionOldLogFile = java.io.File(base, "luks_session.log.old")
-        }
-    }
-
+    /**
+     * The on-disk copy is a `trace{lvl,msg}` line in the structured event log (F9), the same
+     * file as every other event; there is no separate text log any more. The text is exactly
+     * what was formatted for logcat, so the privacy rules on callers are unchanged.
+     */
     private fun appendToFile(level: String, tag: String, text: String) {
         if (!BuildConfig.DEBUG) return
-        synchronized(logLock) {
-            val cur = sessionLogFile ?: return
-            val prev = sessionOldLogFile
-            runCatching {
-                if (cur.exists() && cur.length() > MAX_LOG_SIZE_BYTES) {
-                    if (prev != null && prev.exists()) {
-                        prev.delete()
-                    }
-                    if (prev != null) {
-                        cur.renameTo(prev)
-                    }
-                }
-                val ts = logDateFormat.format(java.util.Date())
-                cur.appendText("$ts $level/$tag: $text\n")
-            }
-        }
+        testSink?.invoke(text)
+        dev.luksandroid.log.EventLog.trace(isError = level == "E", msg = if (tag == TAG) text else "$tag: $text")
     }
 
-    fun readSessionLog(): String {
-        return synchronized(logLock) {
-            runCatching {
-                val cur = sessionLogFile
-                if (cur != null && cur.exists()) {
-                    cur.readText()
-                } else {
-                    ""
-                }
-            }.getOrDefault("")
-        }
-    }
+    /** Newest part of the on-disk event log, for the diagnostics screen. */
+    fun readSessionLog(): String = dev.luksandroid.log.EventLog.readTail(SESSION_LOG_VIEW_BYTES)
 
     fun clearSessionLog() {
-        synchronized(logLock) {
-            runCatching {
-                sessionLogFile?.delete()
-                sessionOldLogFile?.delete()
-            }
-        }
+        dev.luksandroid.log.EventLog.clear()
     }
+
+    private const val SESSION_LOG_VIEW_BYTES = 192 * 1024
 
     @Suppress("DEPRECATION")
     private fun currentThreadTag(): String = "tid=${Thread.currentThread().id}"
@@ -159,6 +127,22 @@ object Trace {
     fun throwableSummary(t: Throwable): String {
         val code = (t as? LuksException)?.code
         return if (code != null) "${t.javaClass.simpleName}[code=$code]" else t.javaClass.simpleName
+    }
+
+    /**
+     * Runs best-effort cleanup (close, delete, unregister). A failure is logged
+     * with its [stage] and exception class, never rethrown, never its text:
+     * cleanup must not mask the failure the caller is already handling, and
+     * must not vanish either. Cancellation always propagates.
+     */
+    inline fun cleanup(stage: String, block: () -> Unit) {
+        try {
+            block()
+        } catch (c: kotlinx.coroutines.CancellationException) {
+            throw c
+        } catch (t: Throwable) {
+            e("$stage: cleanup failed: ${throwableSummary(t)}")
+        }
     }
 
     /**

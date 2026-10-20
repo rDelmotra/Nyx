@@ -29,6 +29,25 @@ pub trait WriteAt: ReadAt {
     /// blocks that were never written. Callers are expected to flush at the
     /// points where an interruption must still leave something consistent.
     fn flush(&self) -> Result<()>;
+
+    /// What the device has said about whether [`flush`](Self::flush) reaches
+    /// the medium: `Some(true)` once a flush command was accepted,
+    /// `Some(false)` if the drive rejected every form of it (so `flush` is a
+    /// silent `Ok`), `None` if nothing has asked yet or the device cannot say.
+    /// Reports what was observed, never a prediction.
+    fn flush_support(&self) -> Option<bool> {
+        None
+    }
+
+    /// Decide, before the first write, whether this device can honour the
+    /// write ordering a filesystem commit depends on (tree blocks durable
+    /// before the superblock that points at them). Issues no write. A device
+    /// that cannot guarantee it returns [`LuksError::UnsafeWriteCache`].
+    /// The default is `Ok`: files and in-memory images have no volatile cache
+    /// this layer could learn about.
+    fn check_write_safety(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub trait ReadAt {
@@ -75,6 +94,14 @@ impl<D: WriteAt + ?Sized> WriteAt for &D {
 
     fn flush(&self) -> Result<()> {
         (**self).flush()
+    }
+
+    fn flush_support(&self) -> Option<bool> {
+        (**self).flush_support()
+    }
+
+    fn check_write_safety(&self) -> Result<()> {
+        (**self).check_write_safety()
     }
 }
 

@@ -17,7 +17,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.HourglassEmpty
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material.icons.filled.Sync
@@ -28,11 +27,26 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.rememberModalBottomSheetState
+import androidx.compose.foundation.clickable
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.graphics.Color
+import dev.luksandroid.Health
+import dev.luksandroid.ui.theme.WarningAmber
+import dev.luksandroid.ui.theme.StateLocked as HealthBlue
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -45,18 +59,41 @@ import androidx.compose.ui.unit.sp
 import dev.luksandroid.formatSize
 import dev.luksandroid.session.LuksSession
 import dev.luksandroid.session.SessionState
-import dev.luksandroid.ui.theme.SuccessGreen
-import dev.luksandroid.ui.theme.WarningAmber
+import androidx.compose.foundation.border
+import androidx.compose.material.icons.filled.LockOpen
+import androidx.compose.ui.platform.LocalContext
+import dev.luksandroid.ui.LuksHaptics
+import dev.luksandroid.ui.theme.DarkOutline
+import dev.luksandroid.ui.theme.DarkOutlineVariant
+import dev.luksandroid.ui.theme.DestructiveRed
+import dev.luksandroid.ui.theme.StateLocked
+import dev.luksandroid.ui.theme.StateUnlocked
+import dev.luksandroid.ui.theme.TextMuted
+import dev.luksandroid.ui.theme.TextPrimary
 import kotlinx.coroutines.launch
+
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.shape.CircleShape
 
 @Composable
 fun SessionStatusHeader(
     modifier: Modifier = Modifier,
 ) {
+    val context = LocalContext.current
     val sessionState by LuksSession.state.collectAsState()
     val activeLeases by LuksSession.activeLeasesFlow.collectAsState()
-    val remainingIdleMs by LuksSession.remainingIdleMs.collectAsState()
+    val writeHolds by LuksSession.writeHoldsFlow.collectAsState()
     val scope = rememberCoroutineScope()
+    val health by LuksSession.health.collectAsState()
+    var showHealthSheet by remember { mutableStateOf(false) }
+
+    LaunchedEffect(sessionState) {
+        when (sessionState) {
+            is SessionState.Detached -> LuksHaptics.deadboltLock(context)
+            is SessionState.Failed -> LuksHaptics.error(context)
+            else -> {}
+        }
+    }
 
     AnimatedVisibility(
         visible = sessionState !is SessionState.Locked,
@@ -69,47 +106,49 @@ fun SessionStatusHeader(
                 val volInfo = state.volume.info
                 val label = volInfo.label.ifBlank { state.partition.label }
                 val fsType = volInfo.fsType.uppercase()
-                val isTimerPaused = activeLeases > 0
+                val isWriting = isSessionWriting(activeLeases, writeHolds)
 
                 Surface(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 4.dp),
-                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.7f),
-                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                    color = MaterialTheme.colorScheme.surface,
+                    shadowElevation = 3.dp,
                 ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                    Column(modifier = Modifier.fillMaxWidth()) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 10.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween,
                     ) {
-                        // Left: Storage Icon, Label, FileSystem badge, and Live Timer/Lease chip
+                        // Left: Storage Icon, Label, FileSystem badge, and Calm status chip
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
                             modifier = Modifier.weight(1f, fill = false),
                         ) {
                             Icon(
-                                imageVector = Icons.Default.Storage,
-                                contentDescription = "Drive",
-                                tint = SuccessGreen,
-                                modifier = Modifier.size(18.dp),
+                                imageVector = Icons.Default.LockOpen,
+                                contentDescription = "Unlocked",
+                                tint = StateUnlocked,
+                                modifier = Modifier.size(17.dp),
                             )
                             Spacer(modifier = Modifier.width(6.dp))
                             Text(
                                 text = label,
-                                style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                                style = MaterialTheme.typography.titleSmall.copy(
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 13.sp,
+                                ),
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
-                                color = MaterialTheme.colorScheme.onSurface,
+                                color = TextPrimary,
                             )
                             Spacer(modifier = Modifier.width(6.dp))
                             // Filesystem pill badge
                             Box(
                                 modifier = Modifier
                                     .clip(RoundedCornerShape(4.dp))
-                                    .background(MaterialTheme.colorScheme.primaryContainer)
+                                    .background(StateUnlocked.copy(alpha = 0.15f))
                                     .padding(horizontal = 5.dp, vertical = 1.dp),
                             ) {
                                 Text(
@@ -118,77 +157,109 @@ fun SessionStatusHeader(
                                         fontWeight = FontWeight.Bold,
                                         fontSize = 10.sp,
                                     ),
-                                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                    color = StateUnlocked,
                                 )
                             }
                             Spacer(modifier = Modifier.width(8.dp))
-                            // Live lease / relock countdown pill
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(4.dp))
-                                    .background(
-                                        if (isTimerPaused) WarningAmber.copy(alpha = 0.15f)
-                                        else MaterialTheme.colorScheme.surfaceVariant
+                            // Calm Sync / Synced status chip (No anxious countdown clock)
+                            if (isWriting) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(4.dp))
+                                        .background(MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.5f))
+                                        .padding(horizontal = 6.dp, vertical = 2.dp),
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Sync,
+                                        contentDescription = null,
+                                        tint = StateUnlocked,
+                                        modifier = Modifier.size(11.dp),
                                     )
-                                    .padding(horizontal = 6.dp, vertical = 2.dp),
-                            ) {
-                                Icon(
-                                    imageVector = if (isTimerPaused) Icons.Default.Sync else Icons.Default.HourglassEmpty,
-                                    contentDescription = null,
-                                    tint = if (isTimerPaused) WarningAmber else MaterialTheme.colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.size(12.dp),
-                                )
-                                Spacer(modifier = Modifier.width(3.dp))
-                                Text(
-                                    text = if (isTimerPaused) {
-                                        "$activeLeases active"
-                                    } else {
-                                        formatIdleTime(remainingIdleMs)
-                                    },
-                                    style = MaterialTheme.typography.labelSmall.copy(
-                                        fontFamily = FontFamily.Monospace,
-                                        fontSize = 11.sp,
-                                        fontWeight = FontWeight.Medium,
-                                    ),
-                                    color = if (isTimerPaused) WarningAmber else MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text(
+                                        text = "Syncing changes…",
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            fontSize = 10.sp,
+                                            fontWeight = FontWeight.Medium,
+                                        ),
+                                        color = StateUnlocked,
+                                    )
+                                }
+                            } else {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(4.dp))
+                                        .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f))
+                                        .padding(horizontal = 6.dp, vertical = 2.dp),
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(5.dp)
+                                            .clip(CircleShape)
+                                            .background(StateUnlocked)
+                                    )
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text(
+                                        text = "Synced",
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            fontSize = 10.sp,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        ),
+                                    )
+                                }
                             }
+                            Spacer(modifier = Modifier.width(6.dp))
+                            HealthDot(health = health, onClick = { showHealthSheet = true })
                         }
 
                         Spacer(modifier = Modifier.width(8.dp))
 
-                        // 1-tap Lock button
+                        // Anchored deliberate Lock Vault button
                         FilledTonalButton(
                             onClick = {
+                                LuksHaptics.deadboltLock(context)
                                 scope.launch { LuksSession.lock() }
                             },
                             colors = ButtonDefaults.filledTonalButtonColors(
-                                containerColor = MaterialTheme.colorScheme.errorContainer,
-                                contentColor = MaterialTheme.colorScheme.onErrorContainer,
+                                containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                                contentColor = MaterialTheme.colorScheme.onSurface,
                             ),
                             contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
-                            modifier = Modifier.height(32.dp),
+                            modifier = Modifier.height(30.dp),
                             shape = RoundedCornerShape(8.dp),
+                            border = BorderStroke(1.dp, DarkOutlineVariant),
                         ) {
                             Icon(
                                 imageVector = Icons.Default.Lock,
                                 contentDescription = null,
-                                modifier = Modifier.size(14.dp),
+                                modifier = Modifier.size(13.dp),
+                                tint = StateLocked,
                             )
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("Lock", style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold))
+                            Spacer(modifier = Modifier.width(5.dp))
+                            Text(
+                                text = if (isWriting) "Lock when ready" else "Lock Vault",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    fontWeight = FontWeight.SemiBold,
+                                    fontSize = 11.sp,
+                                ),
+                            )
                         }
                     }
+                    androidx.compose.material3.HorizontalDivider(color = DarkOutline)
                 }
             }
+            if (showHealthSheet) HealthSheetContent(health = health, onDismiss = { showHealthSheet = false })
+        }
 
             is SessionState.Detached -> {
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 4.dp),
-                    color = MaterialTheme.colorScheme.errorContainer,
+                        .padding(horizontal = 16.dp, vertical = 4.dp)
+                        .border(1.dp, DarkOutline, RoundedCornerShape(8.dp)),
+                    color = MaterialTheme.colorScheme.surfaceVariant,
                     shape = RoundedCornerShape(8.dp),
                 ) {
                     Row(
@@ -196,16 +267,16 @@ fun SessionStatusHeader(
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Icon(
-                            imageVector = Icons.Default.Warning,
+                            imageVector = Icons.Default.Lock,
                             contentDescription = "Detached",
-                            tint = MaterialTheme.colorScheme.onErrorContainer,
+                            tint = StateLocked,
                             modifier = Modifier.size(18.dp),
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = "Drive detached: ${state.message}",
+                            text = "Session secured. Keys wiped from memory.",
                             style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onErrorContainer,
+                            color = TextPrimary,
                         )
                     }
                 }
@@ -215,8 +286,9 @@ fun SessionStatusHeader(
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 4.dp),
-                    color = MaterialTheme.colorScheme.errorContainer,
+                        .padding(horizontal = 16.dp, vertical = 4.dp)
+                        .border(1.dp, DestructiveRed.copy(alpha = 0.3f), RoundedCornerShape(8.dp)),
+                    color = MaterialTheme.colorScheme.surfaceVariant,
                     shape = RoundedCornerShape(8.dp),
                 ) {
                     Row(
@@ -226,14 +298,14 @@ fun SessionStatusHeader(
                         Icon(
                             imageVector = Icons.Default.Warning,
                             contentDescription = "Failed",
-                            tint = MaterialTheme.colorScheme.onErrorContainer,
+                            tint = DestructiveRed,
                             modifier = Modifier.size(18.dp),
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = "Session error: ${state.message}",
+                            text = "Could not unlock: ${state.message}",
                             style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onErrorContainer,
+                            color = TextPrimary,
                         )
                     }
                 }
@@ -274,9 +346,64 @@ fun SessionStatusHeader(
     }
 }
 
-private fun formatIdleTime(ms: Long): String {
-    val totalSecs = (ms / 1000).coerceAtLeast(0)
-    val mins = totalSecs / 60
-    val secs = totalSecs % 60
-    return "%d:%02d".format(mins, secs)
+/** Busy when any lease is open or a SAF write holds the session. */
+internal fun isSessionWriting(activeLeases: Int, writeHolds: Int): Boolean = activeLeases > 0 || writeHolds > 0
+
+/** Theme colour for a health tone: blue = OK, amber = minor, red = errors, grey = checking or unknown. */
+@Composable
+private fun healthColor(tone: HealthTone): Color = when (tone) {
+    HealthTone.OK -> HealthBlue
+    HealthTone.MINOR -> WarningAmber
+    HealthTone.ERROR -> DestructiveRed
+    HealthTone.NEUTRAL -> TextMuted
+}
+
+/** The coloured dot and short label; tapping opens the findings sheet. */
+@Composable
+private fun HealthDot(health: Health, onClick: () -> Unit) {
+    val badge = HealthPresentation.badge(health)
+    val color = healthColor(badge.tone)
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .clip(RoundedCornerShape(4.dp))
+            .clickable(onClick = onClick)
+            .semantics {
+                contentDescription = badge.description
+                role = Role.Button
+            }
+            .padding(horizontal = 4.dp, vertical = 2.dp),
+    ) {
+        Box(modifier = Modifier.size(8.dp).clip(CircleShape).background(color))
+        Spacer(modifier = Modifier.width(4.dp))
+        Text(
+            text = badge.label,
+            style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp, fontWeight = FontWeight.Medium),
+            color = color,
+            maxLines = 1,
+        )
+    }
+}
+
+@Composable
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
+private fun HealthSheetContent(health: Health, onDismiss: () -> Unit) {
+    val sheet = HealthPresentation.sheet(health)
+    val color = healthColor(HealthPresentation.badge(health).tone)
+    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState()) {
+        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(modifier = Modifier.size(10.dp).clip(CircleShape).background(color))
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(sheet.title, style = MaterialTheme.typography.titleMedium, color = TextPrimary)
+            }
+            Spacer(modifier = Modifier.height(12.dp))
+            sheet.lines.forEach { line ->
+                Text(line, style = MaterialTheme.typography.bodyMedium, color = TextPrimary, modifier = Modifier.padding(vertical = 2.dp))
+            }
+            if (sheet.lines.isNotEmpty()) Spacer(modifier = Modifier.height(12.dp))
+            Text(sheet.action, style = MaterialTheme.typography.bodyMedium, color = TextMuted)
+            Spacer(modifier = Modifier.height(24.dp))
+        }
+    }
 }

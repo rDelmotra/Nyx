@@ -1,0 +1,17 @@
+{"t":1790000060007,"seq":1,"sid":"-","src":"kt","ev":"process_start","n":4222}
+{"t":1790000060014,"seq":2,"sid":"11111111","src":"kt","ev":"unlock_fail","stage":"unlock","exc":"LuksException","code":2}
+{"t":1790000060021,"seq":3,"sid":"e5f60718","src":"kt","ev":"session_header","app":"0.4.0","git":"d60ee82","model":"pixel_7","sdk":34,"vid":1921,"pid":21889,"dev_bytes":500107862016,"sector":512,"flush":true,"max_xfer":1048576,"fs":"btrfs","cipher":"aes-xts-plain64","key_bits":512,"write":true}
+{"t":1790000060028,"seq":4,"sid":"e5f60718","src":"kt","ev":"unlock","ms":3900}
+{"t":1790000060035,"seq":5,"sid":"e5f60718","src":"kt","ev":"health","verdict":"leaks","reason":"write_safe","ms":120,"n":1}
+{"t":1790000060042,"seq":6,"sid":"e5f60718","src":"kt","ev":"health_finding","kind":"leaked_extent","n":3}
+{"t":1790000060049,"seq":7,"sid":"e5f60718","src":"kt","ev":"xfer_queued","xfer":1,"op":"import","n":1,"bytes":52428800}
+{"t":1790000060056,"seq":8,"sid":"e5f60718","src":"kt","ev":"xfer_start","xfer":1}
+{"t":1790000060063,"seq":9,"sid":"e5f60718","src":"kt","ev":"xfer_phase","xfer":1,"stage":"begin","ms":4}
+{"t":1790000060070,"seq":10,"sid":"e5f60718","src":"kt","ev":"xfer_phase","xfer":1,"stage":"write","ms":4100,"bytes":52428800}
+{"t":1790000060077,"seq":11,"sid":"e5f60718","src":"kt","ev":"xfer_phase","xfer":1,"stage":"finish","state":"enter"}
+{"t":1790000060084,"seq":12,"sid":"e5f60718","src":"kt","ev":"xfer_phase","xfer":1,"stage":"finish","ms":31,"bytes":52428800,"ino":257}
+{"t":1790000060091,"seq":13,"sid":"e5f60718","src":"kt","ev":"xfer_phase","xfer":1,"stage":"commit","state":"enter"}
+{"t":1790000060098,"seq":14,"sid":"e5f60718","src":"kt","ev":"xfer_phase","xfer":1,"stage":"commit","ms":88}
+{"t":1790000060105,"seq":15,"sid":"e5f60718","src":"rs","ev":"native","kind":"ext4_finish_file","nseq":10,"nt":1790000064000,"bytes":52428800,"ino":257}
+{"t":1790000060112,"seq":16,"sid":"e5f60718","src":"kt","ev":"xfer_end","xfer":1,"state":"completed","ms":4230,"bytes":52428800,"n":1}
+{"t":1790000060119,"seq":17,"sid":"e5f60718","src":"kt","ev":"lock","reason":"user"}

@@ -369,7 +369,13 @@ open class LuksDocumentsProvider(
                         // file is never advertised -- overwrite is out of scope (see
                         // openDocument); it is only ever set for a still-pending document,
                         // handled in the branch above before this block is ever reached.
-                        var flags = Document.FLAG_SUPPORTS_DELETE or Document.FLAG_SUPPORTS_RENAME
+                        // A subvolume root is never offered for delete/rename/move; the
+                        // core refuses those regardless.
+                        var flags = if (isDir && isSubvolumeDocument(volume, docId)) {
+                            0
+                        } else {
+                            Document.FLAG_SUPPORTS_DELETE or Document.FLAG_SUPPORTS_RENAME
+                        }
                         if (isDir && volume.canWrite) {
                             flags = flags or Document.FLAG_DIR_SUPPORTS_CREATE
                         }
@@ -417,7 +423,11 @@ open class LuksDocumentsProvider(
                             getMimeType(entry.name)
                         }
                         // Mirrors queryDocument's flag logic -- see the comment there.
-                        var flags = Document.FLAG_SUPPORTS_DELETE or Document.FLAG_SUPPORTS_RENAME
+                        var flags = if (entry.isSubvolume) {
+                            0
+                        } else {
+                            Document.FLAG_SUPPORTS_DELETE or Document.FLAG_SUPPORTS_RENAME
+                        }
                         if (isDir && volume.canWrite) {
                             flags = flags or Document.FLAG_DIR_SUPPORTS_CREATE
                         }
@@ -578,6 +588,15 @@ open class LuksDocumentsProvider(
         val docId = PendingDocuments.register(parentId, resolvedName)
         trackIssued(docId)
         return docId
+    }
+
+    /** True when [docId] names a btrfs subvolume root (looked up in its parent's listing). */
+    private fun isSubvolumeDocument(volume: LuksVolume, docId: String): Boolean {
+        val slash = docId.lastIndexOf('/')
+        val parent = if (slash <= 0) "/" else docId.substring(0, slash)
+        val name = docId.substring(slash + 1)
+        return runCatching { volume.listDir(parent).any { it.name == name && it.isSubvolume } }
+            .getOrDefault(false)
     }
 
     override fun deleteDocument(documentId: String?) {

@@ -43,7 +43,7 @@ use crate::fs::btrfs::Btrfs;
 
 /// How deep `delete_file`'s directory recursion may descend before refusing.
 /// See `delete_file_at_depth`.
-const MAX_DELETE_DEPTH: usize = 1024;
+pub(crate) const MAX_DELETE_DEPTH: usize = 1024;
 
 impl<D: WriteAt> Btrfs<D> {
     /// Commit any active batch session before performing non-batch operations.
@@ -53,11 +53,25 @@ impl<D: WriteAt> Btrfs<D> {
                 "attempted to commit active batch while a file writer is open",
             ));
         }
-        if let Some(batch) = self.active_batch.take() {
+        if self.commit_pending && self.active_batch.is_none() {
+            // A non-batch commit is in doubt and cannot be replayed from here;
+            // only `discard_active_batch` (fence/teardown) clears it.
+            return Err(LuksError::WriterBusy);
+        }
+        if let Some(mut batch) = self.active_batch.take() {
             if batch.has_uncommitted_files() {
-                let txn = batch.commit(self)?;
-                commit_transaction(self, txn)?;
+                // Non-destructive (D2/N7/N14): on failure the batch, with
+                // every acknowledged file in it, goes back to `active_batch`
+                // for a later retry. If the session is fenced the bridge
+                // discards it via `discard_active_batch`.
+                if let Err(ce) = batch.commit_and_rearm(self) {
+                    self.active_batch = Some(batch);
+                    return Err(ce.error);
+                }
             }
+            // Committed (or nothing to commit): drop it. The non-batch caller
+            // that follows builds its own transaction on the new committed
+            // trees, so a re-armed batch would be stale.
         }
         Ok(())
     }
@@ -79,6 +93,7 @@ impl<D: WriteAt> Btrfs<D> {
     /// filesystem `btrfs check` rejects.
     pub fn discard_active_batch(&mut self) -> bool {
         self.has_open_writer = false;
+        self.commit_pending = false;
         self.active_batch.take().is_some()
     }
 
@@ -124,29 +139,6 @@ impl<D: WriteAt> Btrfs<D> {
             Err(_) => (0, 0),
         };
         let (txn, new_ino) = Transaction::create_directory(self, parent_path, name, now_sec, now_nsec)?;
-        commit_transaction(self, txn)?;
-        Ok(new_ino)
-    }
-
-    /// Create a new directory named `name` inside `parent_ino`.
-    /// Performs this in a transaction and returns the new directory's inode number.
-    pub fn create_directory_in_dir(&mut self, parent_ino: u64, name: &str) -> Result<u64> {
-        self.commit_active_batch()?;
-        let located_parent = self.read_inode(self.fs_tree().bytenr, parent_ino)?;
-        let (now_sec, now_nsec) = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            Ok(d) => (d.as_secs(), d.subsec_nanos()),
-            Err(_) => (0, 0),
-        };
-        let (txn, new_ino) = Transaction::create_directory_in_dir(
-            self,
-            TargetTree::from_fs_tree(self.fs_tree()),
-            parent_ino,
-            located_parent.uid,
-            located_parent.gid,
-            name,
-            now_sec,
-            now_nsec,
-        )?;
         commit_transaction(self, txn)?;
         Ok(new_ino)
     }
@@ -199,7 +191,8 @@ impl<D: WriteAt> Btrfs<D> {
         let mut writer = self.begin_file(data.len() as u64)?;
         if !data.is_empty() {
             if let Err(e) = self.write_chunk(&mut writer, data) {
-                let _ = self.abandon_file(writer);
+                // A failed abandon (ledger/commit trouble) outranks the write error.
+                self.abandon_file(writer)?;
                 return Err(e);
             }
         }
@@ -209,11 +202,13 @@ impl<D: WriteAt> Btrfs<D> {
     }
 
     /// Delete the file or directory at `path`. A directory is emptied first,
-    /// depth-first, one committed transaction per child — the same shape as
-    /// deleting each child by hand, so a mid-tree failure (an unsupported
-    /// child type, a symlink, a subvolume boundary) leaves exactly what it
-    /// would if a caller had stopped there themselves, rather than a
-    /// half-applied larger operation.
+    /// depth-first, one committed transaction per child. Before anything is
+    /// written the whole subtree is walked read-only and every refusal the
+    /// per-item delete would raise (subvolume roots, hardlinks, immutable or
+    /// append-only items, shared extents, ...) is applied up front, so a
+    /// delete that cannot complete is refused whole. Only a power cut can
+    /// leave a partial delete, and then each committed child is a consistent
+    /// state.
     pub fn delete_file(&mut self, path: &str) -> Result<()> {
         self.commit_active_batch()?;
         // `.` and `..` are never real stored entries on btrfs (see
@@ -233,6 +228,10 @@ impl<D: WriteAt> Btrfs<D> {
                 "delete path containing '.' or '..' components".into(),
             ));
         }
+        // Refuse the whole delete up front if any part of it would be refused
+        // (a subvolume root, a nested subvolume, a hardlink, an immutable
+        // item, a shared extent, ...), so nothing is half-deleted.
+        txn::delete::preflight_recursive_delete(self, path)?;
         self.delete_file_at_depth(path, 0)
     }
 
@@ -298,8 +297,9 @@ impl<D: WriteAt> Btrfs<D> {
             self.commit_active_batch()?;
         }
         let (txn, new_chunk) = Transaction::allocate_data_chunk_excluding(self, reserved)?;
-        self.chunks.insert(new_chunk.clone());
         let logical = new_chunk.logical;
+        // `commit_transaction` adds `txn.new_chunks` to the live chunk map once
+        // the commit has succeeded (B4); a failed commit leaves the map alone.
         commit_transaction(self, txn)?;
         Ok(logical)
     }

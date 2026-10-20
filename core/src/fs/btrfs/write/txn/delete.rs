@@ -13,9 +13,141 @@ use crate::fs::btrfs::write::cow::cow_tree_mutate;
 use crate::fs::btrfs::write::extent_tree::{converge_and_finalize, record_cow_result, ExtentTree};
 use crate::fs::btrfs::write::gate;
 use crate::fs::btrfs::write::target::TargetTree;
+use crate::fs::btrfs::inode::Inode;
 use crate::fs::btrfs::Btrfs;
+use crate::fs::FileType;
 
 use super::Transaction;
+
+use crate::fs::btrfs::write::gate::{BTRFS_INODE_APPEND as INODE_APPEND, BTRFS_INODE_IMMUTABLE as INODE_IMMUTABLE};
+
+/// Everything about one inode (and the directory holding its name) that makes
+/// the writer refuse to delete it, with the kernel's semantics: an immutable
+/// or append-only inode cannot be unlinked, and no entry can be removed from
+/// an immutable or append-only directory. `None` means deletable as far as
+/// the inode items go (shared extents are checked separately).
+///
+/// Regular files, directories, symlinks, FIFOs, sockets and device nodes are
+/// all deletable: apart from a regular file's data extents (freed explicitly)
+/// they own only metadata items keyed under their own objectid, and the
+/// delete sweeps every such item.
+pub(crate) fn item_refusal(inode: &Inode, parent: &Inode) -> Option<&'static str> {
+    if parent.flags & (INODE_IMMUTABLE | INODE_APPEND) != 0 {
+        return Some("the containing directory is immutable or append-only");
+    }
+    if inode.flags & (INODE_IMMUTABLE | INODE_APPEND) != 0 {
+        return Some("the item is immutable or append-only");
+    }
+    if inode.file_type() == FileType::Unknown {
+        return Some("deleting items of unknown file type is not supported");
+    }
+    if inode.nlink > 1 {
+        return Some("deleting files with hardlinks (nlink > 1) is not supported");
+    }
+    None
+}
+
+/// Read-only walk of everything a recursive delete of `path` would remove,
+/// running every refusal the per-item delete would run, so the delete is
+/// refused as a whole (naming the first offending path) before anything is
+/// written. Iterative, with the same depth bound as the delete itself.
+pub(crate) fn preflight_recursive_delete<D: ReadAt>(fs: &Btrfs<D>, path: &str) -> Result<()> {
+    use crate::fs::FileType as Ft;
+    let subvol = |p: &str| {
+        LuksError::UnsupportedFsFeature(format!("subvolume deletion is not supported ({p})"))
+    };
+
+    gate::check_writeable_fs(fs.superblock())?;
+    let trimmed = path.trim_matches('/');
+    if trimmed.is_empty() {
+        return Err(LuksError::IsADirectory("/".into()));
+    }
+    let (parent_path, filename) = match trimmed.rsplit_once('/') {
+        Some((p, n)) => (p, n),
+        None => ("", trimmed),
+    };
+    let located_parent = fs.resolve_no_follow(fs.fs_tree(), parent_path)?;
+    if !located_parent.inode.file_type().is_dir() {
+        return Err(LuksError::NotADirectory(parent_path.to_string()));
+    }
+    gate::check_writeable_subvolume(&located_parent.tree)?;
+    let dirent = fs
+        .lookup(located_parent.tree.bytenr, located_parent.inode.objectid, filename)?
+        .ok_or_else(|| LuksError::NotFound(path.to_string()))?;
+    if dirent.is_subvolume() {
+        return Err(subvol(path));
+    }
+    let located = fs.resolve_no_follow(fs.fs_tree(), path)?;
+    if located.tree.objectid != located_parent.tree.objectid {
+        return Err(subvol(path));
+    }
+    gate::check_writeable_subvolume(&located.tree)?;
+    let tree = located.tree.bytenr;
+
+    let extent_tree = ExtentTree::read(fs)?;
+    gate::check_no_shared_history_or_quota(fs, &extent_tree)?;
+    let extents: HashMap<u64, usize> = extent_tree
+        .extents
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.bytenr, i))
+        .collect();
+
+    let mut seen = std::collections::HashSet::new();
+    let base = path.trim_end_matches('/').to_string();
+    let mut stack = vec![(base, located.inode, located_parent.inode, 0usize)];
+    while let Some((p, inode, parent, depth)) = stack.pop() {
+        if depth > super::super::MAX_DELETE_DEPTH {
+            return Err(LuksError::CorruptFs(
+                "directory delete recursed past a sane depth — likely a cycle",
+            ));
+        }
+        if let Some(why) = item_refusal(&inode, &parent) {
+            return Err(LuksError::UnsupportedFsFeature(format!("cannot delete {p}: {why}")));
+        }
+        if !seen.insert(inode.objectid) {
+            return Err(LuksError::CorruptFs("directory tree aliases an inode already visited"));
+        }
+        if inode.file_type() == Ft::Directory {
+            let children = fs.list_dir_by_inode(tree, inode.objectid)?;
+            let mut next = Vec::with_capacity(children.len());
+            for child in children {
+                let child_path = format!("{}/{}", p.trim_end_matches('/'), child.name);
+                if child.is_subvolume {
+                    return Err(subvol(&child_path));
+                }
+                match fs.lookup(tree, inode.objectid, &child.name)? {
+                    Some(d) if d.location.objectid == child.inode => {}
+                    _ => return Err(LuksError::NotFound(child_path)),
+                }
+                let child_inode = fs.read_inode(tree, child.inode)?;
+                next.push((child_path, child_inode, inode.clone(), depth + 1));
+            }
+            // Popped in listing order, i.e. the order the delete visits them.
+            stack.extend(next.into_iter().rev());
+        } else {
+            let mut bad: Option<LuksError> = None;
+            fs.for_each_item(tree, inode.objectid, EXTENT_DATA_KEY, &mut |key, data| {
+                let ext = crate::fs::btrfs::extent::FileExtent::parse(key.offset, data)?;
+                if ext.has_disk_bytes() {
+                    if let Some(&i) = extents.get(&ext.disk_bytenr) {
+                        if let Err(e) = gate::check_data_extent_freeable(&extent_tree.extents[i]) {
+                            bad = Some(LuksError::UnsupportedFsFeature(format!(
+                                "cannot delete {p}: {e}"
+                            )));
+                            return Ok(false);
+                        }
+                    }
+                }
+                Ok(true)
+            })?;
+            if let Some(e) = bad {
+                return Err(e);
+            }
+        }
+    }
+    Ok(())
+}
 
 impl Transaction {
     /// Prepare a transaction that deletes an existing regular file at `path`.
@@ -86,15 +218,9 @@ impl Transaction {
             if has_children {
                 return Err(LuksError::DirectoryNotEmpty(path.to_string()));
             }
-        } else if !located_target.inode.file_type().is_file() {
-            return Err(LuksError::UnsupportedFsFeature(
-                "deleting non-regular files is not supported".into(),
-            ));
         }
-        if located_target.inode.nlink > 1 {
-            return Err(LuksError::UnsupportedFsFeature(
-                "deleting files with hardlinks (nlink > 1) is not supported".into(),
-            ));
+        if let Some(why) = item_refusal(&located_target.inode, &located_parent.inode) {
+            return Err(LuksError::UnsupportedFsFeature(why.into()));
         }
 
         let parent_ino = located_parent.inode.objectid;
@@ -177,17 +303,15 @@ impl Transaction {
         data_extents_to_free.sort_unstable();
         data_extents_to_free.dedup();
 
-        // G1: Refuse to free shared extents (refs > 1). This prevents
-        // data corruption when deleting files that share extents via
-        // reflink, deduplication, or snapshots.
+        // G1: Refuse to free shared extents (refs > 1), or one whose only
+        // ref lives outside the extent item. This prevents corruption when
+        // deleting files that share extents via reflink, deduplication, or
+        // snapshots.
         let extent_tree = ExtentTree::read(fs)?;
+        gate::check_no_shared_history_or_quota(fs, &extent_tree)?;
         for &(bytenr, _num_bytes) in &data_extents_to_free {
             if let Some(ext) = extent_tree.extents.iter().find(|e| e.bytenr == bytenr) {
-                if ext.refs > 1 {
-                    return Err(LuksError::UnsupportedFsFeature(
-                        "deleting a file with shared data extents (refs > 1) is not supported".into(),
-                    ));
-                }
+                gate::check_data_extent_freeable(ext)?;
             }
         }
 

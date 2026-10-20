@@ -6,17 +6,10 @@
 //!
 //! Run this first when a write fails with "no space left on the filesystem".
 //!
-//! That error is `LuksError::FilesystemFull`, and the write path raises it for
-//! two very different reasons: the allocator genuinely could not find a free
-//! range, or **an item did not fit in a 16 KiB tree node**. The second is not a
-//! space problem at all, and this tool is how you tell them apart in one step
-//! instead of guessing. Measured 2026-08-16: a 20 MB file write reported "no
-//! space" on a stick with 405 MiB free and one contiguous 405 MiB run — the
-//! real cause was a single `EXTENT_CSUM` item too large for one leaf (see
-//! `INCIDENTS.md`, and `feature-btrfs-write.md` §10).
-//!
-//! So: if this prints plenty of free space and a write still fails, the
-//! failure is a node-capacity limit, not the disk.
+//! That error is `LuksError::FilesystemFull`: the allocator could not find a
+//! free range. (An item too large for one tree node is reported separately, as
+//! `LuksError::BtrfsItemTooLarge`.) This tool shows how much free space the
+//! allocator actually sees.
 //!
 //! Read-only — it opens the device writable only because `Btrfs::mount` is
 //! generic over the device and the write-side allocator types need that bound;

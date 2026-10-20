@@ -26,11 +26,13 @@ impl Transaction {
         now_nsec: u32,
     ) -> Result<Self> {
         gate::check_writeable_fs(fs.superblock())?;
+        gate::check_entry_name(filename)?;
 
         let located_parent = fs.resolve_no_follow(fs.fs_tree(), parent_path)?;
         if !located_parent.inode.file_type().is_dir() {
             return Err(LuksError::NotADirectory(parent_path.to_string()));
         }
+        gate::check_dir_allows_create(located_parent.inode.flags)?;
         gate::check_writeable_subvolume(&located_parent.tree)?;
 
         let target_tree = TargetTree::new(located_parent.tree);
@@ -53,6 +55,8 @@ impl Transaction {
         let new_generation = sb.generation + 1;
 
         let extent_tree = ExtentTree::read(fs)?;
+
+        gate::check_no_shared_history_or_quota(fs, &extent_tree)?;
         let mut allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(&extent_tree, fs.chunk_map())?;
         let mut pending_blocks = HashMap::new();
         let mut blocks_to_add = Vec::<(u64, u8, u64)>::new();
@@ -307,7 +311,9 @@ impl Transaction {
         now_nsec: u32,
     ) -> Result<(Self, u64)> {
         gate::check_writeable_fs(fs.superblock())?;
+        gate::check_entry_name(name)?;
         gate::check_writeable_subvolume(&parent_tree.root)?;
+        gate::check_dir_allows_create(fs.read_inode(parent_tree.bytenr(), parent_ino)?.flags)?;
 
         // Check if entry already exists in parent directory
         let name_hash = crate::fs::btrfs::crc32c::name_hash(name.as_bytes());
@@ -326,6 +332,8 @@ impl Transaction {
         let new_generation = sb.generation + 1;
 
         let extent_tree = ExtentTree::read(fs)?;
+
+        gate::check_no_shared_history_or_quota(fs, &extent_tree)?;
         let mut allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(&extent_tree, fs.chunk_map())?;
         let mut pending_blocks = HashMap::new();
         let mut blocks_to_add = Vec::<(u64, u8, u64)>::new();
@@ -403,7 +411,7 @@ impl Transaction {
             2, // FT_DIR
             name,
         );
-        let existing_dir_item = find_item_in_tree(fs, &pending_blocks, fs_root_bytenr, &dir_item_key)?;
+        let existing_dir_item = find_item_in_tree(fs, &pending_blocks, fs_root_bytenr, parent_tree.objectid, &dir_item_key)?;
         if let Some(existing_data) = existing_dir_item {
             let mut merged_data = existing_data;
             merged_data.extend_from_slice(&dir_item_entry);

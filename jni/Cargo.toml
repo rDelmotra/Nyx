@@ -26,6 +26,7 @@ jni = "0.21"
 serde_json = "1"
 # Streaming verification of a file on the drive without materialising it.
 sha2 = "0.10"
+zeroize = "1.8"
 
 [lints.rust]
 # `aes_armv8` is a custom cfg set in ../.cargo/config.toml — see the long note

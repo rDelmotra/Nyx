@@ -1,6 +1,11 @@
 package dev.luksandroid.transfer
 
+import dev.luksandroid.Trace
+import java.io.InputStream
 import java.io.OutputStream
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * Pass 4 of notes/feature-directory-transfer.md: turns a [TransferPlan] built
@@ -61,6 +66,17 @@ interface ExportDestination {
 
     /** Renames an existing document. The provider may still adjust the name, so the result is authoritative. */
     fun rename(docId: String, newName: String): CreatedDocument
+
+    /** How this destination is verified. Defaults to NONE to avoid hashing or re-reading. */
+    val verifyLevel: VerifyLevel get() = VerifyLevel.NONE
+
+    /**
+     * Opens a finished document for reading back, so the executor can verify size and SHA-256
+     * against what it sent (R5r). Null means this destination cannot be read back, and the
+     * file is then not verified; an [java.io.IOException] means it should have been readable
+     * and was not, which fails the file. The executor closes the stream.
+     */
+    fun openInput(docId: String): java.io.InputStream? = null
 }
 
 object TreeExporter {
@@ -95,6 +111,7 @@ object TreeExporter {
         mimeTypeFor: (String) -> String = { DEFAULT_MIME },
         onProgress: (TransferProgress) -> Unit = {},
         isCancelled: () -> Boolean = { false },
+        onFileDone: (FileDone) -> Unit = {},
     ): TransferOutcome {
         // Execution trusts this ordering completely (a child's parent directory
         // must already have a document ID); a broken plan must fail loudly here,
@@ -208,20 +225,26 @@ object TreeExporter {
             val requestedName = when {
                 // REPLACE writes to a temp document first so the target is only
                 // destroyed once the new bytes are safely on the destination.
-                replacing -> uniqueName(state.namesOf(parentId), ".transfer-tmp-$name-${System.nanoTime()}")
+                replacing -> uniqueName(state.namesOf(parentId), transferTempName(name))
                 existing == false -> uniqueName(state.namesOf(parentId), name)
                 else -> name
             }
 
             val written: Long
+            val fileStartNs = System.nanoTime()
             var created: CreatedDocument
+            var createdDoc: CreatedDocument? = null
             try {
                 created = destination.createFile(parentId, requestedName, mimeTypeFor(name))
+                createdDoc = created
                 written = streamFile(destination, source, stats, entry, created) { liveBytes ->
                     fireProgress(entry.relativePath, bytesCopied + liveBytes, force = false)
                     if (isCancelled()) throw TransferCancelledException()
                 }
             } catch (t: Throwable) {
+                // R5r: a document that failed, was cancelled, or did not verify is not left behind
+                // truncated. (§5.2's "keep what landed" still holds for every file that finished.)
+                createdDoc?.let { doc -> Trace.cleanup("export_delete_partial") { destination.delete(doc.id) } }
                 return stop(entry.relativePath, t)
             }
 
@@ -247,6 +270,7 @@ object TreeExporter {
             state.recordCreatedFile(parentId, created)
             bytesCopied += written
             filesCopied++
+            onFileDone(FileDone(written, null, (System.nanoTime() - fileStartNs) / 1_000_000L))
             fireProgress(entry.relativePath, bytesCopied, force = true)
         }
 
@@ -257,15 +281,16 @@ object TreeExporter {
     }
 
     /**
-     * Streams [entry]'s bytes from [source] into [target]'s output stream.
-     * [onChunk] gets the running total for *this file only* after each chunk,
-     * driving live progress and cancellation.
+     * Streams [entry]'s bytes from [source] into [target]'s output stream, then
+     * verifies them. [onChunk] gets the running total for *this file only* after
+     * each chunk, driving live progress and cancellation.
      *
-     * Unlike the import side there is no "abandon" that leaves no trace: the
-     * document already exists by the time any byte is written, so a failure
-     * here leaves a short file behind. The caller deals with that -- for
-     * REPLACE it is only ever the temp document, and for a plain write it is
-     * the partial file §5.2 explicitly chooses to keep rather than roll back.
+     * The document already exists by the time any byte is written, so any throw
+     * here leaves a short or unverified document; the caller deletes it. Two
+     * checks make "success" mean something: the byte count must equal the
+     * declared size when one was declared (V2), and, when the destination can
+     * be read back, its size and SHA-256 must equal the bytes that left the
+     * source (R5r).
      */
     private fun streamFile(
         destination: ExportDestination,
@@ -276,30 +301,191 @@ object TreeExporter {
         onChunk: (Long) -> Unit,
     ): Long {
         var total = 0L
+        val verifyLevel = destination.verifyLevel
+        val digest = if (verifyLevel == VerifyLevel.FULL) java.security.MessageDigest.getInstance("SHA-256") else null
         val output = destination.openOutput(target.id)
+        var failure: Throwable? = null
         try {
             source.open(entry.sourceId).use { input ->
-                val buffer = ByteArray(CHUNK_SIZE)
-                try {
-                    while (true) {
-                        // Here "read" is the drive and "write" is the phone -- the
-                        // mirror of TreeImporter's, and serialised the same way.
-                        val read = stats.read { input.read(buffer) }
-                        if (read < 0) break
-                        if (read == 0) continue
-                        stats.write { output.write(buffer, 0, read) }
-                        total += read
-                        onChunk(total)
-                    }
-                } finally {
-                    java.util.Arrays.fill(buffer, 0.toByte())
+                total = if (entry.sizeBytes in 0L..CHUNK_SIZE.toLong()) {
+                    streamFileSync(input, output, stats, digest, entry, onChunk)
+                } else {
+                    streamFilePipelined(input, output, stats, digest, entry, onChunk)
                 }
             }
+            stats.commit { syncOutputStream(output) }
+        } catch (t: Throwable) {
+            failure = t
+            throw t
         } finally {
             // Timed rather than left to `use`: a provider stream can hold a
             // whole file's worth of buffering until close, which would
             // otherwise land in "other" and look like per-entry overhead.
-            stats.commit { output.close() }
+            try {
+                stats.commit { output.close() }
+            } catch (closeFailure: Throwable) {
+                // A close that fails means the bytes may not have landed. It must not hide the
+                // primary failure, but with none it is itself the failure.
+                if (failure != null) failure.addSuppressed(closeFailure) else throw closeFailure
+            }
+        }
+        if (entry.sizeBytes >= 0L && total != entry.sizeBytes) {
+            throw TransferFailure("A source file is smaller than it reported, so the copy was stopped.")
+        }
+        if (verifyLevel == VerifyLevel.FULL) {
+            val readBack = try {
+                destination.openInput(target.id)
+            } catch (_: java.io.IOException) {
+                throw TransferFailure("A copied file could not be read back to verify it.")
+            }
+            if (readBack != null) {
+                when (verifyReadBack({ readBack }, total, digest?.digest() ?: ByteArray(0))) {
+                    ReadBack.Verified -> Unit
+                    is ReadBack.SizeMismatch, ReadBack.HashMismatch ->
+                        throw TransferFailure("A copied file did not match its source, so it was removed.")
+                    ReadBack.Unreadable ->
+                        throw TransferFailure("A copied file could not be read back to verify it.")
+                }
+            }
+        }
+        return total
+    }
+
+    private fun streamFileSync(
+        input: InputStream,
+        output: OutputStream,
+        stats: StatsRecorder,
+        digest: java.security.MessageDigest?,
+        entry: PlanEntry,
+        onChunk: (Long) -> Unit,
+    ): Long {
+        var total = 0L
+        val buffer = ByteArray(CHUNK_SIZE)
+        try {
+            while (true) {
+                val read = stats.read { input.read(buffer) }
+                if (read < 0) break
+                if (read == 0) continue
+                if (entry.sizeBytes >= 0L && total + read > entry.sizeBytes) {
+                    throw TransferFailure("A source file is larger than it reported, so the copy was stopped.")
+                }
+                stats.write { output.write(buffer, 0, read) }
+                digest?.update(buffer, 0, read)
+                total += read
+                onChunk(total)
+            }
+        } finally {
+            java.util.Arrays.fill(buffer, 0.toByte())
+        }
+        return total
+    }
+
+    private sealed class ChunkMsg {
+        class Data(val buffer: ByteArray, val len: Int) : ChunkMsg()
+        object Eof : ChunkMsg()
+        class Error(val cause: Throwable) : ChunkMsg()
+    }
+
+    private fun streamFilePipelined(
+        input: InputStream,
+        output: OutputStream,
+        stats: StatsRecorder,
+        digest: java.security.MessageDigest?,
+        entry: PlanEntry,
+        onChunk: (Long) -> Unit,
+    ): Long {
+        val buf1 = ByteArray(CHUNK_SIZE)
+        val buf2 = ByteArray(CHUNK_SIZE)
+        val bufferPool = ArrayBlockingQueue<ByteArray>(2)
+        bufferPool.put(buf1)
+        bufferPool.put(buf2)
+
+        val queue = ArrayBlockingQueue<ChunkMsg>(2)
+        val aborted = AtomicBoolean(false)
+        val readerError = AtomicReference<Throwable?>(null)
+
+        val readerThread = Thread({
+            try {
+                var totalRead = 0L
+                while (!aborted.get()) {
+                    val buf = try {
+                        bufferPool.take()
+                    } catch (_: InterruptedException) {
+                        break
+                    }
+                    if (aborted.get()) break
+
+                    var bytesRead = 0
+                    var eof = false
+                    while (bytesRead < buf.size) {
+                        if (aborted.get()) break
+                        val r = stats.read { input.read(buf, bytesRead, buf.size - bytesRead) }
+                        if (r < 0) {
+                            eof = true
+                            break
+                        }
+                        if (r == 0) continue
+                        bytesRead += r
+                        if (entry.sizeBytes >= 0L && totalRead + bytesRead > entry.sizeBytes) {
+                            throw TransferFailure("A source file is larger than it reported, so the copy was stopped.")
+                        }
+                    }
+
+                    if (bytesRead > 0) {
+                        totalRead += bytesRead
+                        queue.put(ChunkMsg.Data(buf, bytesRead))
+                    } else {
+                        bufferPool.put(buf)
+                    }
+
+                    if (eof) {
+                        if (!aborted.get()) {
+                            queue.put(ChunkMsg.Eof)
+                        }
+                        break
+                    }
+                }
+            } catch (t: Throwable) {
+                if (!aborted.get()) {
+                    readerError.set(t)
+                    queue.offer(ChunkMsg.Error(t))
+                }
+            }
+        }, "tree-exporter-reader")
+
+        var total = 0L
+        try {
+            readerThread.start()
+            while (true) {
+                readerError.get()?.let { throw it }
+
+                val msg = queue.take()
+                when (msg) {
+                    is ChunkMsg.Data -> {
+                        val buf = msg.buffer
+                        val len = msg.len
+                        try {
+                            stats.write { output.write(buf, 0, len) }
+                            digest?.update(buf, 0, len)
+                            total += len
+                            onChunk(total)
+                        } finally {
+                            bufferPool.put(buf)
+                        }
+                    }
+                    is ChunkMsg.Eof -> break
+                    is ChunkMsg.Error -> throw msg.cause
+                }
+            }
+        } finally {
+            aborted.set(true)
+            readerThread.interrupt()
+            try {
+                input.close()
+            } catch (_: Throwable) {}
+            readerThread.join()
+            java.util.Arrays.fill(buf1, 0.toByte())
+            java.util.Arrays.fill(buf2, 0.toByte())
         }
         return total
     }

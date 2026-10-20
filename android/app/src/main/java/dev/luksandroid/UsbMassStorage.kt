@@ -175,8 +175,8 @@ object UsbMassStorage {
             // The LuksDevice was never constructed, so nothing else will free
             // these. Leaking a claimed interface leaves the drive unusable to
             // the whole system until it is physically unplugged.
-            runCatching { connection.releaseInterface(target.usbInterface) }
-            runCatching { connection.close() }
+            Trace.cleanup("open_release_interface") { connection.releaseInterface(target.usbInterface) }
+            Trace.cleanup("open_close_connection") { connection.close() }
             throw t
         }
     }

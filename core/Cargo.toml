@@ -194,60 +194,55 @@ path = "tests/ext4/ext4_streaming_unknown.rs"
 required-features = ["dangerous-write-support"]
 
 
-# --- fs_permutation (11 tests) ---
+# --- btrfs_tree: B-tree structure regressions and checker self-tests ---
 [[test]]
-name = "btrfs_btree_permutations"
-path = "tests/fs_permutation/btrfs_btree_permutations.rs"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_conformance"
-path = "tests/fs_permutation/btrfs_conformance.rs"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_structural_transitions"
-path = "tests/fs_permutation/btrfs_structural_transitions.rs"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_interior_collapse"
-path = "tests/fs_permutation/btrfs_interior_collapse.rs"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_fst_collapse"
-path = "tests/fs_permutation/btrfs_fst_collapse.rs"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_root_split"
-path = "tests/fs_permutation/btrfs_root_split.rs"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_node_surgery"
-path = "tests/fs_permutation/btrfs_node_surgery.rs"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_cow_fixup"
-path = "tests/fs_permutation/btrfs_cow_fixup.rs"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_empty_leaf"
-path = "tests/fs_permutation/btrfs_empty_leaf.rs"
-required-features = ["dangerous-write-support"]
-
-[[test]]
-name = "btrfs_scale_convergence"
-path = "tests/fs_permutation/btrfs_scale_convergence.rs"
+name = "btrfs_tree_validator"
+path = "tests/btrfs_tree/btrfs_tree_validator.rs"
 required-features = ["dangerous-write-support"]
 
 [[test]]
 name = "btrfs_accounting_oracle"
-path = "tests/fs_permutation/btrfs_accounting_oracle.rs"
+path = "tests/btrfs_tree/btrfs_accounting_oracle.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_root_split"
+path = "tests/btrfs_tree/btrfs_root_split.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_empty_leaf"
+path = "tests/btrfs_tree/btrfs_empty_leaf.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_cow_fixup"
+path = "tests/btrfs_tree/btrfs_cow_fixup.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_node_surgery"
+path = "tests/btrfs_tree/btrfs_node_surgery.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_states"
+path = "tests/btrfs_tree/btrfs_states.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_untouched_judge"
+path = "tests/btrfs_tree/btrfs_untouched_judge.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_subvol_power_cut"
+path = "tests/btrfs_tree/btrfs_subvol_power_cut.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_subvol_states"
+path = "tests/btrfs_tree/btrfs_subvol_states.rs"
 required-features = ["dangerous-write-support"]
 
 
@@ -339,6 +334,11 @@ path = "tests/alloc_chunk/btrfs_valves.rs"
 required-features = ["dangerous-write-support"]
 
 [[test]]
+name = "btrfs_unallocated_reserve"
+path = "tests/alloc_chunk/btrfs_unallocated_reserve.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
 name = "btrfs_extent_tree"
 path = "tests/alloc_chunk/btrfs_extent_tree.rs"
 required-features = ["dangerous-write-support"]
@@ -375,6 +375,11 @@ path = "tests/btrfs_ops/btrfs_rename.rs"
 required-features = ["dangerous-write-support"]
 
 [[test]]
+name = "btrfs_real_kinds"
+path = "tests/btrfs_ops/btrfs_real_kinds.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
 name = "btrfs_finish_file_csum"
 path = "tests/btrfs_ops/btrfs_finish_file_csum.rs"
 required-features = ["dangerous-write-support"]
@@ -407,6 +412,11 @@ required-features = ["dangerous-write-support"]
 [[test]]
 name = "btrfs_csum_type_gate"
 path = "tests/btrfs_ops/btrfs_csum_type_gate.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_shared_history_gate"
+path = "tests/btrfs_ops/btrfs_shared_history_gate.rs"
 required-features = ["dangerous-write-support"]
 
 [[test]]
@@ -452,3 +462,65 @@ path = "tests/integration/forensic_log.rs"
 name = "oracle_ledger"
 path = "tests/integration/oracle_ledger.rs"
 
+
+# --- transfer-integrity red tests (F0) ---
+[[test]]
+name = "ext4_writer_leak"
+path = "tests/ext4/ext4_writer_leak.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "ext4_deferred_alloc"
+path = "tests/ext4/ext4_deferred_alloc.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "ext4_generation"
+path = "tests/ext4/ext4_generation.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_batch_ack_durability"
+path = "tests/txn_batch/btrfs_batch_ack_durability.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_f3_commit_semantics"
+path = "tests/txn_batch/btrfs_f3_commit_semantics.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_read_integrity"
+path = "tests/btrfs_ops/btrfs_read_integrity.rs"
+
+[[test]]
+name = "btrfs_health"
+path = "tests/btrfs_ops/btrfs_health.rs"
+
+[[test]]
+name = "ext4_health"
+path = "tests/ext4/ext4_health.rs"
+
+[[test]]
+name = "ext4_forensic"
+path = "tests/ext4/ext4_forensic.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "scsi_forensic"
+path = "tests/device_scsi/scsi_forensic.rs"
+
+[[test]]
+name = "btrfs_stale_block_gate"
+path = "tests/btrfs_ops/btrfs_stale_block_gate.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_owner_gate"
+path = "tests/btrfs_ops/btrfs_owner_gate.rs"
+required-features = ["dangerous-write-support"]
+
+[[test]]
+name = "btrfs_delete_all_or_nothing"
+path = "tests/btrfs_ops/btrfs_delete_all_or_nothing.rs"
+required-features = ["dangerous-write-support"]

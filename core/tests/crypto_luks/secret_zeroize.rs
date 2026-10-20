@@ -57,6 +57,12 @@ static WATCH_PTR: AtomicPtr<u8> = AtomicPtr::new(std::ptr::null_mut());
 static WATCH_LEN: AtomicUsize = AtomicUsize::new(0);
 static CAPTURED: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 
+/// Second watch, by allocation *size*: for a buffer the test cannot name a
+/// pointer for (a volume's private scratch). The size is chosen to be one
+/// nothing else in this binary allocates.
+static WATCH_SIZE: AtomicUsize = AtomicUsize::new(0);
+static SIZE_CAPTURED: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+
 struct CapturingAlloc;
 
 // SAFETY: `alloc`/`dealloc` are pure pass-throughs to `System`, the global
@@ -78,6 +84,11 @@ unsafe impl GlobalAlloc for CapturingAlloc {
             let snapshot = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
             *CAPTURED.lock().unwrap_or_else(|p| p.into_inner()) = snapshot;
             WATCH_PTR.store(std::ptr::null_mut(), Ordering::SeqCst);
+        }
+        if WATCH_SIZE.load(Ordering::SeqCst) == layout.size() {
+            // Same reasoning as above: the allocation is still live here.
+            let snapshot = unsafe { std::slice::from_raw_parts(ptr, layout.size()) }.to_vec();
+            SIZE_CAPTURED.lock().unwrap_or_else(|p| p.into_inner()).push(snapshot);
         }
         unsafe { System.dealloc(ptr, layout) };
     }
@@ -151,5 +162,42 @@ fn zeroize_on_drop_actually_scrubs_the_backing_bytes_before_dealloc() {
         captured.iter().all(|&b| b == 0),
         "Secret's backing bytes were not zero at the moment of deallocation — \
          ZeroizeOnDrop did not run (or was defeated): {captured:?}"
+    );
+}
+
+/// F6 item 7: a `LuksVolume` keeps one scratch buffer between calls, and a
+/// read decrypts into it. That buffer holds the last plaintext span the volume
+/// touched; it must be scrubbed when the volume is dropped (locked), not freed
+/// with file contents still in it.
+#[test]
+fn volume_scratch_holds_no_plaintext_when_the_volume_is_dropped() {
+    use luks_core::luks::{self, LuksVolume};
+
+    let path = format!("{}/../fixtures/containers/unlock-pbkdf2-512.img", env!("CARGO_MANIFEST_DIR"));
+    let data = std::fs::read(&path).unwrap_or_else(|e| panic!("missing container {path}: {e}"));
+    let header = luks::parse(&data).expect("header");
+    let volume = LuksVolume::open(&data, 0, None, &header, b"test").expect("unlock");
+    assert_eq!(volume.sector_size(), 512, "the span arithmetic below assumes 512-byte sectors");
+
+    // offset 1024, 19_000 bytes -> sectors 2..40 -> a 19_456-byte scratch span,
+    // a size distinct from the caller's own 19_000-byte buffer.
+    const SPAN: usize = 19_456;
+    let mut buf = vec![0u8; 19_000];
+    volume.read_at(1024, &mut buf).expect("read");
+    assert!(
+        buf.iter().any(|&b| b != 0),
+        "fixture span must contain plaintext or this test proves nothing"
+    );
+
+    SIZE_CAPTURED.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    WATCH_SIZE.store(SPAN, Ordering::SeqCst);
+    drop(volume);
+    WATCH_SIZE.store(0, Ordering::SeqCst);
+
+    let captured = SIZE_CAPTURED.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    assert_eq!(captured.len(), 1, "expected exactly the scratch buffer to be freed");
+    assert!(
+        captured[0].iter().all(|&b| b == 0),
+        "the volume's scratch buffer was freed with decrypted bytes still in it"
     );
 }

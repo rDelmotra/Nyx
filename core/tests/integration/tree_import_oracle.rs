@@ -37,6 +37,10 @@
 //!    which a per-file check would pass.
 #![cfg(feature = "dangerous-write-support")]
 
+#[path = "../common/temp_guard.rs"]
+mod temp_guard;
+use temp_guard::{TempPath};
+
 #[path = "../common/mod.rs"]
 mod common;
 
@@ -59,7 +63,7 @@ fn repo_path(rel: &str) -> PathBuf {
 
 static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn copy_fixture_to_temp(src_name: &str, tag: &str) -> PathBuf {
+fn copy_fixture_to_temp(src_name: &str, tag: &str) -> TempPath {
     let src = repo_path(&format!("fixtures/btrfs/{src_name}"));
     let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dst = std::env::temp_dir().join(format!(
@@ -68,7 +72,7 @@ fn copy_fixture_to_temp(src_name: &str, tag: &str) -> PathBuf {
         count
     ));
     fs::copy(&src, &dst).expect("copy fixture to temp");
-    dst
+    TempPath::new(dst)
 }
 
 // ---- the trace format ------------------------------------------------------

@@ -234,7 +234,7 @@ private fun ActiveTransferCard(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text(
-                        text = formatEta(item.etaSeconds),
+                        text = VerifyLabels.label(item) ?: formatEta(item.etaSeconds),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -311,11 +311,27 @@ private fun CompletedTransferCard(
                 }
             }
 
+            VerifyLabels.label(item)?.let { label ->
+                Text(
+                    text = label,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
             if (!item.error.isNullOrBlank()) {
                 Text(
                     text = item.error,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error,
+                )
+            }
+
+            StoppedAtLabel.label(item)?.let { label ->
+                Text(
+                    text = label,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
         }
@@ -326,24 +342,24 @@ private fun CompletedTransferCard(
 private fun TypeBadge(type: TransferType) {
     Surface(
         shape = MaterialTheme.shapes.extraSmall,
-        color = when (type) {
-            TransferType.IMPORT -> MaterialTheme.colorScheme.tertiaryContainer
-            TransferType.EXPORT -> MaterialTheme.colorScheme.secondaryContainer
-            TransferType.HASH -> MaterialTheme.colorScheme.surfaceVariant
+        color = when (TypeBadgeColors.of(type).container) {
+            BadgeRole.TERTIARY -> MaterialTheme.colorScheme.tertiaryContainer
+            BadgeRole.SECONDARY -> MaterialTheme.colorScheme.secondaryContainer
+            BadgeRole.SURFACE_VARIANT -> MaterialTheme.colorScheme.surfaceVariant
         },
     ) {
         Text(
             text = when (type) {
-                TransferType.IMPORT -> "Import"
-                TransferType.EXPORT -> "Export"
+                TransferType.IMPORT -> "Phone → Drive"
+                TransferType.EXPORT -> "Drive → Phone"
                 TransferType.HASH -> "Checksum"
             },
             style = MaterialTheme.typography.labelSmall,
             modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
-            color = when (type) {
-                TransferType.IMPORT -> MaterialTheme.colorScheme.onTertiaryContainer
-                TransferType.EXPORT -> MaterialTheme.colorScheme.onSecondaryContainer
-                TransferType.HASH -> MaterialTheme.colorScheme.onSurfaceVariant
+            color = when (TypeBadgeColors.of(type).content) {
+                BadgeRole.TERTIARY -> MaterialTheme.colorScheme.onTertiaryContainer
+                BadgeRole.SECONDARY -> MaterialTheme.colorScheme.onSecondaryContainer
+                BadgeRole.SURFACE_VARIANT -> MaterialTheme.colorScheme.onSurfaceVariant
             },
         )
     }

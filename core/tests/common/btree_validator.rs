@@ -13,11 +13,13 @@
 //!    interior entry `generation`.
 //! 5. **I-5 (Height Uniformity & Level Stamping)**: An interior node at level $L$
 //!    only points to children with level $L - 1$. All leaves are at level 0.
-//! 6. **I-6 (Root Collapse Invariant)**: The root must NOT be an interior node
-//!    with exactly one child (`cow.rs:739`). If an interior root collapses to
-//!    1 child, the tree height must shrink by adopting the child as root.
-//!    Non-root interior nodes with 1 child are permitted (sparsity is legal in
-//!    Btrfs; see `cow.rs:682`) and counted in `total_single_child_interior_nodes`.
+//! 6. **I-6 (retired)**: used to reject a root interior node with exactly one
+//!    child. That shape is legal btrfs: the kernel's `balance_level` also
+//!    promotes only one level per call, and `btrfs check` accepts it. The
+//!    engine collapses one level per mutation (`cow.rs`), so emptying a big
+//!    folder leaves exactly this shape, measured in `btrfs_states` s1 and
+//!    passed by `btrfs check`. Single-child interior nodes, root included,
+//!    are counted in `total_single_child_interior_nodes`.
 //!
 //! In addition to recursive tree validation, this module validates:
 //! 7. **Bidirectional Cursor Parity**: Traversal forward with `Cursor::advance`
@@ -174,17 +176,6 @@ impl TreeValidator {
             });
         }
 
-        // Invariant I-6: Root Collapse Invariant
-        // The root must not be an interior node with exactly one child (cow.rs:739).
-        // If an interior root has collapsed to 1 child, it must be collapsed to that child.
-        if root_node.level > 0 {
-            assert!(
-                root_node.nr_items > 1,
-                "Invariant I-6 violation: root interior node at {root_bytenr} has {} child pointer(s); interior root must have at least 2 children or collapse to child (cow.rs:739)",
-                root_node.nr_items
-            );
-        }
-
         let mut prev_leaf_max: Option<Key> = None;
         let mut leaf_keys = Vec::new();
         let mut total_leaves = 0;
@@ -223,7 +214,7 @@ impl TreeValidator {
     }
 
     /// Validates all standard Btrfs trees (FS_TREE, ROOT_TREE, EXTENT_TREE, CSUM_TREE, DEV_TREE,
-    /// and FREE_SPACE_TREE if present) across all structural invariants (I-1 through I-6),
+    /// and FREE_SPACE_TREE if present) across all structural invariants (I-1 through I-5),
     /// bidirectional cursor parity, and search-vs-walk parity.
     pub fn validate_all<D: ReadAt>(fs: &Btrfs<D>) -> Result<AllTreesValidationReport> {
         let sb = fs.superblock();

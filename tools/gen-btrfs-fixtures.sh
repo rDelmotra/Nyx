@@ -25,7 +25,7 @@
 set -euo pipefail
 
 OUT="${1:-/tmp/btrfs-fixtures}"
-TARGETS="${2:-plain compress mixed-4k subvol subvol-aged subvol-shared large nonmixed-4k sha256-4k fst-aged fst-multileaf fst-bitmap}"
+TARGETS="${2:-plain compress mixed-4k subvol subvol-aged subvol-shared large nonmixed-4k sha256-4k states-4k quota-4k fedora-4k fst-aged fst-multileaf fst-bitmap}"
 UUID_PLAIN="33333333-4444-5555-6666-777777777777"
 UUID_COMPRESS="88888888-9999-aaaa-bbbb-cccccccccccc"
 UUID_MIXED="11111111-2222-3333-4444-555555555555"
@@ -35,6 +35,9 @@ UUID_SUBVOL_SHARED="acacacac-bded-cefe-dfaf-e0e0e0e0e0e0"
 UUID_LARGE="44444444-5555-6666-7777-888888888888"
 UUID_NONMIXED="99999999-8888-7777-6666-555555555555"
 UUID_SHA256="12121212-3434-5656-7878-909090909090"
+UUID_STATES="23232323-4545-6767-8989-a0a0a0a0a0a0"
+UUID_QUOTA="34343434-5656-7878-9a9a-b0b0b0b0b0b0"
+UUID_FEDORA="45454545-6767-8989-abab-cdcdcdcdcdcd"
 UUID_FST_AGED="77777777-6666-5555-4444-333333333333"
 UUID_FST_MULTILEAF="66666666-5555-4444-3333-222222222222"
 UUID_FST_BITMAP="55555555-4444-3333-2222-111111111111"
@@ -316,8 +319,7 @@ fi
 
 # --- nonmixed-4k.img: 4k nodesize, dedicated metadata chunk -----------------
 # 1 GiB capacity, 4096-byte nodes, non-mixed layout.
-# Used by structural transition tests to trigger interior node splits
-# (level 1 -> 2) on EXTENT_TREE and CSUM_TREE without mixed block group bounds.
+# Exercises metadata trees that live in their own chunk, not a mixed block group.
 if want nonmixed-4k; then
 echo "Building nonmixed-4k.img..."
 IMG="$OUT/nonmixed-4k.img"
@@ -344,6 +346,121 @@ rm -f "$IMG"
 truncate -s 1G "$IMG"
 mkfs.btrfs -q -f -n 4096 --csum sha256 -L BTRFSSHA -U "$UUID_SHA256" "$IMG"
 echo "  -> sha256-4k.img"
+fi
+
+# --- states-4k.img: small, empty, 4k nodes -----------------------------------
+# The B-tree state suite (core/tests/btrfs_tree/btrfs_states.rs) loads this
+# into memory. 4096-byte nodes make trees grow tall after a few thousand
+# items; 256 MiB keeps each in-memory copy cheap. Default profiles (metadata
+# DUP), same as a stick formatted with plain mkfs.btrfs. No mount needed.
+if want states-4k; then
+echo "Building states-4k.img..."
+IMG="$OUT/states-4k.img"
+rm -f "$IMG"
+truncate -s 256M "$IMG"
+mkfs.btrfs -q -f -n 4096 -L BTRFSSTATES -U "$UUID_STATES" "$IMG"
+echo "  -> states-4k.img"
+fi
+
+# --- quota-4k.img: qgroups enabled -------------------------------------------
+# The writer does not maintain qgroup counters, so it must refuse this volume
+# by name (gate::check_no_shared_history_or_quota). No mount needed.
+if want quota-4k; then
+echo "Building quota-4k.img..."
+IMG="$OUT/quota-4k.img"
+rm -f "$IMG"
+truncate -s 256M "$IMG"
+mkfs.btrfs -q -f -n 4096 -O quota -L BTRFSQUOTA -U "$UUID_QUOTA" "$IMG"
+echo "  -> quota-4k.img"
+fi
+
+# --- fedora-4k.img: a Fedora-shaped disk (root + home subvolumes, zstd) ------
+# Mirrors the maintainer's real Fedora SSD: two top-level subvolumes named
+# `root` and `home` (Fedora's names, no `@`), zstd compression, free-space tree,
+# no snapshots, no quotas, one device. The writer is exercised inside
+# /home/user, and the `root` subvolume must stay byte-for-byte untouched, so the
+# tests need a volume where both exist and where the data is genuinely
+# compressed. 4 KiB nodes make the trees grow tall with few files. Fixed 256 MiB
+# (no --shrink) so there is free space to write into.
+#
+# Built without mounting (no root, no loop device) using mkfs --subvol, which
+# needs btrfs-progs >= 6.11. Point MKFS_BTRFS at a newer build if the system
+# one is older:  MKFS_BTRFS=/opt/bp/mkfs.btrfs bash gen.sh out fedora-4k
+if want fedora-4k; then
+echo "Building fedora-4k.img..."
+MKFS="${MKFS_BTRFS:-mkfs.btrfs}"
+MKFS_HELP="$("$MKFS" --help 2>&1 || true)"
+if ! grep -q -- '--subvol' <<<"$MKFS_HELP"; then
+    echo "fedora-4k needs btrfs-progs >= 6.11 (mkfs --subvol); set MKFS_BTRFS to a newer mkfs.btrfs" >&2
+    exit 1
+fi
+IMG="$OUT/fedora-4k.img"
+rm -f "$IMG"
+FED="$WORK/fedora"
+mkdir -p "$FED/root/etc" "$FED/root/usr/bin" "$FED/root/usr/share/doc" \
+    "$FED/home/user/Documents" "$FED/home/user/Photos" "$FED/home/user/.config" \
+    "$FED/root/usr/lib"
+python3 - "$FED" <<'PY'
+import sys, pathlib, hashlib
+d = pathlib.Path(sys.argv[1])
+
+def noise(tag, n):
+    # Incompressible and reproducible: SHA-256 in counter mode.
+    out = bytearray()
+    i = 0
+    while len(out) < n:
+        out += hashlib.sha256(f"{tag}:{i}".encode()).digest()
+        i += 1
+    return bytes(out[:n])
+
+(d / "root/etc/hostname").write_bytes(b"fedora\n")
+(d / "root/etc/fstab").write_text(
+    "UUID=45454545-6767-8989-abab-cdcdcdcdcdcd /     btrfs subvol=root,compress=zstd:1 0 0\n"
+    "UUID=45454545-6767-8989-abab-cdcdcdcdcdcd /home btrfs subvol=home,compress=zstd:1 0 0\n"
+    "UUID=ABCD-1234                            /boot/efi vfat umask=0077,shortname=winnt 0 2\n")
+(d / "root/usr/bin/tool").write_bytes(noise("tool", 300000))
+(d / "root/usr/share/doc/readme.txt").write_text(
+    "".join(f"readme line {i:05d}: the quick brown fox jumps over the lazy dog\n" for i in range(3300)))
+(d / "home/user/hello.txt").write_bytes(b"hello from home\n")
+(d / "home/user/Documents/notes.txt").write_text(
+    "".join(f"note {i:05d}: remember to back up the Photos directory\n" for i in range(3600)))
+(d / "home/user/Photos/img1.bin").write_bytes(noise("img1", 150000))
+(d / "home/user/.config/app.conf").write_text("[app]\ntheme=dark\nautosave=true\n")
+
+# --- real Fedora file kinds (hardlinks, symlink, fifo, xattrs) ---------------
+# The writer's rename/delete must refuse or handle each of these without
+# corrupting the filesystem. mkfs --rootdir preserves hardlinks, symlinks,
+# fifos and user.* xattrs (security.selinux cannot be set unprivileged here).
+import os
+bin_ = d / "root/usr/bin"
+# 3 hardlinks in one directory + 1 in another (nlink == 4).
+(bin_ / "hl_a").write_bytes(b"hardlinked tool body\n" * 40)
+os.link(bin_ / "hl_a", bin_ / "hl_b")
+os.link(bin_ / "hl_a", bin_ / "hl_c")
+os.link(bin_ / "hl_a", d / "root/usr/lib/hl_d")
+os.symlink("tool", bin_ / "link")
+os.mkfifo(bin_ / "fifo")
+(bin_ / "tagged").write_bytes(b"xattr file in usr/bin\n")
+os.setxattr(bin_ / "tagged", "user.nyx.test", b"root-value")
+os.setxattr(bin_ / "tagged", "user.nyx.second", b"2")
+(bin_ / "tagged2").write_bytes(b"second xattr file\n")
+os.setxattr(bin_ / "tagged2", "user.nyx.other", b"v")
+# home/user: a hardlinked trio (two names here, one in Documents), a symlink,
+# and xattr files (one to rename over another).
+h = d / "home/user"
+(h / "hl_a").write_bytes(b"home hardlink body\n" * 30)
+os.link(h / "hl_a", h / "hl_b")
+os.link(h / "hl_a", h / "Documents/hl_c")
+os.symlink("hello.txt", h / "link")
+(h / "tagged.txt").write_bytes(b"home xattr file\n")
+os.setxattr(h / "tagged.txt", "user.nyx.test", b"home-value")
+(h / "tagged_other.txt").write_bytes(b"home xattr file two\n")
+os.setxattr(h / "tagged_other.txt", "user.nyx.test", b"other-value")
+PY
+truncate -s 256M "$IMG"
+"$MKFS" -q -f -n 4096 --compress zstd:1 -L BTRFSFEDORA -U "$UUID_FEDORA" \
+    --rootdir "$FED" --subvol rw:root --subvol rw:home "$IMG"
+echo "  -> fedora-4k.img"
 fi
 
 # --- fst-aged.img: ~500 free extents, ~80-90% of single-leaf ceiling (16 KiB nodes)
@@ -424,7 +541,7 @@ fi
 # --- ground truth -----------------------------------------------------------
 {
     echo "btrfs fixtures — generated by tools/gen-btrfs-fixtures.sh"
-    echo "btrfs-progs: $(mkfs.btrfs --version | head -1)"
+    echo "btrfs-progs: $("${MKFS_BTRFS:-mkfs.btrfs}" --version | head -1)"
     echo
     if [ -f "$WORK/subvol-list.txt" ]; then
         echo "=== subvol.img: subvolumes ==="

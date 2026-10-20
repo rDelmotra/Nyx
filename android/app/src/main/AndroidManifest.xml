@@ -16,6 +16,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <!-- API 33+ requires this before the service's notification will show. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.VIBRATE" />
 
     <application
         android:name=".LuksApp"
@@ -62,6 +63,13 @@
              API 34+ throws instead of starting the service. -->
         <service
             android:name=".UnlockService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- Held while transfers are queued/running or a SAF write is open. Same type
+             rule as above: must match startForeground() in TransferService. -->
+        <service
+            android:name=".TransferService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 

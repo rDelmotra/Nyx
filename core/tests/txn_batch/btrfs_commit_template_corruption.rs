@@ -29,6 +29,10 @@
 //! reason.
 #![cfg(feature = "dangerous-write-support")]
 
+#[path = "../common/temp_guard.rs"]
+mod temp_guard;
+use temp_guard::{TempPath};
+
 #[path = "../common/mod.rs"]
 mod common;
 
@@ -55,7 +59,7 @@ static COUNTER: AtomicUsize = AtomicUsize::new(0);
 /// Copy the shared fixture to a uniquely named scratch file. Every test
 /// below mounts and writes to the copy, never the fixture — the fixture is
 /// shared across the whole test binary and other tests read it concurrently.
-fn copy_to_temp(src_name: &str, tag: &str) -> PathBuf {
+fn copy_to_temp(src_name: &str, tag: &str) -> TempPath {
     let src = fixture(src_name);
     let dst = std::env::temp_dir().join(format!(
         "btrfs-commit-template-{src_name}-{tag}-{}-{}-{}",
@@ -67,7 +71,7 @@ fn copy_to_temp(src_name: &str, tag: &str) -> PathBuf {
             .as_nanos()
     ));
     fs::copy(&src, &dst).expect("copy fixture to temp");
-    dst
+    TempPath::new(dst)
 }
 
 // ---------------------------------------------------------------------

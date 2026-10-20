@@ -4,6 +4,11 @@
 //! `drop_device`, `drop_writer`) are thread-safe and never cause use-after-free,
 //! double-free, segfaults, or unhandled panics.
 
+#[path = "../../core/tests/common/temp_guard.rs"]
+mod temp_guard;
+#[cfg(feature = "dangerous-write-support")]
+use temp_guard::TempPath;
+
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -266,7 +271,9 @@ fn test_stress_heavy_registry_churn() {
 #[cfg(feature = "dangerous-write-support")]
 #[test]
 fn test_concurrent_writer_and_drop_volume_or_writer() {
-    let dst = std::env::temp_dir().join("luks-jni-concurrency-write.img");
+    let dst = TempPath::new(
+        std::env::temp_dir().join(format!("luks-jni-concurrency-write-{}.img", std::process::id())),
+    );
     std::fs::copy(fixture("disks/gpt-luks.img"), &dst).expect("copy fixture");
     let len = std::fs::metadata(&dst).expect("stat").len();
     let dev = FileDevice::open_writable(&dst, len).expect("open writable");
@@ -282,12 +289,12 @@ fn test_concurrent_writer_and_drop_volume_or_writer() {
 
     let vol_h = into_raw(Payload::Volume(vol));
     let vol_ref = volume_ref(vol_h).expect("valid volume handle");
-    let writer_enum = vol_ref.begin_file(1024).expect("begin file");
+    let writer_id = vol_ref.begin_file(1024).expect("begin file");
 
     let writer_h = into_raw(Payload::Writer(WriterHandle {
         volume_handle: vol_h,
         volume_id: vol_ref.id,
-        writer: std::sync::Mutex::new(Some(writer_enum)),
+        writer_id,
     }));
 
     let stop_signal = Arc::new(AtomicBool::new(false));
@@ -303,14 +310,8 @@ fn test_concurrent_writer_and_drop_volume_or_writer() {
         while !stop.load(Ordering::Relaxed) {
             match (volume_ref(vol_h), writer_ref(writer_h)) {
                 (Ok(v), Ok(w)) => {
-                    let mut guard = w.writer.lock().unwrap();
-                    if let Some(state) = guard.as_mut() {
-                        let res = v.write_file_chunk(state, &chunk);
-                        if res.is_ok() {
-                            success.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            failed.fetch_add(1, Ordering::Relaxed);
-                        }
+                    if v.write_file_chunk(w.writer_id, &chunk).is_ok() {
+                        success.fetch_add(1, Ordering::Relaxed);
                     } else {
                         failed.fetch_add(1, Ordering::Relaxed);
                     }

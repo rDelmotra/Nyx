@@ -134,6 +134,19 @@ pub fn clear_halt_code() -> u32 {
     ioc(DIR_READ, USB_IOC, 21, std::mem::size_of::<c_uint>())
 }
 
+pub fn get_speed_code() -> u32 {
+    ioc(DIR_NONE, USB_IOC, 31, 0)
+}
+
+// Speed constants from Linux include/uapi/linux/usb/ch9.h
+pub const USB_SPEED_UNKNOWN: c_int = 0;
+pub const USB_SPEED_LOW: c_int = 1;
+pub const USB_SPEED_FULL: c_int = 2;
+pub const USB_SPEED_HIGH: c_int = 3;
+pub const USB_SPEED_WIRELESS: c_int = 4;
+pub const USB_SPEED_SUPER: c_int = 5;
+pub const USB_SPEED_SUPER_PLUS: c_int = 6;
+
 // ----------------------------------------------------------- RawUsbFs trait seam
 
 /// Abstraction over raw usbfs kernel ioctl and poll operations for deterministic testing.
@@ -342,6 +355,35 @@ fn contiguous_prefix(outcomes: &[Option<i32>]) -> usize {
     total
 }
 
+/// Bytes actually usable from an IN transfer round: the sum of `actual_length` over
+/// the longest prefix of URBs that completed successfully without a gap.
+///
+/// For an IN transfer, if any URB in the chunk list receives less than its allocated
+/// buffer length (`actual_length < buffer_length`), no subsequent chunk's data sits
+/// contiguously in the caller's buffer, because each chunk was submitted pointing to
+/// disjoint slices of the caller's buffer. Counting past a short URB would leave an
+/// unpopulated gap between chunks in the caller's buffer. The contiguous prefix MUST break
+/// immediately at that short URB.
+fn contiguous_prefix_in<T: std::ops::Deref<Target = [u8]>>(
+    outcomes: &[Option<i32>],
+    chunks: &[T],
+) -> usize {
+    let mut total = 0usize;
+    for (outcome, chunk) in outcomes.iter().zip(chunks.iter()) {
+        match outcome {
+            Some(n) => {
+                let actual = (*n).max(0) as usize;
+                total += actual;
+                if actual < chunk.len() {
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    total
+}
+
 // --------------------------------------------------------------------- errors
 
 fn errno() -> i32 {
@@ -361,15 +403,29 @@ fn errno() -> i32 {
 /// place: an error that does not name what it was doing gets the gap filled
 /// in by whoever reads it.
 fn bulk_err(len: usize, limit: usize, e: i32) -> LuksError {
-    match transfer_err("USBDEVFS_BULK", e) {
-        LuksError::UsbTransfer(m) => LuksError::UsbTransfer(format!(
-            "{m} while moving {len} bytes (max_transfer is {limit})"
-        )),
-        other => other,
-    }
+    LuksError::usb_errno(
+        e,
+        format!(
+            "{} while moving {len} bytes (max_transfer is {limit})",
+            transfer_detail("USBDEVFS_BULK", e)
+        ),
+    )
 }
 
+/// The Dead state (un-drained URBs after a failed transfer) is terminal, and
+/// the remedy is the same as for an unplug, so it is typed as ESHUTDOWN
+/// (Linux 108, the endpoint-shut-down errno) and classified as disconnected.
+fn transport_dead(why: &str) -> LuksError {
+    LuksError::usb_errno(LINUX_ESHUTDOWN, why)
+}
+
+const LINUX_ESHUTDOWN: i32 = 108;
+
 fn transfer_err(what: &str, e: i32) -> LuksError {
+    LuksError::usb_errno(e, transfer_detail(what, e))
+}
+
+fn transfer_detail(what: &str, e: i32) -> String {
     let hint = match e {
         libc::EPIPE => " (endpoint stalled — clear_halt required before the next command)",
         libc::ETIMEDOUT => " (timed out)",
@@ -381,10 +437,10 @@ fn transfer_err(what: &str, e: i32) -> LuksError {
         libc::EAGAIN => " (would block)",
         _ => "",
     };
-    LuksError::UsbTransfer(format!(
+    format!(
         "{what}: errno {e} ({}){hint}",
         std::io::Error::from_raw_os_error(e)
-    ))
+    )
 }
 
 // ------------------------------------------------------------------ transport
@@ -429,7 +485,14 @@ impl UsbFsTransport {
     /// command of which only 273 µs was wire time, so two thirds of the link was
     /// spent on overhead. Bigger transfers amortise the wrappers over more
     /// payload.
-    pub const DEFAULT_MAX_TRANSFER: usize = 1024 * 1024;
+    /// Default transfer size for USB 2.0 (High Speed) and below, or unknown/fallback.
+    ///
+    /// Cheap USB 2.0 thumb drives have limited SRAM FIFO buffers (often 64-128 KB)
+    /// and gain zero throughput from 1 MiB transfers.
+    pub const DEFAULT_MAX_TRANSFER: usize = 128 * 1024;
+
+    /// Transfer ceiling for USB 3.0+ (SuperSpeed and SuperSpeedPlus).
+    pub const SUPER_SPEED_MAX_TRANSFER: usize = 1024 * 1024;
 
     /// Never shrink below this. A transfer this small still works on any
     /// kernel, so an `EINVAL` here means something other than the size and
@@ -439,6 +502,43 @@ impl UsbFsTransport {
     /// Maximum transfer ceiling. With MAX_URB_SLOTS = 32 and CHUNK_SIZE = 128 KiB,
     /// a transfer above 4 MiB exceeds the arena slot capacity and must be clamped (B-5).
     pub const MAX_MAX_TRANSFER: usize = MAX_URB_SLOTS * (128 * 1024);
+
+    /// Transfers smaller than this are never a *data phase* that the limit
+    /// governs. 512 is the smallest SCSI block, so every block data phase is at
+    /// least this; the 31-byte CBW, the 13-byte CSW and the short replies
+    /// (INQUIRY 36, REQUEST SENSE 18, READ CAPACITY 8/32) are all below it. A
+    /// timeout on one of those says nothing about transfer size and must not
+    /// shrink the limit (T5/P-5).
+    pub const DATA_PHASE_MIN_BYTES: usize = 512;
+
+    /// Detect device speed using `USBDEVFS_GET_SPEED` (`_IO('U', 31)`).
+    ///
+    /// Returns the raw speed integer if the kernel/device reports it, or None on error.
+    pub fn detect_speed_raw(raw: &dyn RawUsbFs, fd: RawFd) -> Option<c_int> {
+        let rc = raw.ioctl(fd, get_speed_code() as IoctlReq, std::ptr::null_mut());
+        if rc > 0 {
+            Some(rc)
+        } else {
+            None
+        }
+    }
+
+    /// Select dynamic maximum transfer size based on detected USB speed.
+    ///
+    /// - If USB_SPEED_SUPER or higher (USB 3.0+): 1 MiB (1,048,576 bytes).
+    /// - If USB_SPEED_HIGH or below (USB 2.0 / full / low): 128 KiB (131,072 bytes).
+    /// - If unknown or fallback: 128 KiB.
+    pub fn default_max_transfer_for_speed(speed: Option<c_int>) -> usize {
+        match speed {
+            Some(s) if s >= USB_SPEED_SUPER => Self::SUPER_SPEED_MAX_TRANSFER,
+            _ => Self::DEFAULT_MAX_TRANSFER,
+        }
+    }
+
+    /// Query the current device speed.
+    pub fn detect_speed(&self) -> Option<c_int> {
+        Self::detect_speed_raw(&*self.raw, self.fd)
+    }
 
     /// Wrap a usbfs file descriptor.
     ///
@@ -457,16 +557,19 @@ impl UsbFsTransport {
     /// `ep_in` and `ep_out` are endpoint addresses as they appear in the
     /// descriptor, so `ep_in` has the 0x80 direction bit set.
     pub unsafe fn from_raw_fd(fd: RawFd, ep_in: u8, ep_out: u8, interface: u8) -> Self {
+        let raw = Arc::new(RealUsbFs);
+        let speed = Self::detect_speed_raw(&*raw, fd);
+        let max_transfer = Self::default_max_transfer_for_speed(speed);
         Self {
             fd,
             ep_in,
             ep_out,
             interface,
-            max_transfer: Arc::new(AtomicUsize::new(Self::DEFAULT_MAX_TRANSFER)),
+            max_transfer: Arc::new(AtomicUsize::new(max_transfer)),
             timeout_ms: 5_000,
             claimed: false,
             state: Arc::new(AtomicU8::new(TransportState::Healthy as u8)),
-            raw: Arc::new(RealUsbFs),
+            raw,
             arena: Arc::new(Mutex::new(UrbArena::new())),
         }
     }
@@ -474,6 +577,10 @@ impl UsbFsTransport {
     /// Inject a custom `RawUsbFs` implementation for testing.
     pub fn with_raw_usbfs(mut self, raw: Arc<dyn RawUsbFs>) -> Self {
         self.raw = raw;
+        if let Some(speed) = Self::detect_speed_raw(&*self.raw, self.fd) {
+            let limit = Self::default_max_transfer_for_speed(Some(speed));
+            self.max_transfer.store(limit, Ordering::Relaxed);
+        }
         self
     }
 
@@ -510,7 +617,7 @@ impl UsbFsTransport {
     /// will fail with `EBUSY` unless the kernel driver is detached first.
     pub fn claim_interface(&mut self) -> Result<()> {
         if self.state() == TransportState::Dead {
-            return Err(LuksError::UsbTransfer("USB transport is dead".into()));
+            return Err(transport_dead("USB transport is dead"));
         }
         let n = self.interface as c_uint;
         let rc = self.raw.ioctl(
@@ -568,6 +675,45 @@ impl UsbFsTransport {
         }
     }
 
+    /// Score a failed transfer of `attempted` bytes under `limit`. Returns
+    /// `true` if the kernel refused the size (`EINVAL`/`ENOMEM`) and the limit
+    /// was lowered, meaning a zero-byte attempt may be redone smaller.
+    ///
+    /// Only a data-phase-sized transfer (>= [`DATA_PHASE_MIN_BYTES`]) can
+    /// shrink the limit, and it shrinks it to half of what was attempted,
+    /// because that is the size that failed. A CBW/CSW-sized failure is not
+    /// about size at all. The limit only ever goes down within a session: a
+    /// restore probe would be a user write, and a failed probe fails and
+    /// fences that write. A fresh transport starts at the original limit.
+    ///
+    /// [`DATA_PHASE_MIN_BYTES`]: Self::DATA_PHASE_MIN_BYTES
+    fn on_bulk_error(&self, _ep: u8, e: i32, attempted: usize, limit: usize) -> bool {
+        if e == libc::EPIPE && attempted > 128 * 1024 {
+            // Step down the session's limit so subsequent transfers will not exceed 128 KiB.
+            // Under USB Mass Storage Bulk-Only Transport (BOT) rules, an endpoint stall in the
+            // middle of the data phase means the drive has abandoned the current command.
+            // The USB transport layer MUST NOT retry on the data pipe:
+            // - On read: the drive expects to send a CSW status reply, not more data.
+            // - On write: sending data when the drive expects a CSW or new command causes
+            //   raw file data to be interpreted as a command (CBW)!
+            // We return false so the stall error propagates to the SCSI layer. The SCSI layer
+            // performs Reset Recovery and re-issues the command in <= 128 KiB pieces.
+            self.max_transfer.fetch_min(128 * 1024, Ordering::Relaxed);
+            return false;
+        }
+
+        let size_error = e == libc::EINVAL || e == libc::ENOMEM;
+        if !size_error
+            || attempted < Self::DATA_PHASE_MIN_BYTES
+            || limit <= Self::MIN_MAX_TRANSFER
+        {
+            return false;
+        }
+        let smaller = (attempted / 2).max(Self::MIN_MAX_TRANSFER);
+        self.max_transfer.fetch_min(smaller, Ordering::Relaxed);
+        size_error
+    }
+
     /// One asynchronous bulk transfer split into smaller URBs. Returns the number of
     /// bytes moved, which may be less than requested — short reads are normal on the
     /// IN endpoint.
@@ -577,9 +723,7 @@ impl UsbFsTransport {
         }
 
         if self.state() == TransportState::Dead {
-            return Err(LuksError::UsbTransfer(
-                "USB transport dead: un-drained URBs pending from earlier failure".into(),
-            ));
+            return Err(transport_dead("USB transport dead: un-drained URBs pending from earlier failure"));
         }
 
         const CHUNK_SIZE: usize = 128 * 1024;
@@ -745,16 +889,11 @@ impl UsbFsTransport {
             match err {
                 None => return Ok(prefix),
                 Some(e) => {
-                    let is_shrinkable_error = e == libc::EINVAL || e == libc::ENOMEM;
-                    if (is_shrinkable_error || e == libc::ETIMEDOUT) && limit > Self::MIN_MAX_TRANSFER {
-                        let smaller = (limit / 2).max(Self::MIN_MAX_TRANSFER);
-                        self.max_transfer.fetch_min(smaller, Ordering::Relaxed);
-                        if is_shrinkable_error && prefix == 0 {
-                            // Nothing reached the wire this round — safe to
-                            // redo the whole thing at the smaller size rather
-                            // than reporting a zero-byte failure.
-                            continue;
-                        }
+                    if self.on_bulk_error(ep, e, attempted, limit) && prefix == 0 {
+                        // Nothing reached the wire this round — safe to
+                        // redo the whole thing at the smaller size rather
+                        // than reporting a zero-byte failure.
+                        continue;
                     }
                     if prefix > 0 {
                         // Bytes are safely on the wire. Report them as a
@@ -777,9 +916,7 @@ impl UsbFsTransport {
         }
 
         if self.state() == TransportState::Dead {
-            return Err(LuksError::UsbTransfer(
-                "USB transport dead: un-drained URBs pending from earlier failure".into(),
-            ));
+            return Err(transport_dead("USB transport dead: un-drained URBs pending from earlier failure"));
         }
 
         const CHUNK_SIZE: usize = 128 * 1024;
@@ -839,7 +976,7 @@ impl UsbFsTransport {
             luks_core::forensic::record_usb(luks_core::forensic::UsbEvent::Submit {
                 ep,
                 count: submitted_count,
-                bytes: buf.len(),
+                bytes: buf_len,
                 gen: generation,
             });
 
@@ -956,21 +1093,16 @@ impl UsbFsTransport {
                 }
             }
 
-            let prefix = contiguous_prefix(&outcomes);
+            let prefix = contiguous_prefix_in(&outcomes, &chunks);
 
             match err {
                 None => return Ok(prefix),
                 Some(e) => {
-                    let is_shrinkable_error = e == libc::EINVAL || e == libc::ENOMEM;
-                    if (is_shrinkable_error || e == libc::ETIMEDOUT) && limit > Self::MIN_MAX_TRANSFER {
-                        let smaller = (limit / 2).max(Self::MIN_MAX_TRANSFER);
-                        self.max_transfer.fetch_min(smaller, Ordering::Relaxed);
-                        if is_shrinkable_error && prefix == 0 {
-                            // Nothing reached the wire this round — safe to
-                            // redo the whole thing at the smaller size rather
-                            // than reporting a zero-byte failure.
-                            continue;
-                        }
+                    if self.on_bulk_error(ep, e, attempted, limit) && prefix == 0 {
+                        // Nothing reached the wire this round — safe to
+                        // redo the whole thing at the smaller size rather
+                        // than reporting a zero-byte failure.
+                        continue;
                     }
                     if prefix > 0 {
                         // Bytes are safely in hand. Report them as a short
@@ -1115,9 +1247,14 @@ impl BulkTransport for UsbFsTransport {
         self.max_transfer.load(Ordering::Relaxed)
     }
 
+    fn set_max_transfer(&self, bytes: usize) {
+        let clamped = bytes.clamp(Self::MIN_MAX_TRANSFER, Self::MAX_MAX_TRANSFER);
+        self.max_transfer.fetch_min(clamped, Ordering::Relaxed);
+    }
+
     fn clear_halt(&self, endpoint_in: bool) -> Result<()> {
         if self.state() == TransportState::Dead {
-            return Err(LuksError::UsbTransfer("USB transport is dead".into()));
+            return Err(transport_dead("USB transport is dead"));
         }
         let ep = if endpoint_in { self.ep_in } else { self.ep_out } as c_uint;
         let rc = self.raw.ioctl(
@@ -1137,7 +1274,7 @@ impl BulkTransport for UsbFsTransport {
 
     fn reset(&self) -> Result<()> {
         if self.state() == TransportState::Dead {
-            return Err(LuksError::UsbTransfer("USB transport is dead".into()));
+            return Err(transport_dead("USB transport is dead"));
         }
         // Bulk-Only Mass Storage Reset: a *class* request on the interface.
         //
@@ -1231,6 +1368,42 @@ mod tests {
         assert_eq!(contiguous_prefix(&[]), 0);
     }
 
+    #[test]
+    fn in_short_piece_followed_by_full_piece_breaks_immediately() {
+        let outcomes = vec![Some(50), Some(100)];
+        let chunks: Vec<Vec<u8>> = vec![vec![0u8; 100], vec![0u8; 100]];
+        assert_eq!(
+            contiguous_prefix_in(&outcomes, &chunks),
+            50,
+            "must break immediately at short URB, not count subsequent chunk across gap"
+        );
+    }
+
+    #[test]
+    fn in_full_piece_followed_by_short_piece_sums_both() {
+        let outcomes = vec![Some(100), Some(37)];
+        let chunks: Vec<Vec<u8>> = vec![vec![0u8; 100], vec![0u8; 100]];
+        assert_eq!(
+            contiguous_prefix_in(&outcomes, &chunks),
+            137,
+            "must sum full piece and short piece then stop"
+        );
+    }
+
+    #[test]
+    fn in_gap_at_the_start_is_zero() {
+        let outcomes = vec![None, Some(100)];
+        let chunks: Vec<Vec<u8>> = vec![vec![0u8; 100], vec![0u8; 100]];
+        assert_eq!(contiguous_prefix_in(&outcomes, &chunks), 0);
+    }
+
+    #[test]
+    fn in_gap_in_middle_stops_at_gap() {
+        let outcomes = vec![Some(100), None, Some(100)];
+        let chunks: Vec<Vec<u8>> = vec![vec![0u8; 100], vec![0u8; 100], vec![0u8; 100]];
+        assert_eq!(contiguous_prefix_in(&outcomes, &chunks), 100);
+    }
+
     /// Ground truth, not self-reference.
     ///
     /// These numbers were **not** derived by re-reading my own arithmetic. They
@@ -1265,6 +1438,88 @@ mod tests {
         assert_eq!(claim_code(), 0x8004_550F, "USBDEVFS_CLAIMINTERFACE");
         assert_eq!(release_code(), 0x8004_5510, "USBDEVFS_RELEASEINTERFACE");
         assert_eq!(clear_halt_code(), 0x8004_5515, "USBDEVFS_CLEAR_HALT");
+        assert_eq!(get_speed_code(), 0x0000_551F, "USBDEVFS_GET_SPEED");
+    }
+
+    #[test]
+    fn usb_speed_constants_and_default_sizing() {
+        assert_eq!(USB_SPEED_UNKNOWN, 0);
+        assert_eq!(USB_SPEED_LOW, 1);
+        assert_eq!(USB_SPEED_FULL, 2);
+        assert_eq!(USB_SPEED_HIGH, 3);
+        assert_eq!(USB_SPEED_SUPER, 5);
+        assert_eq!(USB_SPEED_SUPER_PLUS, 6);
+
+        // SuperSpeed (USB 3.0+) gets 1 MiB
+        assert_eq!(
+            UsbFsTransport::default_max_transfer_for_speed(Some(USB_SPEED_SUPER)),
+            1024 * 1024
+        );
+        assert_eq!(
+            UsbFsTransport::default_max_transfer_for_speed(Some(USB_SPEED_SUPER_PLUS)),
+            1024 * 1024
+        );
+        assert_eq!(
+            UsbFsTransport::default_max_transfer_for_speed(Some(7)),
+            1024 * 1024
+        );
+
+        // HighSpeed (USB 2.0) and below get 128 KiB
+        assert_eq!(
+            UsbFsTransport::default_max_transfer_for_speed(Some(USB_SPEED_HIGH)),
+            128 * 1024
+        );
+        assert_eq!(
+            UsbFsTransport::default_max_transfer_for_speed(Some(USB_SPEED_FULL)),
+            128 * 1024
+        );
+        assert_eq!(
+            UsbFsTransport::default_max_transfer_for_speed(Some(USB_SPEED_LOW)),
+            128 * 1024
+        );
+        assert_eq!(
+            UsbFsTransport::default_max_transfer_for_speed(Some(USB_SPEED_UNKNOWN)),
+            128 * 1024
+        );
+        assert_eq!(
+            UsbFsTransport::default_max_transfer_for_speed(None),
+            128 * 1024
+        );
+    }
+
+    struct MockSpeedRaw(c_int);
+    impl RawUsbFs for MockSpeedRaw {
+        fn ioctl(&self, _fd: RawFd, req: IoctlReq, _arg: *mut c_void) -> c_int {
+            if req == get_speed_code() as IoctlReq {
+                self.0
+            } else {
+                -1
+            }
+        }
+        fn poll(&self, _fd: RawFd, _events: libc::c_short, _timeout_ms: i32) -> std::result::Result<libc::c_short, i32> {
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn usbfs_speed_detection_with_mock() {
+        let super_raw = Arc::new(MockSpeedRaw(USB_SPEED_SUPER));
+        let t_super = unsafe { UsbFsTransport::from_raw_fd(10, 0x81, 0x02, 0) }
+            .with_raw_usbfs(super_raw);
+        assert_eq!(t_super.detect_speed(), Some(USB_SPEED_SUPER));
+        assert_eq!(t_super.max_transfer(), 1024 * 1024);
+
+        let high_raw = Arc::new(MockSpeedRaw(USB_SPEED_HIGH));
+        let t_high = unsafe { UsbFsTransport::from_raw_fd(10, 0x81, 0x02, 0) }
+            .with_raw_usbfs(high_raw);
+        assert_eq!(t_high.detect_speed(), Some(USB_SPEED_HIGH));
+        assert_eq!(t_high.max_transfer(), 128 * 1024);
+
+        let err_raw = Arc::new(MockSpeedRaw(-1));
+        let t_err = unsafe { UsbFsTransport::from_raw_fd(10, 0x81, 0x02, 0) }
+            .with_raw_usbfs(err_raw);
+        assert_eq!(t_err.detect_speed(), None);
+        assert_eq!(t_err.max_transfer(), 128 * 1024);
     }
 
     /// 32-bit ARM has no padding before the pointer, so the size field — and
@@ -1295,7 +1550,8 @@ mod tests {
         let mut buf = [0u8; 64];
         let err = t.read(&mut buf).unwrap_err();
         assert!(
-            matches!(err, LuksError::UsbTransfer(ref m) if m.contains("errno") || m.contains("dead")),
+            matches!(err, LuksError::UsbErrno { errno, .. } if errno == libc::EBADF)
+                || matches!(err, LuksError::UsbErrno { errno: LINUX_ESHUTDOWN, .. }),
             "unexpected error: {err}"
         );
     }
@@ -1321,6 +1577,39 @@ mod tests {
         // 1 MiB timeout read as a dead device.
         let plain = transfer_err("USBDEVFS_BULK", libc::ETIMEDOUT).to_string();
         assert!(!plain.contains("1048576"), "control is not a control: {plain}");
+    }
+
+    /// F1.2 (T6): disconnect is decided by the errno the kernel returned, not
+    /// by words in a message. The table is the whole claim; every row is a
+    /// negative control for the others.
+    #[test]
+    fn disconnect_is_classified_by_errno_not_by_message() {
+        // Linux errno numbers as literals: `LuksError` classifies Linux
+        // kernel values, and `libc::ESHUTDOWN`/`EPROTO` differ on a macOS host.
+        let rows: &[(i32, bool)] = &[
+            // The device is gone, or the fd/endpoint no longer exists.
+            (19, true),  // ENODEV
+            (108, true), // ESHUTDOWN
+            (2, true),   // ENOENT
+            (9, true),   // EBADF
+            // Alive but unhappy: none of these may read as an unplug.
+            (110, false), // ETIMEDOUT
+            (32, false),  // EPIPE
+            (71, false),  // EPROTO
+            (22, false),  // EINVAL
+            (12, false),  // ENOMEM
+            (5, false),   // EIO
+        ];
+        assert!(!rows.is_empty(), "vacuity: no rows");
+        for &(errno, gone) in rows {
+            for e in [transfer_err("USBDEVFS_BULK", errno), bulk_err(4096, 65536, errno)] {
+                assert_eq!(
+                    e.is_disconnected(),
+                    gone,
+                    "errno {errno} should be disconnected={gone}: {e}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -7,6 +7,7 @@
 pub mod btrfs;
 pub mod detect;
 pub mod ext4;
+pub mod health;
 pub mod mounted;
 
 pub use btrfs::Btrfs;

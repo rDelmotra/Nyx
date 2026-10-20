@@ -79,7 +79,17 @@ pub fn check_writeable_fs(sb: &Superblock) -> Result<()> {
         )));
     }
 
-    // 5. Only crc32c checksums can be written correctly.
+    // 5. Simple quotas: new data extents would need an owner ref this
+    //    writer does not emit, and the squota counters would go stale.
+    //    Regular qgroups have no superblock flag; see
+    //    `check_no_shared_history_or_quota`.
+    if sb.has_simple_quota() {
+        return Err(LuksError::UnsupportedFsFeature(
+            "btrfs simple quotas; this filesystem can be read but not written".into(),
+        ));
+    }
+
+    // 6. Only crc32c checksums can be written correctly.
     //
     // `CsumType::Sha256` parses, mounts and *reads* correctly — `csum_type`
     // drives verification through `Superblock::verify_csum`, and the read path
@@ -110,6 +120,63 @@ pub fn check_writeable_fs(sb: &Superblock) -> Result<()> {
         )));
     }
 
+    Ok(())
+}
+
+/// Refuse a filesystem whose extent tree shows shared history, or that keeps
+/// quota accounting.
+///
+/// Shared history: a tree block flagged `FULL_BACKREF`, or a shared, keyed or
+/// unknown backref (`ExtentTree::shared_history`). The kernel leaves these
+/// behind after a snapshot is deleted, after a reflink copy, or after a
+/// balance. When the kernel CoWs such a block it rewrites the children's
+/// backrefs to name the new copy (`update_ref_for_cow`); this writer only
+/// knows plain inline owner refs and does not, so those backrefs would keep
+/// naming a freed block. `refs > 1` is refused separately where it is read.
+///
+/// Quotas: this writer does not update qgroup counters, so a quota tree
+/// would go stale (`btrfs check`: "counts for qgroup ... are different").
+///
+/// Both are rare on a single-disk personal drive, so refusing by name is the
+/// right trade. Reading such a filesystem stays fully supported.
+pub fn check_no_shared_history_or_quota<D: crate::device::ReadAt>(
+    fs: &crate::fs::btrfs::Btrfs<D>,
+    extent_tree: &crate::fs::btrfs::write::ExtentTree,
+) -> Result<()> {
+    if let Some(why) = &extent_tree.shared_history {
+        return Err(LuksError::UnsupportedFsFeature(format!(
+            "btrfs metadata with snapshot/reflink history ({why}); this filesystem can be read but not written"
+        )));
+    }
+    if fs.find_tree_root(crate::fs::btrfs::tree::QUOTA_TREE_OBJECTID)?.is_some() {
+        return Err(LuksError::UnsupportedFsFeature(
+            "btrfs quotas (qgroups) enabled; this filesystem can be read but not written".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse to free a data extent unless its only reference is the plain inline
+/// one this writer would remove with it.
+///
+/// With `refs == 1` the reference can still live in a separate keyed item
+/// (left behind after a reflink copy was deleted); dropping only the
+/// `EXTENT_ITEM` would orphan it.
+pub fn check_data_extent_freeable(
+    ext: &crate::fs::btrfs::write::AllocatedExtent,
+) -> Result<()> {
+    use crate::fs::btrfs::write::InlineBackref;
+    if ext.refs > 1 {
+        return Err(LuksError::UnsupportedFsFeature(
+            "freeing a file with shared data extents (refs > 1) is not supported".into(),
+        ));
+    }
+    if !matches!(ext.backrefs.as_slice(), [InlineBackref::ExtentData { count: 1, .. }]) {
+        return Err(LuksError::UnsupportedFsFeature(format!(
+            "freeing data extent {} whose backref is not a single inline file ref is not supported",
+            ext.bytenr
+        )));
+    }
     Ok(())
 }
 
@@ -158,6 +225,67 @@ pub fn check_free_space_tree_no_bitmaps<D: crate::device::ReadAt>(
     Ok(())
 }
 
+/// Maximum length in bytes of a btrfs directory entry name (`BTRFS_NAME_LEN`).
+pub const BTRFS_NAME_LEN: usize = 255;
+
+/// Validate a name about to become a directory entry (file, directory, or the
+/// destination of a rename).
+///
+/// Refuses: empty, `.`, `..`, any `/` or NUL, and anything longer than
+/// [`BTRFS_NAME_LEN`] **bytes** (UTF-8 length, not characters). Must run before
+/// anything is written. The error text never includes the name (it crosses into
+/// logs); it reuses `UnsupportedFsFeature`, which the JNI layer reports as code
+/// `UNSUPPORTED`.
+pub fn check_entry_name(name: &str) -> Result<()> {
+    let reason = if name.is_empty() {
+        "is empty"
+    } else if name == "." || name == ".." {
+        "is a reserved name"
+    } else if name.contains('/') {
+        "contains '/'"
+    } else if name.contains('\0') {
+        "contains a NUL byte"
+    } else if name.len() > BTRFS_NAME_LEN {
+        "is longer than 255 bytes"
+    } else {
+        return Ok(());
+    };
+    Err(LuksError::UnsupportedFsFeature(format!(
+        "invalid btrfs file name: name {reason}"
+    )))
+}
+
+/// `BTRFS_INODE_IMMUTABLE` (`1 << 6`) from the kernel's `btrfs_tree.h`
+/// (`chattr +i`). Note `1 << 4` is `PREALLOC` and `1 << 5` is `SYNC`.
+pub const BTRFS_INODE_IMMUTABLE: u64 = 1 << 6;
+/// `BTRFS_INODE_APPEND` (`1 << 7`, `chattr +a`).
+pub const BTRFS_INODE_APPEND: u64 = 1 << 7;
+
+/// Refuse to remove, replace, rename, or otherwise modify an inode (or remove
+/// an entry from a directory) whose `INODE_ITEM.flags` carry immutable or
+/// append-only. `flags` is `Inode::flags`; `what` is a static description for
+/// the message (never a user name).
+pub fn check_inode_mutable(flags: u64, what: &str) -> Result<()> {
+    if flags & (BTRFS_INODE_IMMUTABLE | BTRFS_INODE_APPEND) != 0 {
+        return Err(LuksError::UnsupportedFsFeature(format!(
+            "{what} is immutable or append-only"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuse to add an entry to a directory flagged immutable. Append-only
+/// directories still allow creation (but not removal/rename: use
+/// [`check_inode_mutable`] for those).
+pub fn check_dir_allows_create(dir_flags: u64) -> Result<()> {
+    if dir_flags & BTRFS_INODE_IMMUTABLE != 0 {
+        return Err(LuksError::UnsupportedFsFeature(
+            "directory is immutable".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,6 +307,7 @@ mod tests {
             root_dir_objectid: 6,
             num_devices: 1,
             dev_id: 1,
+            dev_bytes_used: 0,
             sector_size: 4096,
             node_size: 16384,
             stripe_size: 65536,
@@ -200,6 +329,17 @@ mod tests {
         assert!(check_chunk_allocation_profile(BLOCK_GROUP_SYSTEM).is_err());
         assert!(check_chunk_allocation_profile(BLOCK_GROUP_DATA | BLOCK_GROUP_DUP).is_err());
         assert!(check_chunk_allocation_profile(0).is_err());
+    }
+
+    #[test]
+    fn test_simple_quota_refused() {
+        let mut sb = dummy_superblock();
+        assert!(check_writeable_fs(&sb).is_ok());
+        sb.incompat_flags |= 0x8000; // SIMPLE_QUOTA
+        match check_writeable_fs(&sb) {
+            Err(LuksError::UnsupportedFsFeature(msg)) => assert!(msg.contains("simple quotas"), "{msg}"),
+            other => panic!("expected simple-quota refusal, got {other:?}"),
+        }
     }
 
     #[test]

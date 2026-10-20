@@ -16,7 +16,8 @@ use crate::fs::btrfs::tree::{
 use crate::fs::btrfs::write::alloc::FreeSpaceMap;
 use crate::fs::btrfs::write::cow::{cow_tree_insert, cow_tree_mutate};
 use crate::fs::btrfs::write::extent_tree::{
-    converge_and_finalize, find_item_in_tree, find_max_inode, record_cow_result, ExtentTree,
+    converge_and_finalize, find_item_in_tree, find_max_inode, max_offset_in_tree, record_cow_result,
+    ExtentTree,
 };
 use crate::fs::btrfs::write::file::BtrfsFileWriter;
 use crate::fs::btrfs::write::interval_set::IntervalSet;
@@ -25,6 +26,38 @@ use crate::fs::btrfs::write::target::TargetTree;
 use crate::fs::btrfs::write::txn::Transaction;
 use crate::fs::btrfs::write::gate;
 use crate::fs::btrfs::{Btrfs, Node};
+
+/// Largest extent the merge below will build (the kernel's own write-side
+/// extent cap, `BTRFS_MAX_EXTENT_SIZE`).
+const MAX_MERGED_EXTENT: u64 = 128 * 1024 * 1024;
+
+/// Merge runs that are consecutive in file order and contiguous on disk, but
+/// never across a block-group boundary: `data_groups` is the `(start, end)` of
+/// every block group. Data groups are logically adjacent (`next_logical`
+/// appends each new chunk), so a run ending at one group's end can touch the
+/// next group's first run. An extent spanning two groups cannot be freed
+/// (`free_data` needs one containing group) and is accounted to only one (H1).
+pub(crate) fn merge_adjacent_runs(runs: &[(u64, u64)], groups: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let group_of = |b: u64| groups.iter().position(|&(s, e)| b >= s && b < e);
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(runs.len());
+    for &(bytenr, len) in runs {
+        if len == 0 {
+            continue;
+        }
+        if let Some(last) = out.last_mut() {
+            if last.0.checked_add(last.1) == Some(bytenr)
+                && last.1 + len <= MAX_MERGED_EXTENT
+                && group_of(last.0).is_some()
+                && group_of(last.0) == group_of(bytenr)
+            {
+                last.1 += len;
+                continue;
+            }
+        }
+        out.push((bytenr, len));
+    }
+    out
+}
 
 /// Snapshot of batch state taken before adding a file, enabling single-file rollback.
 #[derive(Debug, Clone)]
@@ -67,6 +100,7 @@ impl Batch {
     /// Open a new batch by scanning the filesystem's extent tree.
     pub fn open<D: WriteAt>(fs: &mut Btrfs<D>) -> Result<Self> {
         let ext_tree = ExtentTree::read(fs)?;
+        gate::check_no_shared_history_or_quota(fs, &ext_tree)?;
         let chunk_map = fs.chunk_map().clone();
         let allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(&ext_tree, &chunk_map)?;
         Self::open_with_allocator(fs, allocator)
@@ -320,6 +354,8 @@ impl Batch {
         now_nsec: u32,
         already_reserved: bool,
     ) -> Result<u64> {
+        // Validate the name before any batch state (ledger, allocator) changes.
+        gate::check_entry_name(name)?;
         if !is_streaming && written_bytes != declared_size {
             return Err(LuksError::OutOfBounds);
         }
@@ -327,6 +363,27 @@ impl Batch {
             written_bytes
         } else {
             declared_size
+        };
+
+        // B7: resolve the csum tree BEFORE touching any batch state. A lookup
+        // failure propagates; an absent csum tree refuses the write rather than
+        // silently publishing data with no checksums on a filesystem whose
+        // other data has them. (This used to be `if let Ok(..)`: any failure
+        // skipped the csum insert and the file was still counted as written.)
+        let csum_tree_root = if checksums.is_empty() {
+            None
+        } else {
+            match crate::fs::btrfs::write::extent_tree::tree_root_if_present(
+                fs,
+                crate::fs::btrfs::tree::CSUM_TREE_OBJECTID,
+            )? {
+                Some(r) => Some(r),
+                None => {
+                    return Err(LuksError::UnsupportedFsFeature(
+                        "writing file data to a filesystem that has no checksum tree".into(),
+                    ))
+                }
+            }
         };
 
         // Record data runs into double-allocation ledger (if not already reserved)
@@ -349,6 +406,7 @@ impl Batch {
                     return Err(LuksError::NotADirectory(parent_path.to_string()));
                 }
                 gate::check_writeable_subvolume(&located_parent.tree)?;
+                gate::check_dir_allows_create(located_parent.inode.flags)?;
 
                 if let Some((ref target_tree, _)) = self.target {
                     if target_tree.objectid != located_parent.tree.objectid {
@@ -377,7 +435,7 @@ impl Batch {
         let name_hash = crate::fs::btrfs::crc32c::name_hash(name.as_bytes());
         let dir_item_key = Key::new(parent_ino, DIR_ITEM_KEY, name_hash);
         if let Some(item_data) =
-            find_item_in_tree(fs, &self.pending_blocks, self.fs_root.0, &dir_item_key)?
+            find_item_in_tree(fs, &self.pending_blocks, self.fs_root.0, located_parent_tree_id(&self.target)?, &dir_item_key)?
         {
             let entries = crate::fs::btrfs::inode::parse_dir_entries(&item_data)?;
             if entries.iter().any(|e| e.name == name.as_bytes()) {
@@ -408,13 +466,18 @@ impl Batch {
             *next_idx += 1;
             idx
         } else {
-            let mut max_dir_index = 1u64;
-            fs.for_each_item(self.fs_root.0, parent_ino, DIR_INDEX_KEY, &mut |key, _| {
-                if key.offset > max_dir_index {
-                    max_dir_index = key.offset;
-                }
-                Ok(true)
-            })?;
+            // Through `pending`: once an earlier file in this batch has
+            // changed the tree, `self.fs_root` names a block not yet on disk.
+            let max_dir_index = max_offset_in_tree(
+                fs,
+                &self.pending_blocks,
+                self.fs_root.0,
+                target_objectid,
+                parent_ino,
+                DIR_INDEX_KEY,
+            )?
+            .unwrap_or(1)
+            .max(1);
             let idx = max_dir_index + 1;
             self.next_dir_index.insert(parent_ino, idx + 1);
             idx
@@ -598,7 +661,19 @@ impl Batch {
 
         // 6. Insert EXTENT_DATA (if any)
         let mut file_offset = 0u64;
-        for &(bytenr, run_len) in data_runs {
+        // P-3: physically adjacent runs (consecutive in file order, each
+        // starting where the previous ends) become one EXTENT_DATA item and one
+        // extent-tree item. The reservation ledger and allocator above were
+        // updated per original run, so releasing the writer's `data_runs`
+        // still matches what was recorded.
+        let groups: Vec<(u64, u64)> = self
+            .allocator
+            .block_groups
+            .iter()
+            .map(|bg| (bg.block_group.start, bg.block_group.start + bg.block_group.length))
+            .collect();
+        let merged_runs = merge_adjacent_runs(data_runs, &groups);
+        for &(bytenr, run_len) in &merged_runs {
             if run_len > 0 {
                 let extent_data_key = Key::new(new_ino, EXTENT_DATA_KEY, file_offset);
                 let extent_data_item = node::build_regular_file_extent(
@@ -650,8 +725,8 @@ impl Batch {
         }
 
         // 7. CoW CSUM_TREE: insert EXTENT_CSUM items covering all data runs (if CSUM tree is present and non-empty)
-        if !checksums.is_empty() {
-            if let Ok(csum_root) = fs.tree_root(crate::fs::btrfs::tree::CSUM_TREE_OBJECTID) {
+        if let Some(csum_root) = csum_tree_root {
+            {
                 let mut csum_root_bytenr =
                     self.csum_root.map(|(b, _)| b).unwrap_or(csum_root.bytenr);
                 let mut csum_root_level = self.csum_root.map(|(_, l)| l).unwrap_or(csum_root.level);
@@ -701,19 +776,23 @@ impl Batch {
         Ok(new_ino)
     }
 
-    /// Commit the current batch state to disk and re-arm the batch for the next file
-    /// while preserving the cached allocator, next_ino, next_dir_index, and parent directory cache.
-    pub fn commit_and_rearm<D: WriteAt>(&mut self, fs: &mut Btrfs<D>) -> Result<Transaction> {
+    /// Build the transaction for the batch's current state WITHOUT consuming or
+    /// mutating the batch. Everything handed to `converge_and_finalize` is a
+    /// clone, so a failure here or in the later device commit leaves every
+    /// pending block, extent delta, allocator reservation and ledger entry in
+    /// place for a retry (D2/N7/N14/B3).
+    ///
+    /// The caller must hold the batch OUTSIDE `fs.active_batch` while this runs
+    /// (as `finish_file` / `commit_active_batch` do): `fs.fs_tree()` and
+    /// `read_node` consult the active batch, which would make the commit see
+    /// its own uncommitted root as the committed one.
+    pub fn prepare_commit<D: WriteAt>(&self, fs: &Btrfs<D>) -> Result<Transaction> {
         let mut new_fs_tree = self.target_tree().map(|t| t.root).unwrap_or_else(|| fs.fs_tree());
         new_fs_tree.bytenr = self.fs_root.0;
         new_fs_tree.level = self.fs_root.1;
         new_fs_tree.generation = self.generation;
 
-        // `converge_and_finalize` reads the current trees and can fail before
-        // it returns a transaction. Keep the live batch untouched until it
-        // succeeds; otherwise a later commit can retain an allocator `used`
-        // counter while losing the matching extent-tree deltas.
-        let txn = converge_and_finalize(
+        converge_and_finalize(
             fs,
             self.generation,
             new_fs_tree,
@@ -721,34 +800,55 @@ impl Batch {
             None,
             None,
             None,
-            std::mem::take(&mut self.pending_blocks),
+            self.pending_blocks.clone(),
             Vec::new(),
             self.allocator.clone(),
-            std::mem::take(&mut self.blocks_to_add),
-            std::mem::take(&mut self.blocks_to_remove),
-            std::mem::take(&mut self.data_extents_to_add),
+            self.blocks_to_add.clone(),
+            self.blocks_to_remove.clone(),
+            self.data_extents_to_add.clone(),
             Vec::new(),
-        )?;
+        )
+    }
 
-        if let Some(ref final_alloc) = txn.final_allocator {
-            self.allocator = final_alloc.clone();
+    /// Re-arm the batch after `txn` (built by `prepare_commit`) became durable:
+    /// adopt the post-commit allocator with freed ranges unpinned (only now is
+    /// it safe to reuse them, B3), forget everything the commit covered, and
+    /// move to the NEXT generation (B1). `commit_transaction` leaves
+    /// `sb.generation == txn.new_generation`, and every later node header,
+    /// inode transid, dir item and extent item stamps `self.generation`, so the
+    /// next commit must be strictly greater.
+    pub fn rearm_after_commit(&mut self, txn: &mut Transaction) {
+        if let Some(final_alloc) = txn.final_allocator.take() {
+            self.allocator = final_alloc;
             self.allocator.unpin_freed();
         }
-        // `pending_blocks`, `blocks_to_add`, `blocks_to_remove`, and
-        // `data_extents_to_add` are already empty — `std::mem::take` moved
-        // their contents into `converge_and_finalize` above.
+        self.pending_blocks.clear();
+        self.pending_nodes.lock().unwrap().clear();
+        self.blocks_to_add.clear();
+        self.blocks_to_remove.clear();
+        self.data_extents_to_add.clear();
         self.fs_root = (txn.new_fs_tree.bytenr, txn.new_fs_tree.level);
         if let Some((ref mut target_tree, _)) = self.target {
             target_tree.update_root(txn.new_fs_tree.bytenr, txn.new_fs_tree.level, txn.new_generation);
         }
         self.csum_root = None;
-        self.generation = txn.new_generation;
+        self.generation = txn.new_generation + 1;
         self.handed_out.clear();
         self.accumulated_files = 0;
         self.accumulated_data_bytes = 0;
         self.start_time = Instant::now();
+    }
 
-        Ok(txn)
+    /// Commit the batch to the device and re-arm it. On `Err` the batch is
+    /// untouched (see `prepare_commit`, and the retry argument in `commit.rs`).
+    pub fn commit_and_rearm<D: WriteAt>(
+        &mut self,
+        fs: &mut Btrfs<D>,
+    ) -> std::result::Result<(), crate::fs::btrfs::write::commit::CommitError> {
+        let mut txn = self.prepare_commit(fs)?;
+        crate::fs::btrfs::write::commit::commit_transaction_ref(fs, &txn)?;
+        self.rearm_after_commit(&mut txn);
+        Ok(())
     }
 
     /// Commit the batch into a Transaction ready to be committed to disk.
@@ -775,4 +875,26 @@ impl Batch {
             Vec::new(),
         )
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_adjacent_runs;
+
+    #[test]
+    fn merge_stops_at_block_group_boundary() {
+        let groups = [(0, 1000), (1000, 2000)];
+        // Adjacent inside group 0: merged. Adjacent across 1000: not.
+        let runs = [(0, 300), (300, 700), (1000, 200), (1200, 100)];
+        assert_eq!(merge_adjacent_runs(&runs, &groups), vec![(0, 1000), (1000, 300)]);
+        // Run outside every group is never merged.
+        assert_eq!(merge_adjacent_runs(&[(5000, 10), (5010, 10)], &groups), vec![(5000, 10), (5010, 10)]);
+    }
+}
+
+/// Objectid of the batch's bound target tree (set by the first operation).
+fn located_parent_tree_id(target: &Option<(TargetTree, u64)>) -> Result<u64> {
+    target.as_ref().map(|(t, _)| t.objectid).ok_or(LuksError::CorruptFs(
+        "batch target tree must be bound before file insertion",
+    ))
 }

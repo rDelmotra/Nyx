@@ -20,7 +20,7 @@ use crate::error::{LuksError, Result};
 use crate::fs::btrfs::cursor::Cursor;
 use crate::fs::btrfs::superblock::BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE;
 use crate::fs::btrfs::tree::{
-    Key, BLOCK_GROUP_ITEM_KEY, CSUM_TREE_OBJECTID, EXTENT_DATA_REF_KEY, EXTENT_ITEM_KEY,
+    check_generation, check_owner, Key, BLOCK_GROUP_ITEM_KEY, CSUM_TREE_OBJECTID, EXTENT_DATA_REF_KEY, EXTENT_ITEM_KEY,
     EXTENT_TREE_OBJECTID, FREE_SPACE_TREE_OBJECTID, FS_TREE_OBJECTID, METADATA_ITEM_KEY,
     ROOT_ITEM_KEY, ROOT_TREE_OBJECTID, SHARED_BLOCK_REF_KEY, SHARED_DATA_REF_KEY,
     TREE_BLOCK_REF_KEY,
@@ -346,6 +346,19 @@ fn parse_inline_backrefs(mut data: &[u8]) -> Result<Vec<InlineBackref>> {
     Ok(backrefs)
 }
 
+/// Why an extent's flags or inline backrefs show it was once shared, if they do.
+fn shared_mark(flags: u64, backrefs: &[InlineBackref]) -> Option<&'static str> {
+    if flags & BLOCK_FLAG_FULL_BACKREF != 0 {
+        return Some("FULL_BACKREF flag");
+    }
+    backrefs.iter().find_map(|b| match b {
+        InlineBackref::SharedBlock { .. } => Some("shared tree block backref"),
+        InlineBackref::SharedData { .. } => Some("shared data backref"),
+        InlineBackref::Other { .. } => Some("unknown inline backref type"),
+        InlineBackref::TreeBlock { .. } | InlineBackref::ExtentData { .. } => None,
+    })
+}
+
 /// Unified representation of an allocated extent (data or metadata).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AllocatedExtent {
@@ -364,6 +377,13 @@ pub struct AllocatedExtent {
 pub struct ExtentTree {
     pub block_groups: Vec<BlockGroupItem>,
     pub extents: Vec<AllocatedExtent>,
+    /// First sign, if any, that this filesystem's metadata was once shared
+    /// (a snapshot, a reflink, a balance): a `FULL_BACKREF` tree block, a
+    /// shared or keyed tree-block backref, or a backref type this writer does
+    /// not know. The writer only maintains plain inline owner refs, so CoW
+    /// over any of these would leave backrefs naming freed blocks.
+    /// `gate::check_no_shared_history_or_quota` refuses on it.
+    pub shared_history: Option<String>,
 }
 
 impl ExtentTree {
@@ -393,6 +413,12 @@ impl ExtentTree {
         let mut block_groups = Vec::new();
         let mut extents = Vec::new();
         let node_size = fs.superblock().node_size as u64;
+        let mut shared_history: Option<String> = None;
+        let mut note = |what: String| {
+            if shared_history.is_none() {
+                shared_history = Some(what);
+            }
+        };
 
         fs.walk_tree(root.bytenr, &mut |key, data| {
             match key.item_type {
@@ -400,8 +426,17 @@ impl ExtentTree {
                     let bg = BlockGroupItem::parse(&key, data)?;
                     block_groups.push(bg);
                 }
+                TREE_BLOCK_REF_KEY | SHARED_BLOCK_REF_KEY | SHARED_DATA_REF_KEY => {
+                    note(format!(
+                        "keyed backref item type {} for extent {}",
+                        key.item_type, key.objectid
+                    ));
+                }
                 EXTENT_ITEM_KEY => {
                     let item = ExtentItem::parse(&key, data)?;
+                    if let Some(why) = shared_mark(item.flags, &item.backrefs) {
+                        note(format!("extent {}: {why}", item.bytenr));
+                    }
                     let is_data = item.flags & EXTENT_FLAG_DATA != 0;
                     let is_tree_block = item.flags & EXTENT_FLAG_TREE_BLOCK != 0;
                     extents.push(AllocatedExtent {
@@ -417,6 +452,11 @@ impl ExtentTree {
                 }
                 METADATA_ITEM_KEY => {
                     let item = MetadataItem::parse(&key, data)?;
+                    if let Some(why) = shared_mark(item.flags, &item.backrefs) {
+                        note(format!("tree block {}: {why}", item.bytenr));
+                    } else if item.refs == 1 && item.backrefs.is_empty() {
+                        note(format!("tree block {}: backref stored outside the item", item.bytenr));
+                    }
                     extents.push(AllocatedExtent {
                         bytenr: item.bytenr,
                         length: node_size,
@@ -440,6 +480,7 @@ impl ExtentTree {
         Ok(ExtentTree {
             block_groups,
             extents,
+            shared_history,
         })
     }
 
@@ -545,17 +586,37 @@ pub(crate) fn record_cow_result(
     Ok(())
 }
 
+/// Root of tree `objectid`, `Ok(None)` only if the root tree has no ROOT_ITEM
+/// for it. Every other failure (I/O, checksum, truncated item) is an `Err`, so a
+/// caller can never mistake "could not look" for "does not exist" (B7).
+pub fn tree_root_if_present<D: ReadAt>(
+    fs: &Btrfs<D>,
+    objectid: u64,
+) -> Result<Option<crate::fs::btrfs::TreeRoot>> {
+    let key = Key::new(objectid, ROOT_ITEM_KEY, 0);
+    match find_item_in_tree(fs, &HashMap::new(), fs.superblock().root, ROOT_TREE_OBJECTID, &key)? {
+        None => Ok(None),
+        Some(_) => fs.tree_root(objectid).map(Some),
+    }
+}
+
 /// Find an item with `key` in the tree rooted at `root_bytenr`, consulting `pending_blocks` if available.
 pub(crate) fn find_item_in_tree<D: ReadAt>(
     fs: &Btrfs<D>,
     pending: &HashMap<u64, Vec<u8>>,
     root_bytenr: u64,
+    owner: u64,
     key: &Key,
 ) -> Result<Option<Vec<u8>>> {
     let mut curr_bytenr = root_bytenr;
+    let mut expected_gen: Option<u64> = None;
     let mut depth = 0;
     while depth < 16 {
         let node = read_node(fs, pending, curr_bytenr)?;
+        check_owner(owner, &node)?;
+        if let Some(expected) = expected_gen {
+            check_generation(expected, &node)?;
+        }
         if node.is_leaf() {
             for i in 0..node.nr_items {
                 if node.key(i)? == *key {
@@ -567,21 +628,86 @@ pub(crate) fn find_item_in_tree<D: ReadAt>(
         if node.nr_items == 0 {
             return Ok(None);
         }
-        let mut child_bytenr = None;
+        let mut child = None;
         for i in (0..node.nr_items).rev() {
             let k = node.key(i)?;
             if *key >= k {
-                child_bytenr = Some(node.key_ptr(i)?.blockptr);
+                child = Some(node.key_ptr(i)?);
                 break;
             }
         }
-        match child_bytenr {
-            Some(ptr) => curr_bytenr = ptr,
+        match child {
+            Some(ptr) => {
+                curr_bytenr = ptr.blockptr;
+                expected_gen = Some(ptr.generation);
+            }
             None => return Ok(None),
         }
         depth += 1;
     }
     Ok(None)
+}
+
+/// Largest key offset among items `(objectid, item_type, *)` in the tree
+/// rooted at `root_bytenr`, consulting `pending`, or `None` if there are none.
+///
+/// Mid-batch the root and the nodes under it may exist only in `pending`;
+/// reading them from the device instead returns whatever older block sits at
+/// that address.
+pub(crate) fn max_offset_in_tree<D: ReadAt>(
+    fs: &Btrfs<D>,
+    pending: &HashMap<u64, Vec<u8>>,
+    root_bytenr: u64,
+    owner: u64,
+    objectid: u64,
+    item_type: u8,
+) -> Result<Option<u64>> {
+    fn walk<D: ReadAt>(
+        fs: &Btrfs<D>,
+        pending: &HashMap<u64, Vec<u8>>,
+        owner: u64,
+        bytenr: u64,
+        expected_gen: Option<u64>,
+        lo: &Key,
+        hi: &Key,
+        depth: usize,
+        best: &mut Option<u64>,
+    ) -> Result<()> {
+        if depth > 16 {
+            return Err(LuksError::CorruptFs("btrfs tree deeper than 16 levels"));
+        }
+        let node = read_node(fs, pending, bytenr)?;
+        check_owner(owner, &node)?;
+        if let Some(expected) = expected_gen {
+            check_generation(expected, &node)?;
+        }
+        if node.is_leaf() {
+            for i in 0..node.nr_items {
+                let k = node.key(i)?;
+                if k >= *lo && k <= *hi {
+                    *best = Some(best.map_or(k.offset, |b| b.max(k.offset)));
+                }
+            }
+            return Ok(());
+        }
+        // Child i holds keys in [key(i), key(i+1)).
+        for i in 0..node.nr_items {
+            let start = node.key(i)?;
+            let starts_after_range = start > *hi;
+            let ends_before_range = i + 1 < node.nr_items && node.key(i + 1)? <= *lo;
+            if !starts_after_range && !ends_before_range {
+                let ptr = node.key_ptr(i)?;
+                walk(fs, pending, owner, ptr.blockptr, Some(ptr.generation), lo, hi, depth + 1, best)?;
+            }
+        }
+        Ok(())
+    }
+
+    let lo = Key::new(objectid, item_type, 0);
+    let hi = Key::new(objectid, item_type, u64::MAX);
+    let mut best = None;
+    walk(fs, pending, owner, root_bytenr, None, &lo, &hi, 0, &mut best)?;
+    Ok(best)
 }
 
 /// Collect all (Key, data) items present in the tree rooted at `bytenr`, consulting `pending`.
@@ -591,20 +717,36 @@ pub(crate) fn collect_tree_items<D: ReadAt>(
     fs: &Btrfs<D>,
     pending: &HashMap<u64, Vec<u8>>,
     bytenr: u64,
+    owner: u64,
     items: &mut Vec<(Key, Vec<u8>)>,
 ) -> Result<()> {
     if bytenr == 0 {
         return Ok(());
     }
+    collect_node_items(fs, pending, bytenr, owner, None, items)
+}
+
+fn collect_node_items<D: ReadAt>(
+    fs: &Btrfs<D>,
+    pending: &HashMap<u64, Vec<u8>>,
+    bytenr: u64,
+    owner: u64,
+    expected_gen: Option<u64>,
+    items: &mut Vec<(Key, Vec<u8>)>,
+) -> Result<()> {
     let node = read_node(fs, pending, bytenr)?;
+    check_owner(owner, &node)?;
+    if let Some(expected) = expected_gen {
+        check_generation(expected, &node)?;
+    }
     if node.is_leaf() {
         for i in 0..node.nr_items {
             items.push((node.key(i)?, node.item_data(i)?.to_vec()));
         }
     } else {
         for i in 0..node.nr_items {
-            let child_ptr = node.key_ptr(i)?.blockptr;
-            collect_tree_items(fs, pending, child_ptr, items)?;
+            let ptr = node.key_ptr(i)?;
+            collect_node_items(fs, pending, ptr.blockptr, owner, Some(ptr.generation), items)?;
         }
     }
     Ok(())
@@ -691,10 +833,12 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
     };
     let mut fst_root_opt: Option<(u64, u8)> =
         if sb.compat_ro_flags & BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE != 0 {
-            match fs.tree_root(FREE_SPACE_TREE_OBJECTID) {
-                Ok(r) => Some((r.bytenr, r.level)),
-                Err(_) => None,
-            }
+            // B7: the superblock advertises the free-space tree, so it must be
+            // reconciled. A lookup failure (I/O error, or a root item that is
+            // missing/truncated) fails the commit; it used to become `None`,
+            // which skipped reconciliation while the flag stayed set.
+            let r = fs.tree_root(FREE_SPACE_TREE_OBJECTID)?;
+            Some((r.bytenr, r.level))
         } else {
             None
         };
@@ -938,6 +1082,14 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
                             "modifying shared tree blocks is not supported (subvolume is snapshotted)".into(),
                         ));
                     }
+                    // Second line behind `gate::check_no_shared_history_or_quota`:
+                    // a once-shared block's children name it by address.
+                    let flags = u64::from_le_bytes(data[16..24].try_into().unwrap());
+                    if flags & BLOCK_FLAG_FULL_BACKREF != 0 {
+                        return Err(LuksError::UnsupportedFsFeature(
+                            "modifying a once-shared (FULL_BACKREF) tree block is not supported".into(),
+                        ));
+                    }
                     let _ = leaf.delete_item(&del_key)?;
                     freed_to_allocator = true;
                     Ok(())
@@ -1015,7 +1167,7 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
         // Reconcile Free Space Tree if present on this filesystem.
         if let Some((ref mut fst_bytenr, ref mut fst_level)) = fst_root_opt {
             let mut current_items = Vec::new();
-            collect_tree_items(fs, &pending_blocks, *fst_bytenr, &mut current_items)?;
+            collect_tree_items(fs, &pending_blocks, *fst_bytenr, FREE_SPACE_TREE_OBJECTID, &mut current_items)?;
             let desired_items = allocator.emit_free_space_tree_items();
 
             let mut to_delete = Vec::new();
@@ -1054,34 +1206,6 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
                 !to_delete.is_empty() || !to_insert.is_empty() || !to_mutate.is_empty();
 
             if fst_modified {
-                for del_key in to_delete {
-                    let fst_res = cow_tree_mutate(
-                        fs,
-                        &pending_blocks,
-                        *fst_bytenr,
-                        *fst_level,
-                        FREE_SPACE_TREE_OBJECTID,
-                        &del_key,
-                        new_generation,
-                        &mut allocator,
-                        |leaf| {
-                            let _ = leaf.delete_item(&del_key)?;
-                            Ok(())
-                        },
-                    )?;
-                    record_cow_result(
-                        &fst_res,
-                        &mut blocks_to_add,
-                        &mut blocks_to_remove,
-                        &mut allocator,
-                        &mut pending_blocks,
-                        sb.node_size,
-                        FREE_SPACE_TREE_OBJECTID,
-                    )?;
-                    *fst_bytenr = fst_res.new_root_bytenr;
-                    *fst_level = fst_res.new_root_level;
-                }
-
                 for (mut_key, mut_data) in to_mutate {
                     let fst_res = cow_tree_mutate(
                         fs,
@@ -1113,6 +1237,13 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
                     *fst_level = fst_res.new_root_level;
                 }
 
+                // Inserts before deletes. A changed free extent is a new key
+                // (start and length are the key), so it arrives as one delete
+                // plus one insert. Deleting first can empty a leaf that holds
+                // only that item, collapsing the tree, and the insert then
+                // splits it again onto other blocks, which changes the free
+                // space this tree describes: on a fragmented volume that
+                // flipped between two states until the round limit.
                 for (ins_key, ins_data) in to_insert {
                     let fst_res = cow_tree_insert(
                         fs,
@@ -1124,6 +1255,34 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
                         ins_data,
                         new_generation,
                         &mut allocator,
+                    )?;
+                    record_cow_result(
+                        &fst_res,
+                        &mut blocks_to_add,
+                        &mut blocks_to_remove,
+                        &mut allocator,
+                        &mut pending_blocks,
+                        sb.node_size,
+                        FREE_SPACE_TREE_OBJECTID,
+                    )?;
+                    *fst_bytenr = fst_res.new_root_bytenr;
+                    *fst_level = fst_res.new_root_level;
+                }
+
+                for del_key in to_delete {
+                    let fst_res = cow_tree_mutate(
+                        fs,
+                        &pending_blocks,
+                        *fst_bytenr,
+                        *fst_level,
+                        FREE_SPACE_TREE_OBJECTID,
+                        &del_key,
+                        new_generation,
+                        &mut allocator,
+                        |leaf| {
+                            let _ = leaf.delete_item(&del_key)?;
+                            Ok(())
+                        },
                     )?;
                     record_cow_result(
                         &fst_res,
@@ -1302,5 +1461,7 @@ pub(crate) fn converge_and_finalize<D: ReadAt>(
         pending_blocks,
         pending_data,
         final_allocator: Some(allocator),
+        new_chunks: Vec::new(),
+        final_dev_bytes_used: None,
     })
 }

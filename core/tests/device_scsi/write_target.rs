@@ -10,12 +10,16 @@
 //! has come to mean a different drive fails loudly instead of being written to.
 #![cfg(feature = "dangerous-write-support")]
 
+#[path = "../common/temp_guard.rs"]
+mod temp_guard;
+use temp_guard::{TempPath};
+
 use luks_core::device::{FileDevice, WriteAt};
 
-fn scratch(name: &str, len: usize) -> std::path::PathBuf {
+fn scratch(name: &str, len: usize) -> TempPath {
     let p = std::env::temp_dir().join(format!("write-target-{name}"));
     std::fs::write(&p, vec![0u8; len]).expect("create scratch");
-    p
+    TempPath::new(p)
 }
 
 #[test]

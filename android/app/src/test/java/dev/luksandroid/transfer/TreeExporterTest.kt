@@ -39,6 +39,7 @@ class TreeExporterTest {
             var bytes: ByteArray = ByteArray(0)
         }
 
+        override var verifyLevel: VerifyLevel = VerifyLevel.FULL
         val docs = mutableMapOf<String, Doc>()
         private var nextId = 0
 
@@ -157,6 +158,17 @@ class TreeExporterTest {
             if (failDeleteFor == doc.name) throw IOException("simulated delete failure for ${doc.name}")
             deletedIds += docId
             docs.remove(docId)
+        }
+
+        /** Flip one byte of what a read-back returns, to model a destination that lost or altered data. */
+        var corruptReadBack = false
+        var unreadable = false
+
+        override fun openInput(docId: String): java.io.InputStream? {
+            if (unreadable) throw IOException("simulated unreadable destination")
+            val b = docs.getValue(docId).bytes.copyOf()
+            if (corruptReadBack && b.isNotEmpty()) b[0] = (b[0] + 1).toByte()
+            return ByteArrayInputStream(b)
         }
 
         override fun rename(docId: String, newName: String): CreatedDocument {
@@ -313,7 +325,7 @@ class TreeExporterTest {
 
     @Test
     fun `replace - the temp document is written first, so a failed write never destroys the original`() {
-        dest.seedFile(root, "note.txt", "original".toByteArray())
+        val originalId = dest.seedFile(root, "note.txt", "original".toByteArray())
         dest.failWriteAfterTotalBytes = 1
 
         val outcome = export(
@@ -326,7 +338,8 @@ class TreeExporterTest {
         // This is the property that ordering buys: the original is still there
         // and still correct. Under delete-then-write it would be gone.
         assertArrayEquals("original".toByteArray(), dest.bytesAt(root, "note.txt"))
-        assertTrue("the original must not have been deleted", dest.deletedIds.isEmpty())
+        assertTrue("the original must not have been deleted", originalId !in dest.deletedIds)
+        assertTrue("the failed temp document is removed (R5r)", dest.namesUnder(root).none { it.startsWith(".transfer-tmp-") })
     }
 
     // ---- the provider renames behind our back ------------------------------
@@ -395,6 +408,66 @@ class TreeExporterTest {
         assertEquals(1, outcome.filesCopied)
         // §5.2: no rollback. The first file stays.
         assertArrayEquals(ok, dest.bytesAt(root, "first.txt"))
+        // R5r: but the file that failed is not left behind half-written.
+        assertNull(dest.childNamed(root, "second.txt"))
+    }
+
+    @Test
+    fun `R5r a cancelled file is deleted, not left truncated`() {
+        val data = ByteArray(TreeExporter.CHUNK_SIZE * 2) { 1 }
+        var chunks = 0
+        val outcome = export(
+            plan(file("big.bin", data.size.toLong())),
+            FakeSource(mapOf("v:big.bin" to data)),
+            isCancelled = { ++chunks > 2 },
+        )
+        assertTrue(outcome.failure is TransferCancelledException)
+        assertNull(dest.childNamed(root, "big.bin"))
+    }
+
+    @Test
+    fun `R5r a file that reads back different is failed and deleted`() {
+        dest.corruptReadBack = true
+        val outcome = export(plan(file("a.txt", 3)), FakeSource(mapOf("v:a.txt" to "abc".toByteArray())))
+        assertFalse(outcome.succeeded)
+        assertEquals("a.txt", outcome.stoppedAtPath)
+        assertEquals(0, outcome.filesCopied)
+        assertNull(dest.childNamed(root, "a.txt"))
+    }
+
+    @Test
+    fun `R5r a destination that cannot be read back cannot be verified, so the file fails and is deleted`() {
+        dest.unreadable = true
+        val outcome = export(plan(file("a.txt", 3)), FakeSource(mapOf("v:a.txt" to "abc".toByteArray())))
+        assertFalse(outcome.succeeded)
+        assertNull(dest.childNamed(root, "a.txt"))
+    }
+
+    @Test
+    fun `a destination with verifyLevel NONE skips read-back and succeeds even if unreadable`() {
+        dest.verifyLevel = VerifyLevel.NONE
+        dest.unreadable = true
+        val outcome = export(plan(file("a.txt", 3)), FakeSource(mapOf("v:a.txt" to "abc".toByteArray())))
+        assertTrue(outcome.failure?.toString() ?: "expected success", outcome.succeeded)
+        assertEquals(1, outcome.filesCopied)
+        assertNotNull(dest.childNamed(root, "a.txt"))
+    }
+
+    @Test
+    fun `V2 a file whose bytes differ in count from its declared size fails and is deleted`() {
+        val longer = export(plan(file("a.txt", 2)), FakeSource(mapOf("v:a.txt" to "abc".toByteArray())))
+        assertFalse(longer.succeeded)
+        assertNull(dest.childNamed(root, "a.txt"))
+        val shorter = export(plan(file("b.txt", 9)), FakeSource(mapOf("v:b.txt" to "abc".toByteArray())))
+        assertFalse(shorter.succeeded)
+        assertNull(dest.childNamed(root, "b.txt"))
+    }
+
+    @Test
+    fun `an unknown declared size is not a mismatch`() {
+        val outcome = export(plan(file("a.txt", -1)), FakeSource(mapOf("v:a.txt" to "abc".toByteArray())))
+        assertTrue(outcome.succeeded)
+        assertArrayEquals("abc".toByteArray(), dest.bytesAt(root, "a.txt"))
     }
 
     @Test
@@ -514,5 +587,119 @@ class TreeExporterTest {
 
         assertNotNull("expected the ordering check to fail loudly", thrown)
         assertTrue("nothing may have been created", dest.createCalls.isEmpty())
+    }
+
+    // ---- pipelined export tests --------------------------------------------
+
+    @Test
+    fun `pipelined export of multi-chunk file completes with full verification`() {
+        val data = ByteArray(TreeExporter.CHUNK_SIZE * 2 + 54321) { (it * 17 % 251).toByte() }
+        val p = plan(file("multi.bin", data.size.toLong()))
+        val source = FakeSource(mapOf("v:multi.bin" to data))
+
+        val outcome = export(p, source)
+
+        assertTrue(outcome.failure?.toString() ?: "expected success", outcome.succeeded)
+        assertEquals(1, outcome.filesCopied)
+        assertEquals(data.size.toLong(), outcome.bytesCopied)
+        assertArrayEquals(data, dest.bytesAt(root, "multi.bin"))
+    }
+
+    @Test
+    fun `pipelined export handles fragmented short reads correctly`() {
+        val data = ByteArray(TreeExporter.CHUNK_SIZE * 2 + 1000) { (it % 253).toByte() }
+        val p = plan(file("fragmented.bin", data.size.toLong()))
+        // Source returns at most 32 KB per read call
+        val source = SourceBytes { _ ->
+            object : java.io.ByteArrayInputStream(data) {
+                override fun read(b: ByteArray, off: Int, len: Int): Int {
+                    val chunkLimit = minOf(len, 32 * 1024)
+                    return super.read(b, off, chunkLimit)
+                }
+            }
+        }
+
+        val outcome = export(p, source)
+
+        assertTrue(outcome.failure?.toString() ?: "expected success", outcome.succeeded)
+        assertEquals(1, outcome.filesCopied)
+        assertEquals(data.size.toLong(), outcome.bytesCopied)
+        assertArrayEquals(data, dest.bytesAt(root, "fragmented.bin"))
+    }
+
+    @Test
+    fun `pipelined export fails and cleans up when source file has early EOF`() {
+        val realData = ByteArray(TreeExporter.CHUNK_SIZE * 2) { 7 }
+        // Declare 3 chunks, but source only provides 2 chunks
+        val declaredSize = (TreeExporter.CHUNK_SIZE * 3).toLong()
+        val p = plan(file("short.bin", declaredSize))
+        val source = FakeSource(mapOf("v:short.bin" to realData))
+
+        val outcome = export(p, source)
+
+        assertFalse(outcome.succeeded)
+        assertTrue(outcome.failure is TransferFailure)
+        assertEquals("short.bin", outcome.stoppedAtPath)
+        assertNull("partial multi-chunk file must be deleted", dest.childNamed(root, "short.bin"))
+    }
+
+    @Test
+    fun `pipelined export fails and cleans up when source file is larger than declared`() {
+        val realData = ByteArray(TreeExporter.CHUNK_SIZE * 2 + 100) { 7 }
+        // Declare 2 chunks, but source has 100 extra bytes
+        val declaredSize = (TreeExporter.CHUNK_SIZE * 2).toLong()
+        val p = plan(file("oversize.bin", declaredSize))
+        val source = FakeSource(mapOf("v:oversize.bin" to realData))
+
+        val outcome = export(p, source)
+
+        assertFalse(outcome.succeeded)
+        assertTrue(outcome.failure is TransferFailure)
+        assertEquals("oversize.bin", outcome.stoppedAtPath)
+        assertNull("oversized multi-chunk file must be deleted", dest.childNamed(root, "oversize.bin"))
+    }
+
+    @Test
+    fun `pipelined export fails and cleans up when destination write fails mid-pipeline`() {
+        val data = ByteArray(TreeExporter.CHUNK_SIZE * 3) { 1 }
+        val p = plan(file("writefail.bin", data.size.toLong()))
+        val source = FakeSource(mapOf("v:writefail.bin" to data))
+        dest.failWriteAfterTotalBytes = (TreeExporter.CHUNK_SIZE * 1.5).toLong()
+
+        val outcome = export(p, source)
+
+        assertFalse(outcome.succeeded)
+        assertTrue(outcome.failure is java.io.IOException)
+        assertEquals("writefail.bin", outcome.stoppedAtPath)
+        assertNull("failed write must be deleted", dest.childNamed(root, "writefail.bin"))
+    }
+
+    @Test
+    fun `pipelined export fails and cleans up when source read fails mid-pipeline`() {
+        val data = ByteArray(TreeExporter.CHUNK_SIZE * 3) { 1 }
+        val p = plan(file("readfail.bin", data.size.toLong()))
+        var bytesRead = 0
+        val source = SourceBytes { _ ->
+            object : java.io.InputStream() {
+                override fun read(): Int = throw UnsupportedOperationException()
+                override fun read(b: ByteArray, off: Int, len: Int): Int {
+                    if (bytesRead >= TreeExporter.CHUNK_SIZE * 1.5) {
+                        throw java.io.IOException("simulated source read error")
+                    }
+                    val n = minOf(len, data.size - bytesRead)
+                    if (n <= 0) return -1
+                    System.arraycopy(data, bytesRead, b, off, n)
+                    bytesRead += n
+                    return n
+                }
+            }
+        }
+
+        val outcome = export(p, source)
+
+        assertFalse(outcome.succeeded)
+        assertTrue(outcome.failure is java.io.IOException)
+        assertEquals("readfail.bin", outcome.stoppedAtPath)
+        assertNull("failed read must be deleted", dest.childNamed(root, "readfail.bin"))
     }
 }

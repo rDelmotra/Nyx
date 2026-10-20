@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="transfer_channel_name">File transfers</string>
+    <string name="transfer_channel_description">Keeps the app alive while files are being copied to or from a drive</string>
+    <string name="transfer_notification_title">Copying files</string>
+    <string name="transfer_notification_text">%1$d in progress. Keep the drive plugged in.</string>
+
+    <string name="alert_channel_name">Drive write problems</string>
+    <string name="alert_channel_description">Warns when files may not have been saved to a drive</string>
+    <string name="alert_files_unsaved_title">Files may not be on the drive</string>
+    <string name="alert_files_unsaved_text_n">%1$d files reported as done may not have been saved. Check the drive before relying on them.</string>
+    <string name="alert_files_unsaved_text">Some files reported as done may not have been saved. Check the drive before relying on them.</string>
+    <string name="alert_saf_finish_title">A file was not saved</string>
+    <string name="alert_saf_finish_text">A file copied to the drive from another app could not be completed. The other app was told it succeeded.</string>
+    <string name="alert_saf_commit_title">A file may not be saved yet</string>
+    <string name="alert_saf_commit_text">A file copied to the drive from another app was written but not yet made permanent. Keep the drive plugged in.</string>
+</resources>

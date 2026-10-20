@@ -32,14 +32,15 @@ class UiErrorMessageTest {
             LuksException.WRONG_TARGET to "target USB",
             LuksException.UNVERIFIABLE_TARGET to "verify the USB",
             LuksException.ALREADY_EXISTS to "already exists",
-            LuksException.WRITER_BUSY to "write operation is currently in progress",
+            LuksException.WRITER_BUSY to "busy with a transfer",
             LuksException.ITEM_TOO_LARGE to "too large",
             LuksException.MUTEX_POISONED to "Drive state was compromised",
             LuksException.CANCELLED to "cancelled",
             LuksException.WRITE_SESSION_FENCED to "Lock and unlock the volume again",
+            LuksException.FILE_CHANGED to "changed or replaced",
         )
 
-        assertEquals("Must test exactly 20 error codes", 20, codes.size)
+        assertEquals("Must test exactly 21 error codes", 21, codes.size)
 
         for ((code, keyword) in codes) {
             val msg = UiErrorMessage.getBaseMessage(code)
@@ -123,5 +124,19 @@ class UiErrorMessageTest {
         val unknown = RuntimeException("something weird")
         val unknownMsg = UiErrorMessage.getUserMessage(unknown, "Operation")
         assertEquals("Operation failed: An unexpected error occurred.", unknownMsg)
+    }
+
+    /**
+     * Closed-handle failures are classified by type. Matching on message text
+     * meant any exception whose text happened to contain "closed" (or a path
+     * containing it) was reported as a dead handle.
+     */
+    @Test
+    fun closedHandleIsClassifiedByTypeNotByMessageText() {
+        val typed = UiErrorMessage.getUserMessage(dev.luksandroid.SessionClosedException("volume is closed"), "Read")
+        assertEquals("Read failed: " + UiErrorMessage.getBaseMessage(LuksException.BAD_HANDLE), typed)
+
+        val lookalike = UiErrorMessage.getUserMessage(IllegalStateException("volume is closed"), "Read")
+        assertEquals("Read failed: An unexpected error occurred.", lookalike)
     }
 }

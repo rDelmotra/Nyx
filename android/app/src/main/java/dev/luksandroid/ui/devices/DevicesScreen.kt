@@ -8,13 +8,26 @@ import android.hardware.usb.UsbManager
 import android.os.Build
 import android.text.Editable
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -22,12 +35,15 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Fingerprint
 import androidx.compose.material.icons.filled.FolderOpen
@@ -51,6 +67,7 @@ import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilledTonalIconButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedCard
@@ -70,6 +87,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontFamily
@@ -83,6 +103,7 @@ import dev.luksandroid.LuksDevice
 import dev.luksandroid.LuksException
 import dev.luksandroid.PartitionInfo
 import dev.luksandroid.Trace
+import dev.luksandroid.ui.UiErrorMessage
 import dev.luksandroid.UsbMassStorage
 import dev.luksandroid.biometricKeyFor
 import dev.luksandroid.formatSize
@@ -91,8 +112,13 @@ import dev.luksandroid.security.PassphraseScrubber
 import dev.luksandroid.security.SecurePassphraseBuffer
 import dev.luksandroid.session.LuksSession
 import dev.luksandroid.session.SessionState
+import dev.luksandroid.ui.LuksHaptics
 import dev.luksandroid.ui.SecurePassphraseField
-import dev.luksandroid.ui.theme.SuccessGreen
+import dev.luksandroid.ui.components.DiskVisualMap
+import dev.luksandroid.ui.theme.DarkOutline
+import dev.luksandroid.ui.theme.DestructiveRed
+import dev.luksandroid.ui.theme.StateLocked
+import dev.luksandroid.ui.theme.StateUnlocked
 import dev.luksandroid.ui.theme.WarningAmber
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -114,6 +140,7 @@ private sealed interface DeviceItemState {
 fun DevicesScreen(
     modifier: Modifier = Modifier,
     onNavigateToBrowser: (() -> Unit)? = null,
+    onOpenDiagnostics: (() -> Unit)? = null,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -172,7 +199,7 @@ fun DevicesScreen(
             deviceStates.forEach { (k, v) ->
                 if (v is DeviceItemState.Opened && (k !in validKeys || !v.device.isOpen)) {
                     if (v.device !== sessionDev) {
-                        runCatching { v.device.close() }
+                        Trace.cleanup("devices_close_stale") { v.device.close() }
                     }
                 }
             }
@@ -231,11 +258,11 @@ fun DevicesScreen(
             context.registerReceiver(receiver, filter)
         }
         onDispose {
-            runCatching { context.unregisterReceiver(receiver) }
+            Trace.cleanup("devices_unregister_receiver") { context.unregisterReceiver(receiver) }
             val sessionDev = LuksSession.device as? LuksDevice
             deviceStates.values.forEach { state ->
                 if (state is DeviceItemState.Opened && state.device !== sessionDev) {
-                    runCatching { state.device.close() }
+                    Trace.cleanup("devices_close_on_dispose") { state.device.close() }
                 }
             }
         }
@@ -260,12 +287,71 @@ fun DevicesScreen(
         }
     }
 
-    // Dialog state for passphrase entry
+    // In-place unlock state for passphrase entry
     var promptDialogTarget by remember { mutableStateOf<Pair<LuksDevice, PartitionInfo>?>(null) }
+
+    LaunchedEffect(deviceStates) {
+        if (promptDialogTarget == null) {
+            val firstLuks = deviceStates.values
+                .filterIsInstance<DeviceItemState.Opened>()
+                .map { it.device }
+                .firstNotNullOfOrNull { dev ->
+                    dev.openablePartitions.firstOrNull { it.isLuks }?.let { dev to it }
+                }
+            if (firstLuks != null) {
+                promptDialogTarget = firstLuks
+            }
+        }
+    }
 
     fun startManualUnlock(device: LuksDevice, partition: PartitionInfo, notice: String? = null) {
         dialogNotice = notice
         promptDialogTarget = device to partition
+    }
+
+    fun submitManualUnlock(
+        device: LuksDevice,
+        partition: PartitionInfo,
+        buffer: SecurePassphraseBuffer,
+        enrollBiometric: Boolean,
+    ) {
+        val bioKey = if (enrollBiometric) device.biometricKeyFor(partition) else null
+        val act = activity
+        LuksSession.scope.launch {
+            buffer.use { buf ->
+                var pendingKey: String? = null
+                if (bioKey != null && act != null) {
+                    withContext(Dispatchers.Main) { biometricBusy = true }
+                    try {
+                        if (enrollBiometric(act, bioKey, partition.name.ifBlank { "Partition #${partition.index}" }, buf)) {
+                            pendingKey = bioKey
+                        }
+                    } finally {
+                        withContext(Dispatchers.Main) { biometricBusy = false }
+                    }
+                }
+                var unlocked = false
+                try {
+                    val res = LuksSession.unlock(context, device, partition, buf)
+                    unlocked = res is SessionState.Unlocked
+                    if (res is SessionState.Failed) {
+                        withContext(Dispatchers.Main) {
+                            dialogNotice = res.message
+                        }
+                    } else if (unlocked) {
+                        withContext(Dispatchers.Main) {
+                            promptDialogTarget = null
+                            dialogNotice = null
+                        }
+                    }
+                } finally {
+                    pendingKey?.let { k ->
+                        if (!unlocked) BiometricPassphraseVault.forget(context, k)
+                        withContext(Dispatchers.Main) { vaultVersion++ }
+                    }
+                }
+            }
+        }
     }
 
     fun startBiometricUnlock(device: LuksDevice, partition: PartitionInfo) {
@@ -303,118 +389,75 @@ fun DevicesScreen(
         }
     }
 
-    Column(
-        modifier = modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp),
-    ) {
-        // Header
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
+    val onRetryPartition: (LuksDevice, PartitionInfo) -> Unit = { dev, part ->
+        scope.launch {
+            LuksSession.reset()
+            if (part.isPlain) {
+                LuksSession.openPlain(context, dev, part)
+            } else {
+                promptDialogTarget = dev to part
+            }
+        }
+    }
+    val onResetSession: () -> Unit = {
+        scope.launch {
+            LuksSession.reset()
+            scanDevices()
+        }
+    }
+
+    if (targets.isEmpty() && sessionState !is SessionState.Unlocked) {
+        Column(
+            modifier = modifier
+                .fillMaxSize()
+                .padding(16.dp),
         ) {
-            Column {
-                Text(
-                    text = "Storage Devices",
-                    style = MaterialTheme.typography.headlineMedium,
-                    color = MaterialTheme.colorScheme.onBackground,
-                )
-                Text(
-                    text = "Encrypted USB block storage",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
+            QuietRoomHeader(
+                isScanning = isScanning,
+                onScan = { scanDevices() },
+                onOpenDiagnostics = onOpenDiagnostics,
+            )
 
-            OutlinedButton(
-                onClick = { scanDevices() },
-                enabled = !isScanning,
-                shape = RoundedCornerShape(8.dp),
+            GlobalSessionNotices(
+                sessionState = sessionState,
+                deviceStates = deviceStates,
+                onRetryPartition = onRetryPartition,
+                onReset = onResetSession,
+                modifier = Modifier.padding(top = 16.dp),
+            )
+
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth(),
+                contentAlignment = Alignment.Center,
             ) {
-                if (isScanning) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(16.dp),
-                        strokeWidth = 2.dp,
-                    )
-                } else {
-                    Icon(
-                        imageVector = Icons.Default.Refresh,
-                        contentDescription = "Scan",
-                        modifier = Modifier.size(16.dp),
-                    )
-                }
-                Spacer(modifier = Modifier.width(6.dp))
-                Text("Rescan")
+                EmptyDevicesView(onScan = { scanDevices() }, isScanning = isScanning)
             }
-        }
 
-        // Global Session State notices (Unlocking / Detached / Failed)
-        when (val s = sessionState) {
-            is SessionState.Unlocking -> {
-                UnlockingStateCard(partition = s.partition)
-            }
-            is SessionState.Detached -> {
-                DetachedStateCard(
-                    message = s.message,
-                    onDismiss = {
-                        scope.launch {
-                            LuksSession.reset()
-                            scanDevices()
-                        }
-                    }
-                )
-            }
-            is SessionState.Failed -> {
-                FailedStateCard(
-                    message = s.message,
-                    onReset = {
-                        scope.launch {
-                            LuksSession.reset()
-                        }
-                    },
-                    onTryAgain = if (s.partition != null) {
-                        {
-                            val targetDev = deviceStates.values
-                                .filterIsInstance<DeviceItemState.Opened>()
-                                .map { it.device }
-                                .firstOrNull { it.openablePartitions.any { op -> op.offsetBytes == s.partition.offsetBytes } }
-                            if (targetDev != null) {
-                                scope.launch {
-                                    LuksSession.reset()
-                                    if (s.partition.isPlain) {
-                                        LuksSession.openPlain(context, targetDev, s.partition)
-                                    } else {
-                                        promptDialogTarget = targetDev to s.partition
-                                    }
-                                }
-                            } else {
-                                scope.launch { LuksSession.reset() }
-                            }
-                        }
-                    } else null
-                )
-            }
-            is SessionState.Unlocked -> {
-                UnlockedStateCard(
-                    state = s,
-                    onNavigateToBrowser = onNavigateToBrowser,
-                    onLock = {
-                        scope.launch { LuksSession.lock() }
-                    }
-                )
-            }
-            is SessionState.Locked -> {
-                // Normal locked flow
-            }
+            QuietSecurityFooter()
         }
+    } else {
+        Column(
+            modifier = modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
+            QuietRoomHeader(
+                isScanning = isScanning,
+                onScan = { scanDevices() },
+                onOpenDiagnostics = onOpenDiagnostics,
+            )
 
-        // Render targets
-        if (targets.isEmpty() && sessionState !is SessionState.Unlocked) {
-            EmptyDevicesCard(onScan = { scanDevices() })
-        } else {
+            GlobalSessionNotices(
+                sessionState = sessionState,
+                deviceStates = deviceStates,
+                onRetryPartition = onRetryPartition,
+                onReset = onResetSession,
+            )
+
             targets.forEach { target ->
                 val key = keyOf(target)
                 val itemState = deviceStates[key] ?: DeviceItemState.Idle
@@ -428,6 +471,8 @@ fun DevicesScreen(
                     biometricAvailable = biometricAvailable,
                     biometricBusy = biometricBusy,
                     vaultVersion = vaultVersion,
+                    promptDialogTarget = promptDialogTarget,
+                    dialogNotice = dialogNotice,
                     onRequestPermission = {
                         scope.launch {
                             val granted = UsbMassStorage.requestPermission(context, target.device)
@@ -459,56 +504,16 @@ fun DevicesScreen(
                     onForgetBiometric = { bioKey, partition ->
                         forgetTarget = bioKey to partition
                     },
+                    onSubmitUnlock = { device, partition, buffer, enroll ->
+                        submitManualUnlock(device, partition, buffer, enroll)
+                    },
+                    onDismissUnlock = {
+                        promptDialogTarget = null
+                        dialogNotice = null
+                    },
                 )
             }
         }
-    }
-
-    // Passphrase Entry Dialog
-    promptDialogTarget?.let { (device, partition) ->
-        val bioKey = remember(device, partition) { device.biometricKeyFor(partition) }
-        val offerEnroll = remember(bioKey, biometricAvailable, vaultVersion) {
-            bioKey != null && biometricAvailable && !BiometricPassphraseVault.isEnrolled(context, bioKey)
-        }
-        PassphraseEntryDialog(
-            partition = partition,
-            offerBiometricEnroll = offerEnroll,
-            notice = dialogNotice,
-            onDismiss = {
-                promptDialogTarget = null
-                dialogNotice = null
-            },
-            onSubmit = { buffer, enroll ->
-                promptDialogTarget = null
-                dialogNotice = null
-                val enrollKey = if (enroll) bioKey else null
-                val act = activity
-                LuksSession.scope.launch {
-                    buffer.use { buf ->
-                        var pendingKey: String? = null
-                        if (enrollKey != null && act != null) {
-                            withContext(Dispatchers.Main) { biometricBusy = true }
-                            try {
-                                if (enrollBiometric(act, enrollKey, partition.name.ifBlank { "Partition #${partition.index}" }, buf)) {
-                                    pendingKey = enrollKey
-                                }
-                            } finally {
-                                withContext(Dispatchers.Main) { biometricBusy = false }
-                            }
-                        }
-                        var unlocked = false
-                        try {
-                            unlocked = LuksSession.unlock(context, device, partition, buf) is SessionState.Unlocked
-                        } finally {
-                            pendingKey?.let { k ->
-                                if (!unlocked) BiometricPassphraseVault.forget(context, k)
-                                withContext(Dispatchers.Main) { vaultVersion++ }
-                            }
-                        }
-                    }
-                }
-            },
-        )
     }
 
     // Forget-biometric confirmation
@@ -526,27 +531,125 @@ fun DevicesScreen(
 }
 
 @Composable
-private fun EmptyDevicesCard(
+private fun QuietRoomHeader(
+    isScanning: Boolean,
     onScan: () -> Unit,
+    onOpenDiagnostics: (() -> Unit)?,
     modifier: Modifier = Modifier,
 ) {
-    Card(
+    Row(
         modifier = modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
-        ),
-        shape = RoundedCornerShape(16.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(
+                imageVector = Icons.Default.Lock,
+                contentDescription = null,
+                tint = StateLocked,
+                modifier = Modifier.size(20.dp),
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Text(
+                text = "LUKS Android",
+                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.SemiBold),
+                color = MaterialTheme.colorScheme.onBackground,
+            )
+        }
+
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            if (isScanning) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(16.dp),
+                    strokeWidth = 2.dp,
+                    color = StateLocked,
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+            } else {
+                IconButton(onClick = onScan) {
+                    Icon(
+                        imageVector = Icons.Default.Refresh,
+                        contentDescription = "Check connection",
+                        modifier = Modifier.size(18.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            if (onOpenDiagnostics != null) {
+                IconButton(onClick = onOpenDiagnostics) {
+                    Icon(
+                        imageVector = Icons.Default.BugReport,
+                        contentDescription = "Diagnostics",
+                        modifier = Modifier.size(18.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun GlobalSessionNotices(
+    sessionState: SessionState,
+    deviceStates: Map<String, DeviceItemState>,
+    onRetryPartition: (LuksDevice, PartitionInfo) -> Unit,
+    onReset: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    when (val s = sessionState) {
+        is SessionState.Unlocking -> {
+            UnlockingStateCard(partition = s.partition, modifier = modifier)
+        }
+        is SessionState.Detached -> {
+            DetachedStateCard(
+                message = s.message,
+                onDismiss = onReset,
+                modifier = modifier,
+            )
+        }
+        is SessionState.Failed -> {
+            val part = s.partition
+            val targetDev = if (part != null) {
+                deviceStates.values
+                    .filterIsInstance<DeviceItemState.Opened>()
+                    .map { it.device }
+                    .firstOrNull { it.openablePartitions.any { op -> op.offsetBytes == part.offsetBytes } }
+            } else null
+
+            FailedStateCard(
+                message = s.message,
+                onReset = onReset,
+                onTryAgain = if (part != null && targetDev != null) {
+                    { onRetryPartition(targetDev, part) }
+                } else null,
+                modifier = modifier,
+            )
+        }
+        is SessionState.Unlocked -> {}
+        is SessionState.Locked -> {}
+    }
+}
+
+@Composable
+private fun EmptyDevicesView(
+    onScan: () -> Unit,
+    isScanning: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = 24.dp),
+        contentAlignment = Alignment.Center,
     ) {
         Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(32.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
             Box(
                 modifier = Modifier
-                    .size(64.dp)
+                    .size(76.dp)
                     .clip(CircleShape)
                     .background(MaterialTheme.colorScheme.surfaceVariant),
                 contentAlignment = Alignment.Center,
@@ -555,19 +658,19 @@ private fun EmptyDevicesCard(
                     imageVector = Icons.Default.Usb,
                     contentDescription = null,
                     modifier = Modifier.size(36.dp),
-                    tint = MaterialTheme.colorScheme.primary,
+                    tint = StateLocked,
                 )
             }
 
             Text(
-                text = "Plug in a USB storage drive",
-                style = MaterialTheme.typography.titleLarge,
+                text = "Plug in a drive",
+                style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.SemiBold),
                 textAlign = TextAlign.Center,
                 color = MaterialTheme.colorScheme.onSurface,
             )
 
             Text(
-                text = "Connect a LUKS-encrypted USB drive via an OTG adapter or USB-C cable.",
+                text = "Nothing leaves this phone. Connect via USB-C or OTG adapter.\nDecryption keys remain strictly in RAM.",
                 style = MaterialTheme.typography.bodyMedium,
                 textAlign = TextAlign.Center,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -575,15 +678,52 @@ private fun EmptyDevicesCard(
 
             Spacer(modifier = Modifier.height(4.dp))
 
-            Button(
-                onClick = onScan,
-                shape = RoundedCornerShape(8.dp),
-            ) {
-                Icon(imageVector = Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
-                Spacer(modifier = Modifier.width(6.dp))
-                Text("Scan USB")
+            if (isScanning) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(20.dp),
+                    strokeWidth = 2.dp,
+                    color = StateLocked,
+                )
+            } else {
+                TextButton(onClick = onScan) {
+                    Icon(
+                        imageVector = Icons.Default.Refresh,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Check USB connection", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
             }
         }
+    }
+}
+
+@Composable
+private fun QuietSecurityFooter(modifier: Modifier = Modifier) {
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(vertical = 8.dp),
+        horizontalArrangement = Arrangement.Center,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            imageVector = Icons.Default.Security,
+            contentDescription = null,
+            modifier = Modifier.size(13.dp),
+            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
+        )
+        Spacer(modifier = Modifier.width(6.dp))
+        Text(
+            text = "Isolated RAM · Zero network · Off-heap key wiping",
+            style = MaterialTheme.typography.labelSmall.copy(
+                fontSize = 11.sp,
+                letterSpacing = 0.3.sp,
+            ),
+            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+        )
     }
 }
 
@@ -596,21 +736,23 @@ private fun TargetDeviceCard(
     biometricAvailable: Boolean,
     biometricBusy: Boolean,
     vaultVersion: Int,
+    promptDialogTarget: Pair<LuksDevice, PartitionInfo>?,
+    dialogNotice: String?,
     onRequestPermission: () -> Unit,
     onOpen: () -> Unit,
     onUnlockPartition: (LuksDevice, PartitionInfo) -> Unit,
     onBiometricUnlockPartition: (LuksDevice, PartitionInfo) -> Unit,
     onMountPartition: (LuksDevice, PartitionInfo) -> Unit = { _, _ -> },
     onForgetBiometric: (String, PartitionInfo) -> Unit = { _, _ -> },
+    onSubmitUnlock: (LuksDevice, PartitionInfo, SecurePassphraseBuffer, Boolean) -> Unit = { _, _, _, _ -> },
+    onDismissUnlock: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
-    Card(
+    Surface(
         modifier = modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceVariant,
-        ),
-        shape = RoundedCornerShape(14.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        shape = RoundedCornerShape(16.dp),
     ) {
         Column(
             modifier = Modifier
@@ -618,7 +760,7 @@ private fun TargetDeviceCard(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            // Header Row: USB Icon, Label, VID:PID
+            // Header Row: USB Icon, Label
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -633,7 +775,7 @@ private fun TargetDeviceCard(
                     Icon(
                         imageVector = Icons.Default.Usb,
                         contentDescription = "USB",
-                        tint = MaterialTheme.colorScheme.primary,
+                        tint = StateLocked,
                         modifier = Modifier.size(24.dp),
                     )
                 }
@@ -647,29 +789,24 @@ private fun TargetDeviceCard(
                         color = MaterialTheme.colorScheme.onSurface,
                     )
                     Text(
-                        text = "VID:PID %04x:%04x · Interface %d".format(
-                            target.device.vendorId,
-                            target.device.productId,
-                            target.usbInterface.id,
-                        ),
-                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                        text = "USB Storage · Interface ${target.usbInterface.id}",
+                        style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
             }
 
-            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.3f))
 
             // State specific content
             if (!hasPermission) {
-                // Permission not granted
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween,
                 ) {
                     Text(
-                        text = "USB permission required to read drive",
+                        text = "Tap to allow access to this drive",
                         style = MaterialTheme.typography.bodySmall,
                         color = WarningAmber,
                         modifier = Modifier.weight(1f),
@@ -689,7 +826,6 @@ private fun TargetDeviceCard(
                     }
                 }
             } else {
-                // Permission granted
                 when (itemState) {
                     is DeviceItemState.Idle -> {
                         Row(
@@ -734,39 +870,99 @@ private fun TargetDeviceCard(
                         val dev = itemState.device
                         val info = dev.info
 
-                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Text(
-                                text = "${info.vendor} ${info.product} · ${formatSize(info.sizeBytes)} · ${info.tableKind}",
-                                style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium),
-                                color = MaterialTheme.colorScheme.onSurface,
-                            )
-
-                            if (info.partitions.isEmpty()) {
+                        Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                                 Text(
-                                    text = "No partition table found on drive.",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    text = "${info.vendor} ${info.product} · ${formatSize(info.sizeBytes)} · ${info.tableKind}",
+                                    style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium),
+                                    color = MaterialTheme.colorScheme.onSurface,
                                 )
+
+                                if (info.partitions.isNotEmpty()) {
+                                    DiskVisualMap(
+                                        deviceInfo = info,
+                                        selectedPartition = promptDialogTarget?.takeIf { it.first == dev }?.second,
+                                        onSelectPartition = { partition ->
+                                            onUnlockPartition(dev, partition)
+                                        },
+                                    )
+                                } else {
+                                    Text(
+                                        text = "No partition table found on drive.",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
                             }
 
-                            // Render partitions
-                            info.partitions.forEach { partition ->
-                                val bioKey = remember(dev, partition) { dev.biometricKeyFor(partition) }
+                            // Show unlock challenge directly under map if a partition is selected
+                            val selectedPartition = promptDialogTarget?.takeIf { it.first == dev }?.second
+                            if (selectedPartition != null && sessionState is SessionState.Locked) {
+                                val bioKey = remember(dev, selectedPartition) { dev.biometricKeyFor(selectedPartition) }
                                 val enrolled = remember(bioKey, vaultVersion) {
                                     bioKey != null && BiometricPassphraseVault.isEnrolled(context, bioKey)
                                 }
-                                PartitionItemCard(
-                                    device = dev,
-                                    partition = partition,
-                                    sessionState = sessionState,
-                                    biometricEnrolled = enrolled,
-                                    showBiometricUnlock = enrolled && biometricAvailable,
-                                    biometricBusy = biometricBusy,
-                                    onUnlock = { onUnlockPartition(dev, partition) },
-                                    onBiometricUnlock = { onBiometricUnlockPartition(dev, partition) },
-                                    onMount = { onMountPartition(dev, partition) },
-                                    onForgetBiometric = { bioKey?.let { onForgetBiometric(it, partition) } },
-                                )
+                                val offerEnroll = remember(bioKey, biometricAvailable, vaultVersion) {
+                                    bioKey != null && biometricAvailable && !BiometricPassphraseVault.isEnrolled(context, bioKey)
+                                }
+
+                                AnimatedVisibility(
+                                    visible = true,
+                                    enter = fadeIn() + expandVertically(expandFrom = Alignment.Top),
+                                    exit = fadeOut() + shrinkVertically(shrinkTowards = Alignment.Top),
+                                ) {
+                                    if (selectedPartition.isLuks) {
+                                        InPlaceUnlockSection(
+                                            partition = selectedPartition,
+                                            showBiometricUnlock = enrolled && biometricAvailable,
+                                            biometricEnrolled = enrolled,
+                                            biometricBusy = biometricBusy,
+                                            offerBiometricEnroll = offerEnroll,
+                                            dialogNotice = dialogNotice,
+                                            onBiometricUnlock = { onBiometricUnlockPartition(dev, selectedPartition) },
+                                            onForgetBiometric = { bioKey?.let { onForgetBiometric(it, selectedPartition) } },
+                                            onSubmitPassphrase = { buffer, enroll ->
+                                                onSubmitUnlock(dev, selectedPartition, buffer, enroll)
+                                            },
+                                            onDismiss = onDismissUnlock,
+                                        )
+                                    } else if (selectedPartition.isPlain) {
+                                        Column(
+                                            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                                        ) {
+                                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.25f))
+                                            FilledTonalButton(
+                                                onClick = { onMountPartition(dev, selectedPartition) },
+                                                shape = RoundedCornerShape(8.dp),
+                                                modifier = Modifier.fillMaxWidth()
+                                            ) {
+                                                Icon(
+                                                    imageVector = Icons.Default.Storage,
+                                                    contentDescription = null,
+                                                    modifier = Modifier.size(16.dp),
+                                                )
+                                                Spacer(modifier = Modifier.width(4.dp))
+                                                Text("Mount ${selectedPartition.fsType?.uppercase() ?: "Plain"}")
+                                            }
+                                            Row(
+                                                modifier = Modifier.fillMaxWidth(),
+                                                horizontalArrangement = Arrangement.End
+                                            ) {
+                                                TextButton(
+                                                    onClick = onDismissUnlock,
+                                                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
+                                                    modifier = Modifier.height(26.dp),
+                                                ) {
+                                                    Text(
+                                                        text = "Cancel",
+                                                        style = MaterialTheme.typography.labelSmall.copy(color = MaterialTheme.colorScheme.onSurfaceVariant),
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -795,234 +991,169 @@ private fun TargetDeviceCard(
 }
 
 @Composable
-private fun PartitionItemCard(
-    device: LuksDevice,
+private fun InPlaceUnlockSection(
     partition: PartitionInfo,
-    sessionState: SessionState,
-    biometricEnrolled: Boolean,
     showBiometricUnlock: Boolean,
+    biometricEnrolled: Boolean,
     biometricBusy: Boolean,
-    onUnlock: () -> Unit,
-    onBiometricUnlock: () -> Unit = {},
-    onMount: () -> Unit = {},
-    onForgetBiometric: () -> Unit = {},
+    offerBiometricEnroll: Boolean,
+    dialogNotice: String?,
+    onBiometricUnlock: () -> Unit,
+    onForgetBiometric: () -> Unit,
+    onSubmitPassphrase: (SecurePassphraseBuffer, Boolean) -> Unit,
+    onDismiss: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val isSessionUnlocked = sessionState is SessionState.Unlocked &&
-            sessionState.partition.offsetBytes == partition.offsetBytes
+    var activeEditable by remember { mutableStateOf<Editable?>(null) }
+    var hasContent by remember { mutableStateOf(false) }
+    var enrollChecked by remember { mutableStateOf(false) }
 
-    OutlinedCard(
-        modifier = modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(8.dp),
-        colors = CardDefaults.outlinedCardColors(
-            containerColor = MaterialTheme.colorScheme.surface,
-        ),
+    fun submit() {
+        val editable = activeEditable ?: return
+        val buffer = PassphraseScrubber.extractAndScrub(editable)
+        onSubmitPassphrase(buffer, offerBiometricEnroll && enrollChecked)
+    }
+
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(top = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
+        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.25f))
+
         Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(12.dp),
-            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.weight(1f),
+            Text(
+                text = "Unlock ${partition.name.ifBlank { "Partition #${partition.index}" }}",
+                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            if (biometricEnrolled) {
+                BiometricRevokeIcon(onTriggerTurnOff = onForgetBiometric)
+            }
+        }
+
+        if (dialogNotice != null) {
+            Text(
+                text = dialogNotice,
+                style = MaterialTheme.typography.bodySmall,
+                color = WarningAmber,
+            )
+        }
+
+        if (showBiometricUnlock) {
+            FilledTonalButton(
+                onClick = onBiometricUnlock,
+                enabled = !biometricBusy,
+                shape = RoundedCornerShape(8.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(36.dp),
+                colors = ButtonDefaults.filledTonalButtonColors(
+                    containerColor = StateUnlocked.copy(alpha = 0.12f),
+                    contentColor = StateUnlocked,
+                ),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
             ) {
                 Icon(
-                    imageVector = if (partition.isLuks) {
-                        if (isSessionUnlocked) Icons.Default.LockOpen else Icons.Default.Lock
-                    } else {
-                        Icons.Default.Storage
-                    },
+                    imageVector = Icons.Default.Fingerprint,
                     contentDescription = null,
-                    tint = when {
-                        isSessionUnlocked -> SuccessGreen
-                        partition.isLuks -> MaterialTheme.colorScheme.primary
-                        partition.isPlain -> MaterialTheme.colorScheme.secondary
-                        partition.unsupportedReason != null -> MaterialTheme.colorScheme.error
-                        else -> MaterialTheme.colorScheme.onSurfaceVariant
-                    },
-                    modifier = Modifier.size(20.dp),
+                    modifier = Modifier.size(16.dp),
                 )
-                Spacer(modifier = Modifier.width(10.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = "Touch sensor to unlock with Fingerprint",
+                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Medium),
+                )
+            }
+        }
 
-                Column {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(
-                            text = partition.name.ifBlank { "Partition #${partition.index}" },
-                            style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium),
-                            color = MaterialTheme.colorScheme.onSurface,
-                        )
-                        if (partition.isLuks) {
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Box(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(4.dp))
-                                    .background(MaterialTheme.colorScheme.primaryContainer)
-                                    .padding(horizontal = 6.dp, vertical = 1.dp),
-                            ) {
-                                Text(
-                                    text = "LUKS${partition.luksVersion ?: ""}",
-                                    style = MaterialTheme.typography.labelSmall.copy(
-                                        fontWeight = FontWeight.Bold,
-                                        fontSize = 10.sp,
-                                    ),
-                                    color = MaterialTheme.colorScheme.onPrimaryContainer,
-                                )
-                            }
-                        } else if (partition.isPlain) {
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Box(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(4.dp))
-                                    .background(MaterialTheme.colorScheme.secondaryContainer)
-                                    .padding(horizontal = 6.dp, vertical = 1.dp),
-                            ) {
-                                Text(
-                                    text = "${partition.fsType?.uppercase()}",
-                                    style = MaterialTheme.typography.labelSmall.copy(
-                                        fontWeight = FontWeight.Bold,
-                                        fontSize = 10.sp,
-                                    ),
-                                    color = MaterialTheme.colorScheme.onSecondaryContainer,
-                                )
-                            }
-                        } else if (partition.unsupportedReason != null) {
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Box(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(4.dp))
-                                    .background(MaterialTheme.colorScheme.errorContainer)
-                                    .padding(horizontal = 6.dp, vertical = 1.dp),
-                            ) {
-                                Text(
-                                    text = "${partition.fsType?.uppercase() ?: "UNKNOWN"} (Unsupported)",
-                                    style = MaterialTheme.typography.labelSmall.copy(
-                                        fontWeight = FontWeight.Bold,
-                                        fontSize = 10.sp,
-                                    ),
-                                    color = MaterialTheme.colorScheme.onErrorContainer,
-                                )
-                            }
-                        }
-                    }
-
-                    Text(
-                        text = buildString {
-                            append("${formatSize(partition.sizeBytes)} · Offset 0x${partition.offsetBytes.toString(16)}")
-                            if (partition.unsupportedReason != null) {
-                                append(" · ${partition.unsupportedReason}")
-                            }
-                        },
-                        style = MaterialTheme.typography.bodySmall.copy(
-                            fontFamily = FontFamily.Monospace,
-                            fontSize = 11.sp,
-                        ),
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-
-                    if (biometricEnrolled) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(
-                                imageVector = Icons.Default.Fingerprint,
-                                contentDescription = null,
-                                modifier = Modifier.size(12.dp),
-                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text(
-                                text = "Fingerprint unlock on",
-                                style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                            TextButton(
-                                onClick = onForgetBiometric,
-                                contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
-                            ) {
-                                Text("Turn off", style = MaterialTheme.typography.labelSmall)
-                            }
-                        }
-                    }
-                }
+        // Compact Passphrase Entry Row: Input + Unlock button side-by-side
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Box(modifier = Modifier.weight(1f)) {
+                SecurePassphraseField(
+                    onEditableReady = { activeEditable = it },
+                    onHasContentChange = { hasContent = it },
+                )
             }
 
-            if (partition.isLuks) {
-                if (isSessionUnlocked) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(
-                            imageVector = Icons.Default.CheckCircle,
-                            contentDescription = "Unlocked",
-                            tint = SuccessGreen,
-                            modifier = Modifier.size(16.dp),
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text(
-                            text = "Unlocked",
-                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
-                            color = SuccessGreen,
-                        )
-                    }
-                } else if (sessionState is SessionState.Locked) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        if (showBiometricUnlock) {
-                            FilledTonalIconButton(
-                                onClick = onBiometricUnlock,
-                                enabled = !biometricBusy,
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Fingerprint,
-                                    contentDescription = "Unlock with fingerprint",
-                                    modifier = Modifier.size(20.dp),
-                                )
-                            }
-                            Spacer(modifier = Modifier.width(6.dp))
-                        }
-                        FilledTonalButton(
-                            onClick = onUnlock,
-                            enabled = !biometricBusy,
-                            shape = RoundedCornerShape(8.dp),
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.LockOpen,
-                                contentDescription = null,
-                                modifier = Modifier.size(16.dp),
-                            )
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("Unlock")
-                        }
-                    }
-                }
-            } else if (partition.isPlain) {
-                if (isSessionUnlocked) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(
-                            imageVector = Icons.Default.CheckCircle,
-                            contentDescription = "Mounted",
-                            tint = SuccessGreen,
-                            modifier = Modifier.size(16.dp),
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text(
-                            text = "Mounted",
-                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
-                            color = SuccessGreen,
-                        )
-                    }
-                } else if (sessionState is SessionState.Locked) {
-                    FilledTonalButton(
-                        onClick = onMount,
-                        shape = RoundedCornerShape(8.dp),
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Storage,
-                            contentDescription = null,
-                            modifier = Modifier.size(16.dp),
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text("Mount")
-                    }
-                }
+            FilledTonalButton(
+                onClick = ::submit,
+                enabled = hasContent,
+                shape = RoundedCornerShape(8.dp),
+                modifier = Modifier.height(40.dp),
+                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 0.dp),
+            ) {
+                Icon(
+                    imageVector = Icons.Default.LockOpen,
+                    contentDescription = null,
+                    modifier = Modifier.size(15.dp),
+                )
+                Spacer(modifier = Modifier.width(4.dp))
+                Text(
+                    text = "Unlock",
+                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                )
+            }
+        }
+
+        // Sub-row: Memory security reassurance + Cancel affordance
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = "Protected memory · Wiped on lock",
+                style = MaterialTheme.typography.labelSmall.copy(
+                    fontSize = 10.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                ),
+            )
+
+            TextButton(
+                onClick = onDismiss,
+                contentPadding = PaddingValues(horizontal = 6.dp, vertical = 0.dp),
+                modifier = Modifier.height(26.dp),
+            ) {
+                Text(
+                    text = "Cancel",
+                    style = MaterialTheme.typography.labelSmall.copy(color = MaterialTheme.colorScheme.onSurfaceVariant),
+                )
+            }
+        }
+
+        if (offerBiometricEnroll) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .toggleable(
+                        value = enrollChecked,
+                        role = Role.Checkbox,
+                        onValueChange = { enrollChecked = it },
+                    )
+                    .padding(vertical = 2.dp),
+            ) {
+                Checkbox(
+                    checked = enrollChecked,
+                    onCheckedChange = null,
+                    modifier = Modifier.size(18.dp),
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = "Save passphrase to fingerprint for this drive",
+                    style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
             }
         }
     }
@@ -1072,18 +1203,34 @@ private fun UnlockingStateCard(
                         color = MaterialTheme.colorScheme.onPrimaryContainer,
                     )
                     Text(
-                        text = "Deriving master key · Elapsed: ${elapsedSec}s",
-                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-                        color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.8f),
+                        text = "Deriving key — slow on purpose, so guessing is slow too.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.85f),
                     )
                 }
             }
 
-            Text(
-                text = "Argon2 / PBKDF2 key derivation and memory allocation in progress.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.8f),
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                val kdfLabel = when (partition.luksVersion) {
+                    1 -> "PBKDF2 · Iterated KDF"
+                    2 -> "Argon2id · Memory-hard KDF"
+                    else -> "Cryptographic KDF"
+                }
+                Text(
+                    text = kdfLabel,
+                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace),
+                    color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.7f),
+                )
+                Text(
+                    text = "${elapsedSec}s elapsed",
+                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold),
+                    color = MaterialTheme.colorScheme.onPrimaryContainer,
+                )
+            }
         }
     }
 }
@@ -1097,9 +1244,10 @@ private fun DetachedStateCard(
     Card(
         modifier = modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.errorContainer,
+            containerColor = MaterialTheme.colorScheme.surfaceVariant,
         ),
         shape = RoundedCornerShape(12.dp),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
     ) {
         Row(
             modifier = Modifier
@@ -1115,33 +1263,29 @@ private fun DetachedStateCard(
                 Icon(
                     imageVector = Icons.Default.UsbOff,
                     contentDescription = null,
-                    tint = MaterialTheme.colorScheme.onErrorContainer,
+                    tint = StateLocked,
                     modifier = Modifier.size(28.dp),
                 )
                 Spacer(modifier = Modifier.width(12.dp))
                 Column {
                     Text(
-                        text = "Drive Detached",
+                        text = "Drive Disconnected",
                         style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                        color = MaterialTheme.colorScheme.onErrorContainer,
+                        color = MaterialTheme.colorScheme.onSurface,
                     )
                     Text(
-                        text = message,
+                        text = "Session closed safely. Master key cleared from memory.",
                         style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onErrorContainer.copy(alpha = 0.9f),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
             }
 
             Button(
                 onClick = onDismiss,
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = MaterialTheme.colorScheme.error,
-                    contentColor = MaterialTheme.colorScheme.onError,
-                ),
                 shape = RoundedCornerShape(8.dp),
             ) {
-                Text("Dismiss / Scan")
+                Text("Scan Drives")
             }
         }
     }
@@ -1155,77 +1299,15 @@ private fun FailedStateCard(
     modifier: Modifier = Modifier,
 ) {
     val isWrongPassphrase = message.contains("wrong passphrase", ignoreCase = true)
+    val autoDismissProgress = remember { Animatable(0f) }
 
-    Card(
-        modifier = modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.errorContainer,
-        ),
-        shape = RoundedCornerShape(12.dp),
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(
-                    imageVector = Icons.Default.ErrorOutline,
-                    contentDescription = null,
-                    tint = MaterialTheme.colorScheme.onErrorContainer,
-                    modifier = Modifier.size(24.dp),
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = if (isWrongPassphrase) "Incorrect Passphrase" else "Unlock Failed",
-                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                    color = MaterialTheme.colorScheme.onErrorContainer,
-                )
-            }
-
-            Text(
-                text = message,
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onErrorContainer.copy(alpha = 0.9f),
-            )
-
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Button(
-                    onClick = onReset,
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.error,
-                        contentColor = MaterialTheme.colorScheme.onError,
-                    ),
-                    shape = RoundedCornerShape(8.dp),
-                ) {
-                    Text("Reset")
-                }
-
-                if (onTryAgain != null) {
-                    FilledTonalButton(
-                        onClick = onTryAgain,
-                        shape = RoundedCornerShape(8.dp),
-                    ) {
-                        Text("Try Again")
-                    }
-                }
-            }
-        }
+    LaunchedEffect(Unit) {
+        autoDismissProgress.animateTo(
+            targetValue = 1f,
+            animationSpec = tween(durationMillis = 4000, easing = LinearEasing),
+        )
+        onReset()
     }
-}
-
-@Composable
-private fun UnlockedStateCard(
-    state: SessionState.Unlocked,
-    onNavigateToBrowser: (() -> Unit)?,
-    onLock: () -> Unit,
-    modifier: Modifier = Modifier,
-) {
-    val info = state.volume.info
 
     Card(
         modifier = modifier.fillMaxWidth(),
@@ -1233,6 +1315,7 @@ private fun UnlockedStateCard(
             containerColor = MaterialTheme.colorScheme.surfaceVariant,
         ),
         shape = RoundedCornerShape(12.dp),
+        border = BorderStroke(1.dp, if (isWrongPassphrase) StateUnlocked.copy(alpha = 0.5f) else DestructiveRed.copy(alpha = 0.5f)),
     ) {
         Column(
             modifier = Modifier
@@ -1240,196 +1323,175 @@ private fun UnlockedStateCard(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            if (!info.encrypted) {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.errorContainer,
-                    ),
-                    shape = RoundedCornerShape(8.dp),
-                ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(12.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Text(
-                            text = "⚠️ UNENCRYPTED DRIVE: Data on this partition is stored in plaintext.",
-                            style = MaterialTheme.typography.labelMedium.copy(
-                                fontWeight = FontWeight.Bold,
-                            ),
-                            color = MaterialTheme.colorScheme.onErrorContainer,
-                        )
-                    }
-                }
-            }
-
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(
-                    imageVector = if (info.encrypted) Icons.Default.LockOpen else Icons.Default.Storage,
+                    imageVector = if (isWrongPassphrase) Icons.Default.Lock else Icons.Default.ErrorOutline,
                     contentDescription = null,
-                    tint = SuccessGreen,
+                    tint = if (isWrongPassphrase) StateUnlocked else DestructiveRed,
                     modifier = Modifier.size(24.dp),
                 )
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = "Active Session: ${info.label.ifBlank { state.partition.label }}",
-                        style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                        color = MaterialTheme.colorScheme.onSurface,
-                    )
-                    Text(
-                        text = "Filesystem: ${info.fsType.uppercase()} · ${formatSize(info.sizeBytes)}" +
-                            if (!info.encrypted) " · Unencrypted" else "",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = if (isWrongPassphrase) "Incorrect Passphrase" else "Unlock Failed",
+                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+            }
+
+            if (!isWrongPassphrase) {
+                Text(
+                    text = message,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
 
             Row(
-                modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth(),
             ) {
-                if (onNavigateToBrowser != null) {
+                if (onTryAgain != null) {
                     Button(
-                        onClick = onNavigateToBrowser,
-                        modifier = Modifier.weight(1f),
+                        onClick = onTryAgain,
                         shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.height(38.dp),
+                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 0.dp),
                     ) {
-                        Icon(imageVector = Icons.Default.FolderOpen, contentDescription = null, modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Open File Browser")
+                        Text("Try Again")
                     }
                 }
 
-                OutlinedButton(
-                    onClick = onLock,
-                    shape = RoundedCornerShape(8.dp),
+                // Auto-dismiss bar: fills from 0% to 100% over 4s (tap to dismiss early)
+                val fillTrackColor = if (isWrongPassphrase) StateUnlocked.copy(alpha = 0.22f)
+                                     else DestructiveRed.copy(alpha = 0.20f)
+                Box(
+                    modifier = (if (onTryAgain != null) Modifier.weight(1f) else Modifier.fillMaxWidth())
+                        .height(38.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(MaterialTheme.colorScheme.surface)
+                        .border(
+                            BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)),
+                            RoundedCornerShape(8.dp),
+                        )
+                        .drawBehind {
+                            val fraction = autoDismissProgress.value.coerceIn(0f, 1f)
+                            if (fraction > 0f) {
+                                drawRect(
+                                    color = fillTrackColor,
+                                    size = size.copy(width = size.width * fraction),
+                                )
+                            }
+                        }
+                        .clickable(onClick = onReset),
+                    contentAlignment = Alignment.Center,
                 ) {
-                    Icon(
-                        imageVector = if (info.encrypted) Icons.Default.Lock else Icons.Default.LockOpen,
-                        contentDescription = null,
-                        modifier = Modifier.size(16.dp),
-                    )
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text(if (info.encrypted) "Lock" else "Unmount")
+                    Row(
+                        modifier = Modifier.fillMaxSize(),
+                        horizontalArrangement = Arrangement.Center,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Close,
+                            contentDescription = null,
+                            modifier = Modifier.size(14.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "Dismiss",
+                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Medium),
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                    }
                 }
             }
         }
     }
 }
 
-@Composable
-private fun PassphraseEntryDialog(
-    partition: PartitionInfo,
-    offerBiometricEnroll: Boolean,
-    notice: String?,
-    onDismiss: () -> Unit,
-    onSubmit: (SecurePassphraseBuffer, enrollBiometric: Boolean) -> Unit,
-) {
-    var activeEditable by remember { mutableStateOf<Editable?>(null) }
-    var hasContent by remember { mutableStateOf(false) }
-    var enrollChecked by remember { mutableStateOf(false) }
 
-    fun submit() {
-        val editable = activeEditable ?: return
-        val buffer = PassphraseScrubber.extractAndScrub(editable)
-        onSubmit(buffer, offerBiometricEnroll && enrollChecked)
+@Composable
+private fun BiometricRevokeIcon(
+    onTriggerTurnOff: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val holdProgress = remember { Animatable(0f) }
+    var isHolding by remember { mutableStateOf(false) }
+
+    // Guarantee vibrator motor is cancelled if composable unmounts while being touched
+    DisposableEffect(Unit) {
+        onDispose {
+            LuksHaptics.cancel(context)
+        }
     }
 
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(
-                    imageVector = Icons.Default.VpnKey,
-                    contentDescription = null,
-                    tint = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.size(24.dp),
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = "Unlock ${partition.name.ifBlank { "Partition #${partition.index}" }}",
-                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                )
-            }
-        },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                if (notice != null) {
-                    Text(
-                        text = notice,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = WarningAmber,
-                    )
+    // Faded dark reddish tones (calm, subtle, non-intrusive)
+    val containerBg = Color(0xFF281A1C)
+    val iconTint = Color(0xFFC76D6D)
+    val activeBorder = DestructiveRed.copy(alpha = 0.7f)
+
+    Box(
+        modifier = modifier
+            .size(24.dp)
+            .clip(RoundedCornerShape(6.dp))
+            .background(containerBg)
+            .border(
+                BorderStroke(
+                    width = 1.dp,
+                    color = if (isHolding) activeBorder else iconTint.copy(alpha = 0.25f),
+                ),
+                shape = RoundedCornerShape(6.dp),
+            )
+            .drawBehind {
+                val fraction = holdProgress.value
+                if (fraction > 0f) {
+                    drawRect(activeBorder.copy(alpha = 0.35f * fraction))
                 }
+            }
+            .pointerInput(Unit) {
+                awaitEachGesture {
+                    awaitFirstDown(requireUnconsumed = false)
+                    isHolding = true
+                    var triggered = false
 
-                Text(
-                    text = "Enter LUKS passphrase to derive decryption key:",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-
-                SecurePassphraseField(
-                    onEditableReady = { activeEditable = it },
-                    onHasContentChange = { hasContent = it },
-                )
-
-                Text(
-                    text = "Screen capture blocked & memory scrubbed on submit.",
-                    style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
-                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
-                )
-
-                if (offerBiometricEnroll) {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .toggleable(
-                                value = enrollChecked,
-                                role = Role.Checkbox,
-                                onValueChange = { enrollChecked = it },
-                            ),
-                    ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Checkbox(checked = enrollChecked, onCheckedChange = null)
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text(
-                                text = "Enable fingerprint unlock for this drive",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurface,
-                            )
-                        }
-                        Text(
-                            text = "Saved on this phone, encrypted with a key that needs your fingerprint.",
-                            style = MaterialTheme.typography.bodySmall.copy(fontSize = 11.sp),
-                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
-                            modifier = Modifier.padding(start = 36.dp),
+                    val holdJob = scope.launch {
+                        LuksHaptics.startUphillRamp(context)
+                        holdProgress.snapTo(0f)
+                        holdProgress.animateTo(
+                            targetValue = 1f,
+                            animationSpec = tween(durationMillis = 650, easing = LinearEasing),
                         )
+                        triggered = true
+                        LuksHaptics.rampPeakAndDrop(context)
+                        onTriggerTurnOff()
+                    }
+
+                    try {
+                        waitForUpOrCancellation()
+                    } finally {
+                        if (!triggered) {
+                            holdJob.cancel()
+                            LuksHaptics.cancel(context)
+                            scope.launch {
+                                holdProgress.animateTo(0f, animationSpec = tween(120))
+                            }
+                        }
+                        isHolding = false
                     }
                 }
-            }
-        },
-        confirmButton = {
-            Button(
-                onClick = ::submit,
-                enabled = hasContent,
-                shape = RoundedCornerShape(8.dp),
-            ) {
-                Text("Unlock")
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) {
-                Text("Cancel")
-            }
-        },
-        shape = RoundedCornerShape(16.dp),
-    )
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(
+            imageVector = Icons.Default.Fingerprint,
+            contentDescription = "Fingerprint enrolled. Touch and hold to turn off.",
+            tint = iconTint,
+            modifier = Modifier.size(13.dp),
+        )
+    }
 }
 
 @Composable
@@ -1438,22 +1500,51 @@ private fun ForgetBiometricDialog(
     onConfirm: () -> Unit,
     onDismiss: () -> Unit,
 ) {
+    val context = LocalContext.current
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Turn off fingerprint unlock?") },
+        title = {
+            Text(
+                text = "Turn off fingerprint unlock?",
+                style = MaterialTheme.typography.titleLarge,
+                color = MaterialTheme.colorScheme.error,
+            )
+        },
         text = {
-            Text("The saved passphrase for $label will be deleted from this phone. You'll need to type it next time.")
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(
+                    text = "Are you sure you want to turn off fingerprint unlock for \"$label\"?",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Text(
+                    text = "The saved passphrase will be removed from secure hardware storage.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                    fontWeight = FontWeight.Medium,
+                )
+                Text(
+                    text = "You will need to manually type the passphrase next time you unlock this partition.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         },
         confirmButton = {
             Button(
-                onClick = onConfirm,
+                onClick = {
+                    LuksHaptics.deadboltLock(context)
+                    onConfirm()
+                },
                 colors = ButtonDefaults.buttonColors(
                     containerColor = MaterialTheme.colorScheme.error,
                     contentColor = MaterialTheme.colorScheme.onError,
                 ),
                 shape = RoundedCornerShape(8.dp),
             ) {
-                Text("Turn off")
+                Text("Turn Off")
             }
         },
         dismissButton = {
@@ -1477,21 +1568,22 @@ private suspend fun openTarget(
         Trace.i("DevicesScreen: opened ${target.label} successfully")
         DeviceItemState.Opened(device)
     } catch (e: CancellationException) {
-        runCatching { device?.close() }
+        closeAfterFailedOpen(device, e)
         throw e
-    } catch (e: LuksException) {
-        runCatching { device?.close() }
-        Trace.err(e.code, "open_target")
-        Trace.e("DevicesScreen: open failed [${e.code}]")
-        DeviceItemState.Failed("[${e.code}] ${e.message}")
     } catch (e: Exception) {
-        if (e is CancellationException) {
-            runCatching { device?.close() }
-            throw e
-        }
-        runCatching { device?.close() }
-        Trace.err(-1, "open_target")
-        Trace.e("DevicesScreen: open failed: ${Trace.throwableSummary(e)}")
-        DeviceItemState.Failed(e.message ?: e.toString())
+        // LuksException included: the card shows the mapped message, never the native text.
+        closeAfterFailedOpen(device, e)
+        Trace.e("DevicesScreen: open_target failed: ${Trace.throwableSummary(e)}")
+        DeviceItemState.Failed(UiErrorMessage.getUserMessage(e, "Opening the drive"))
+    }
+}
+
+/** Closes a half-opened device after [failure]; a close error is attached to it and logged, not dropped. */
+private fun closeAfterFailedOpen(device: LuksDevice?, failure: Throwable) {
+    try {
+        device?.close()
+    } catch (c: Exception) {
+        failure.addSuppressed(c)
+        Trace.e("DevicesScreen: open_target cleanup close failed: ${Trace.throwableSummary(c)}")
     }
 }

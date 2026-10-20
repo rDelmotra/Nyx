@@ -14,12 +14,15 @@ pub mod oracle;
 pub mod btree_validator;
 pub mod mem_device;
 pub mod scratch;
+pub mod temp_guard;
+#[cfg(feature = "dangerous-write-support")]
+pub mod fail_after;
 #[cfg(feature = "dangerous-write-support")]
 pub mod accounting;
 #[cfg(feature = "dangerous-write-support")]
-pub mod fs_model;
-#[cfg(feature = "dangerous-write-support")]
 pub mod csum_pack;
+#[cfg(feature = "dangerous-write-support")]
+pub mod states;
 
 use luks_core::error::{LuksError, Result};
 use luks_core::usb::bot::{CBW_LEN, CBW_SIGNATURE, CSW_LEN, CSW_SIGNATURE};
@@ -62,7 +65,7 @@ enum Phase {
 pub struct MockUsbDrive {
     image: RefCell<Vec<u8>>,
     block_size: u32,
-    max_transfer: usize,
+    max_transfer: std::cell::Cell<usize>,
     phase: RefCell<Phase>,
     csw: RefCell<[u8; CSW_LEN]>,
     pub stats: RefCell<Stats>,
@@ -83,6 +86,14 @@ pub struct MockUsbDrive {
     /// where the mock expects the next CBW, which reads as a bad signature —
     /// a mock artefact that looks nothing like the failure being modelled.
     pending_fail: std::cell::Cell<bool>,
+    pub vpd_block_limits: RefCell<Option<(u32, u32)>>,
+    pub vpd_reject: std::cell::Cell<bool>,
+    pub stall_transfers_larger_than: std::cell::Cell<Option<usize>>,
+    pub stalled_endpoints: std::cell::Cell<bool>,
+    /// What MODE SENSE(6) reports for the Caching page's WCE bit. `None`
+    /// (the default) means the command is rejected like any other opcode this
+    /// mock does not implement.
+    pub write_cache_enabled: std::cell::Cell<Option<bool>>,
 }
 
 impl MockUsbDrive {
@@ -90,7 +101,7 @@ impl MockUsbDrive {
         Self {
             image: RefCell::new(image),
             block_size: 512,
-            max_transfer: 128 * 1024,
+            max_transfer: std::cell::Cell::new(128 * 1024),
             phase: RefCell::new(Phase::Idle),
             csw: RefCell::new([0u8; CSW_LEN]),
             stats: RefCell::new(Stats::default()),
@@ -98,7 +109,18 @@ impl MockUsbDrive {
             fail_opcodes: RefCell::new(Vec::new()),
             sense: [0, 0, 0],
             pending_fail: std::cell::Cell::new(false),
+            vpd_block_limits: RefCell::new(None),
+            vpd_reject: std::cell::Cell::new(false),
+            stall_transfers_larger_than: std::cell::Cell::new(None),
+            stalled_endpoints: std::cell::Cell::new(false),
+            write_cache_enabled: std::cell::Cell::new(None),
         }
+    }
+
+    /// Answer MODE SENSE(6) for the Caching page with the given WCE bit.
+    pub fn with_write_cache(self, wce: bool) -> Self {
+        self.write_cache_enabled.set(Some(wce));
+        self
     }
 
     /// Refuse `opcode` with CSW status 1, reporting `sense` when asked why.
@@ -120,8 +142,23 @@ impl MockUsbDrive {
         self
     }
 
-    pub fn with_max_transfer(mut self, max_transfer: usize) -> Self {
-        self.max_transfer = max_transfer;
+    pub fn with_max_transfer(self, max_transfer: usize) -> Self {
+        self.max_transfer.set(max_transfer);
+        self
+    }
+
+    pub fn with_vpd_block_limits(self, max_blocks: u32, opt_blocks: u32) -> Self {
+        *self.vpd_block_limits.borrow_mut() = Some((max_blocks, opt_blocks));
+        self
+    }
+
+    pub fn with_vpd_reject(self) -> Self {
+        self.vpd_reject.set(true);
+        self
+    }
+
+    pub fn with_stall_transfers_larger_than(self, bytes: usize) -> Self {
+        self.stall_transfers_larger_than.set(Some(bytes));
         self
     }
 
@@ -202,15 +239,42 @@ impl MockUsbDrive {
         let data: Vec<u8> = match cdb[0] {
             // INQUIRY
             0x12 => {
-                let mut d = vec![0u8; 36];
-                d[0] = 0x00; // direct-access block device
-                d[1] = 0x80; // removable
-                d[3] = 0x02;
-                d[4] = 31;
-                d[8..16].copy_from_slice(b"MOCKVEND");
-                d[16..32].copy_from_slice(b"MOCK USB DISK   ");
-                d[32..36].copy_from_slice(b"1.00");
-                d
+                if cdb.len() >= 3 && cdb[1] & 0x01 != 0 && cdb[2] == 0xB0 {
+                    if self.vpd_reject.get() {
+                        self.set_csw(tag, expected_len, 1);
+                        *self.phase.borrow_mut() = Phase::Csw { pos: 0 };
+                        return Ok(());
+                    }
+                    if let Some((max, opt)) = *self.vpd_block_limits.borrow() {
+                        let mut d = vec![0u8; 64];
+                        d[0] = 0x00; // direct-access block device
+                        d[1] = 0xB0; // Block Limits VPD page code
+                        d[2..4].copy_from_slice(&60u16.to_be_bytes()); // page length
+                        d[8..12].copy_from_slice(&max.to_be_bytes()); // max transfer blocks
+                        d[12..16].copy_from_slice(&opt.to_be_bytes()); // optimal transfer blocks
+                        d
+                    } else {
+                        let mut d = vec![0u8; 36];
+                        d[0] = 0x00;
+                        d[1] = 0x80;
+                        d[3] = 0x02;
+                        d[4] = 31;
+                        d[8..16].copy_from_slice(b"MOCKVEND");
+                        d[16..32].copy_from_slice(b"MOCK USB DISK   ");
+                        d[32..36].copy_from_slice(b"1.00");
+                        d
+                    }
+                } else {
+                    let mut d = vec![0u8; 36];
+                    d[0] = 0x00; // direct-access block device
+                    d[1] = 0x80; // removable
+                    d[3] = 0x02;
+                    d[4] = 31;
+                    d[8..16].copy_from_slice(b"MOCKVEND");
+                    d[16..32].copy_from_slice(b"MOCK USB DISK   ");
+                    d[32..36].copy_from_slice(b"1.00");
+                    d
+                }
             }
             // TEST UNIT READY
             0x00 => Vec::new(),
@@ -267,6 +331,12 @@ impl MockUsbDrive {
                     return Ok(());
                 }
 
+                if let Some(threshold) = self.stall_transfers_larger_than.get() {
+                    if len as usize > threshold {
+                        self.stalled_endpoints.set(true);
+                    }
+                }
+
                 let mut s = self.stats.borrow_mut();
                 s.read_commands += 1;
                 s.bytes_read += len as usize;
@@ -298,6 +368,12 @@ impl MockUsbDrive {
                     self.set_csw(tag, expected_len, 1);
                     *self.phase.borrow_mut() = Phase::Csw { pos: 0 };
                     return Ok(());
+                }
+
+                if let Some(threshold) = self.stall_transfers_larger_than.get() {
+                    if len as usize > threshold {
+                        self.stalled_endpoints.set(true);
+                    }
                 }
                 // The CBW's byte count and the CDB's block count are two
                 // statements of the same length; a host that disagrees with
@@ -331,6 +407,16 @@ impl MockUsbDrive {
                 self.stats.borrow_mut().sync_commands += 1;
                 Vec::new()
             }
+            // MODE SENSE(6), only when the test configured a cache state.
+            0x1A if self.write_cache_enabled.get().is_some() => {
+                let wce = self.write_cache_enabled.get().unwrap();
+                let mut d = vec![0u8; 24];
+                d[0] = 23;
+                d[4] = 0x08; // Caching page
+                d[5] = 18;
+                d[6] = if wce { 0x04 } else { 0x00 };
+                d
+            }
             _ => {
                 self.set_csw(tag, expected_len, 1);
                 *self.phase.borrow_mut() = Phase::Csw { pos: 0 };
@@ -361,7 +447,15 @@ impl BulkTransport for MockUsbDrive {
                 blocks,
             } = &mut *phase
             {
-                let n = data.len().min(*want - got.len()).min(self.max_transfer);
+                if self.stalled_endpoints.get() {
+                    return Err(LuksError::UsbErrno {
+                        errno: 32,
+                        reset_failed: false,
+                        reset_gone: false,
+                        detail: "USBDEVFS_BULK: errno 32 (Broken pipe) (endpoint stalled)".into(),
+                    });
+                }
+                let n = data.len().min(*want - got.len()).min(self.max_transfer.get());
                 got.extend_from_slice(&data[..n]);
                 if got.len() == *want {
                     let (at, got, blocks) = (*at, std::mem::take(got), *blocks);
@@ -413,8 +507,16 @@ impl BulkTransport for MockUsbDrive {
             // surfaces it as a hang in the test rather than as silent success.
             Phase::DataOut { .. } => Ok(0),
             Phase::DataIn { data, pos } => {
+                if self.stalled_endpoints.get() {
+                    return Err(LuksError::UsbErrno {
+                        errno: 32,
+                        reset_failed: false,
+                        reset_gone: false,
+                        detail: "USBDEVFS_BULK: errno 32 (Broken pipe) (endpoint stalled)".into(),
+                    });
+                }
                 // Serve at most max_transfer per call, as a real endpoint would.
-                let n = (data.len() - *pos).min(buf.len()).min(self.max_transfer);
+                let n = (data.len() - *pos).min(buf.len()).min(self.max_transfer.get());
                 buf[..n].copy_from_slice(&data[*pos..*pos + n]);
                 *pos += n;
                 if *pos == data.len() {
@@ -436,11 +538,105 @@ impl BulkTransport for MockUsbDrive {
     }
 
     fn max_transfer(&self) -> usize {
-        self.max_transfer
+        self.max_transfer.get()
+    }
+
+    fn set_max_transfer(&self, bytes: usize) {
+        self.max_transfer.set(bytes);
+    }
+
+    fn clear_halt(&self, _endpoint_in: bool) -> Result<()> {
+        self.stalled_endpoints.set(false);
+        Ok(())
+    }
+
+    fn reset(&self) -> Result<()> {
+        self.stalled_endpoints.set(false);
+        *self.phase.borrow_mut() = Phase::Idle;
+        Ok(())
     }
 }
 
 pub fn fixture(rel: &str) -> Vec<u8> {
     let path = format!("{}/../fixtures/{rel}", env!("CARGO_MANIFEST_DIR"));
     std::fs::read(&path).unwrap_or_else(|e| panic!("missing fixture {path}: {e}"))
+}
+
+/// One way a bridge can hand back a wrapper that BOT section 6.5 calls
+/// invalid or not meaningful, armed on [`TamperTransport`].
+#[derive(Clone, Copy, Debug)]
+pub enum Tamper {
+    /// The next 13-byte CSW read comes back with a corrupted signature.
+    BadCswSignature,
+    /// ... with a tag that is not the command's.
+    CswTagMismatch,
+    /// ... with a reserved bCSWStatus value.
+    ReservedCswStatus,
+    /// The next 31-byte CBW write reports one byte fewer than it was given.
+    ShortCbwWrite,
+}
+
+/// Wraps a transport, corrupts exactly one wrapper when armed, and counts how
+/// many BOT resets the layer above issued. Everything else passes through.
+pub struct TamperTransport<T> {
+    pub inner: T,
+    armed: std::cell::Cell<Option<Tamper>>,
+    pub resets: std::cell::Cell<usize>,
+}
+
+impl<T> TamperTransport<T> {
+    pub fn new(inner: T) -> Self {
+        Self {
+            inner,
+            armed: std::cell::Cell::new(None),
+            resets: std::cell::Cell::new(0),
+        }
+    }
+
+    pub fn arm(&self, t: Tamper) {
+        self.armed.set(Some(t));
+    }
+}
+
+impl<T: BulkTransport> BulkTransport for TamperTransport<T> {
+    fn write(&self, data: &[u8]) -> Result<usize> {
+        if data.len() == CBW_LEN && matches!(self.armed.get(), Some(Tamper::ShortCbwWrite)) {
+            // The device never saw a complete CBW, so it starts no command;
+            // the inner drive is not told at all.
+            self.armed.set(None);
+            return Ok(CBW_LEN - 1);
+        }
+        self.inner.write(data)
+    }
+
+    fn read(&self, buf: &mut [u8]) -> Result<usize> {
+        let n = self.inner.read(buf)?;
+        if buf.len() == CSW_LEN && n == CSW_LEN {
+            match self.armed.get() {
+                Some(Tamper::BadCswSignature) => buf[0] ^= 0xFF,
+                Some(Tamper::CswTagMismatch) => buf[4] ^= 0xFF,
+                Some(Tamper::ReservedCswStatus) => buf[12] = 0x7F,
+                _ => return Ok(n),
+            }
+            self.armed.set(None);
+        }
+        Ok(n)
+    }
+
+    fn max_transfer(&self) -> usize {
+        self.inner.max_transfer()
+    }
+
+    fn set_max_transfer(&self, bytes: usize) {
+        self.inner.set_max_transfer(bytes);
+    }
+
+    fn clear_halt(&self, endpoint_in: bool) -> Result<()> {
+        self.inner.clear_halt(endpoint_in)
+    }
+
+    fn reset(&self) -> Result<()> {
+        self.resets.set(self.resets.get() + 1);
+        self.inner.reset()
+    }
 }

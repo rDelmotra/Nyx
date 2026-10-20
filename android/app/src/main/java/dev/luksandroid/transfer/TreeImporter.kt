@@ -1,6 +1,7 @@
 package dev.luksandroid.transfer
 
 import dev.luksandroid.LuksVolume
+import dev.luksandroid.Trace
 
 /**
  * Pass 3 of notes/feature-directory-transfer.md: turns a [TransferPlan] into
@@ -49,6 +50,7 @@ object TreeImporter {
         collisionMode: CollisionMode,
         onProgress: (TransferProgress) -> Unit = {},
         isCancelled: () -> Boolean = { false },
+        onFileDone: (FileDone) -> Unit = {},
     ): TransferOutcome {
         // Execution trusts this ordering completely (mkdir-then-descend assumes
         // the parent is already there); a broken plan must fail loudly here; not
@@ -162,7 +164,7 @@ object TreeImporter {
                     CollisionMode.KEEP_BOTH -> {
                         val targetName = uniqueName(destination.namesOf(parentDir), name)
                         val written = try {
-                            streamFile(volume, source, stats, entry, parentDir,targetName) { liveBytes ->
+                            streamFile(volume, source, stats, entry, parentDir, targetName, onFileDone) { liveBytes ->
                                 fireProgress(entry.relativePath, bytesCopied + liveBytes, force = false)
                                 if (isCancelled()) throw TransferCancelledException()
                             }
@@ -179,9 +181,9 @@ object TreeImporter {
                         // The temp name is dedup'd against real siblings the same way
                         // keep-both is, so a leftover temp file from an earlier
                         // aborted run can never collide with this one either.
-                        val tempName = uniqueName(destination.namesOf(parentDir), ".transfer-tmp-${name}-${System.nanoTime()}")
+                        val tempName = uniqueName(destination.namesOf(parentDir), transferTempName(name))
                         val written = try {
-                            streamFile(volume, source, stats, entry, parentDir,tempName) { liveBytes ->
+                            streamFile(volume, source, stats, entry, parentDir, tempName, onFileDone) { liveBytes ->
                                 fireProgress(entry.relativePath, bytesCopied + liveBytes, force = false)
                                 if (isCancelled()) throw TransferCancelledException()
                             }
@@ -198,7 +200,7 @@ object TreeImporter {
                             // temp entry so a failed replace leaves no orphan behind,
                             // and the original file is untouched because it was never
                             // in the rename's path in the first place.
-                            runCatching { volume.deleteFile(childPath(parentDir, tempName)) }
+                            Trace.cleanup("import_delete_temp") { volume.deleteFile(childPath(parentDir, tempName)) }
                             return stop(entry.relativePath, t)
                         }
                         destination.recordCreatedFile(parentDir, name)
@@ -212,7 +214,7 @@ object TreeImporter {
 
             // No collision: plain write.
             val written = try {
-                streamFile(volume, source, stats, entry, parentDir, name) { liveBytes ->
+                streamFile(volume, source, stats, entry, parentDir, name, onFileDone) { liveBytes ->
                     fireProgress(entry.relativePath, bytesCopied + liveBytes, force = false)
                     if (isCancelled()) throw TransferCancelledException()
                 }
@@ -258,8 +260,12 @@ object TreeImporter {
         entry: PlanEntry,
         parentDir: String,
         targetName: String,
+        onFileDone: (FileDone) -> Unit,
         onChunk: (Long) -> Unit,
     ): Long {
+        val startNs = System.nanoTime()
+        // One owner for the writer: every exit below that does not publish the file ends in
+        // abandonFile (which is close(), idempotent natively), including a failed finish (W5).
         val writer = if (entry.sizeBytes >= 0L) {
             volume.beginFile(entry.sizeBytes)
         } else {
@@ -279,6 +285,11 @@ object TreeImporter {
                         val read = stats.read { input.read(buffer) }
                         if (read < 0) break
                         if (read == 0) continue
+                        // V2: the declared size is a contract. A source that runs past it
+                        // is stopped before the excess is written, not truncated or extended.
+                        if (entry.sizeBytes >= 0L && total + read > entry.sizeBytes) {
+                            throw TransferFailure("A source file is larger than it reported, so the copy was stopped.")
+                        }
                         stats.write { volume.writeChunk(writer, buffer, 0, read) }
                         total += read
                         onChunk(total)
@@ -287,11 +298,19 @@ object TreeImporter {
                     java.util.Arrays.fill(buffer, 0.toByte())
                 }
             }
+            if (entry.sizeBytes >= 0L && total != entry.sizeBytes) {
+                throw TransferFailure("A source file is smaller than it reported, so the copy was stopped.")
+            }
+            val ino = stats.commit { volume.finishFile(writer, parentDir, targetName) }
+            onFileDone(FileDone(total, ino, (System.nanoTime() - startNs) / 1_000_000L))
         } catch (t: Throwable) {
-            volume.abandonFile(writer)
+            try {
+                volume.abandonFile(writer)
+            } catch (cleanup: Throwable) {
+                t.addSuppressed(cleanup)
+            }
             throw t
         }
-        stats.commit { volume.finishFile(writer, parentDir, targetName) }
         return total
     }
 }

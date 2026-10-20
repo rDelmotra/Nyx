@@ -39,6 +39,17 @@ internal object LuksNative {
     external fun nativeClearForensicLog()
 
     /**
+     * F9 C4: removes and returns the native "notable events" queue as JSON
+     * `{"dropped":n,"events":[{flat fields}]}`. Absent in a `.so` older than F9: the caller
+     * ([dev.luksandroid.log.NativeDrain]) treats the resulting `UnsatisfiedLinkError` as "no
+     * native timeline" and stops asking.
+     */
+    external fun nativeDrainEvents(): String
+
+    /** F9 C4: the whole 256-entry forensic ring in the same JSON shape as [nativeDrainEvents]; the ring is NOT cleared. */
+    external fun nativeRingJson(): String
+
+    /**
      * @param fd from `UsbDeviceConnection.getFileDescriptor()`. Stays owned by
      *   Java; Rust never closes it, and it must outlive the returned handle.
      * @param maxTransfer bytes per bulk transfer, or 0 for the safe default of
@@ -105,8 +116,32 @@ internal object LuksNative {
     /** Whole file. Throws rather than exceeding [maxBytes], which must fit the heap. */
     external fun nativeReadFile(handle: Long, path: String, maxBytes: Long): ByteArray
 
-    /** Up to [len] bytes at [offset]. A short result means end of file. */
-    external fun nativeReadChunk(handle: Long, path: String, offset: Long, len: Int): ByteArray
+    /**
+     * Resolves [path] once and returns a read handle that pins the file by identity (inode
+     * number plus generation). Close it with [nativeCloseFile].
+     */
+    external fun nativeOpenFile(handle: Long, path: String): Long
+
+    /**
+     * Up to [len] bytes at [offset] of an open file, read by inode and never by path. A short
+     * result means end of file. Throws [LuksException.FILE_CHANGED] if the file was deleted,
+     * replaced or modified since [nativeOpenFile]; it never returns another file's bytes.
+     */
+    external fun nativeReadAt(volume: Long, file: Long, offset: Long, len: Int): ByteArray
+    external fun nativeReadAtDirect(volume: Long, file: Long, offset: Long, data: java.nio.ByteBuffer, len: Int): Int
+    external fun nativeReadAtDirectWithCancel(volume: Long, file: Long, offset: Long, data: java.nio.ByteBuffer, len: Int, cancelToken: Long): Int
+
+    /**
+     * Size of an open file, from the handle: identity-checked, no second path lookup. Throws
+     * [LuksException.FILE_CHANGED] if the file is no longer the one that was opened.
+     */
+    external fun nativeFileSize(volume: Long, file: Long): Long
+
+    /** `[verified, unverified]` bytes [nativeReadAt] has returned on [file] so far. */
+    external fun nativeFileCoverage(file: Long): LongArray
+
+    /** Releases an open-file handle. Idempotent; safe from a `finally`. */
+    external fun nativeCloseFile(file: Long)
 
     /**
      * Streams the file through SHA-256 without materialising it, returning JSON
@@ -116,6 +151,30 @@ internal object LuksNative {
      * @param chunkBytes 0 for the default (1 MiB).
      */
     external fun nativeSha256(handle: Long, path: String, chunkBytes: Int): String
+
+    /**
+     * [nativeSha256] that polls [cancelToken] (from [nativeCreateCancelToken]) between chunks and
+     * throws [LuksException.CANCELLED] once it is signalled. A token <= 0 means "none".
+     * Matches `nativeSha256WithCancel` in `jni/src/lib.rs`.
+     */
+    external fun nativeSha256WithCancel(handle: Long, path: String, chunkBytes: Int, cancelToken: Long): String
+
+    /**
+     * Reads the whole file at [path] through the native pipeline into a sink and returns the byte
+     * count, polling [cancelToken] between chunks (<= 0 means none). Nothing is returned to the
+     * JVM, so this is a read-throughput probe, not a way to obtain the bytes.
+     * Matches `nativeReadFileStream` in `jni/src/lib.rs`.
+     */
+    external fun nativeReadFileStream(handle: Long, path: String, chunkBytes: Int, cancelToken: Long): Long
+
+    /**
+     * Read-only consistency check of the mounted filesystem (F8). JSON
+     * `{verdict, unknown, writeSafe, findings:{kind:count}, elapsedMs}`; kinds and counts only,
+     * never a path or a block number. Holds the volume's filesystem lock for the whole scan and
+     * polls [cancelToken] (<= 0 means none), stopping with `unknown: "cancelled"`. A damaged drive
+     * is the answer, not an exception. Matches `nativeHealthCheck` in `jni/src/lib.rs`.
+     */
+    external fun nativeHealthCheck(handle: Long, cancelToken: Long): String
 
     /**
      * Times a raw block read — no decryption, no filesystem. JSON result also
@@ -182,6 +241,13 @@ internal object LuksNative {
      */
     external fun nativeBeginFileStreaming(handle: Long): Long
     external fun nativeWriteChunk(handle: Long, writer: Long, data: java.nio.ByteBuffer, len: Int)
+
+    /**
+     * [nativeWriteChunk] that refuses with [LuksException.CANCELLED] when [cancelToken] is already
+     * signalled (<= 0 means none). Same write-support gating. Matches `nativeWriteChunkWithCancel`
+     * in `jni/src/lib.rs`.
+     */
+    external fun nativeWriteChunkWithCancel(handle: Long, writer: Long, data: java.nio.ByteBuffer, len: Int, cancelToken: Long)
     external fun nativeFinishFile(handle: Long, writer: Long, parentPath: String, name: String): Long
     external fun nativeCommitActiveBatch(handle: Long)
     external fun nativeCloseWriter(handle: Long, writer: Long)

@@ -31,6 +31,7 @@ pub mod crc32c;
 pub mod cursor;
 pub mod dir;
 pub mod extent;
+pub mod health;
 pub mod inode;
 pub mod subvol;
 pub mod superblock;
@@ -42,7 +43,7 @@ pub use chunk::{Chunk, ChunkMap, DevExtent, Stripe};
 pub use csum::Verified;
 pub use cursor::Cursor;
 pub use dir::Located;
-pub use extent::{ExtentKind, FileExtent};
+pub use extent::{ExtentKind, FileExtent, ReadCoverage};
 pub use inode::{DirEntryItem, Inode};
 pub use subvol::Subvolume;
 pub use superblock::{CsumType, Superblock};
@@ -103,6 +104,10 @@ pub struct Btrfs<D: ReadAt> {
     /// Same reasoning, and it matters more: every data read consults this.
     /// `None` on a filesystem that keeps no data checksums.
     csum_tree: Option<TreeRoot>,
+    /// Set when reloading the csum root after a commit *failed*, as opposed to
+    /// finding it absent. Reads then look it up again and report the real
+    /// error rather than running unverified.
+    csum_tree_failed: bool,
     /// Tree nodes already read and verified. See [`cache`] for the measurement
     /// that put it here — six metadata reads per data read, all of them
     /// re-descending the same two trees.
@@ -112,8 +117,17 @@ pub struct Btrfs<D: ReadAt> {
     pub(crate) active_batch: Option<write::Batch>,
     #[cfg(feature = "dangerous-write-support")]
     pub(crate) has_open_writer: bool,
+    /// Set when a commit failed after its first superblock write was attempted:
+    /// the disk may already hold that generation. Until a retry of the same
+    /// (unchanged) batch succeeds, or the batch is discarded, no new write may
+    /// begin (see `write::commit`, M1).
+    #[cfg(feature = "dangerous-write-support")]
+    pub(crate) commit_pending: bool,
     #[cfg(feature = "dangerous-write-support")]
     pub(crate) statfs_cache: std::sync::Mutex<Option<crate::fs::StatFs>>,
+    /// Test-only replacement for the unallocated-space reserve.
+    #[cfg(feature = "dangerous-write-support")]
+    pub(crate) reserve_override: Option<u64>,
 }
 
 impl<D: ReadAt> Btrfs<D> {
@@ -155,18 +169,23 @@ impl<D: ReadAt> Btrfs<D> {
             // lines build. Nothing reads it in between.
             fs_tree: TreeRoot::default(),
             csum_tree: None,
+            csum_tree_failed: false,
             subvol_cache: std::sync::Mutex::new(None),
             #[cfg(feature = "dangerous-write-support")]
             active_batch: None,
             #[cfg(feature = "dangerous-write-support")]
             has_open_writer: false,
             #[cfg(feature = "dangerous-write-support")]
+            commit_pending: false,
+            #[cfg(feature = "dangerous-write-support")]
             statfs_cache: std::sync::Mutex::new(None),
+            #[cfg(feature = "dangerous-write-support")]
+            reserve_override: None,
         };
         fs.load_chunk_tree()?;
         fs.chunks.check_single_device(fs.sb.dev_id)?;
         fs.fs_tree = fs.tree_root(tree::FS_TREE_OBJECTID)?;
-        fs.csum_tree = csum::load(&fs);
+        fs.csum_tree = csum::load(&fs)?;
         crate::forensic::record_btrfs(crate::forensic::BtrfsEvent::Mount {
             generation: fs.sb.generation,
             root_bytenr: fs.fs_tree.bytenr,
@@ -303,6 +322,7 @@ impl<D: ReadAt> Btrfs<D> {
                     "btrfs child node is not one level below its parent",
                 ));
             }
+            ptr.check_child(&child)?;
             self.walk_node(child, visit)?;
         }
         Ok(())
@@ -327,32 +347,62 @@ impl<D: ReadAt> Btrfs<D> {
     /// item for this objectid is what the kernel does, and it picks the newest
     /// root when there is more than one.
     pub fn tree_root(&self, objectid: u64) -> Result<TreeRoot> {
+        // A tree named in the superblock but absent from the root tree is
+        // corruption, not an empty filesystem.
+        self.find_tree_root(objectid)?
+            .ok_or(LuksError::CorruptFs("btrfs root item is missing"))
+    }
+
+    /// Like [`Btrfs::tree_root`], but a root item that is not there is
+    /// `Ok(None)`, kept distinct from a lookup that *failed*. A tree that may
+    /// legally be absent (the csum tree) must not treat the two alike.
+    pub fn find_tree_root(&self, objectid: u64) -> Result<Option<TreeRoot>> {
         let key = Key::new(objectid, tree::ROOT_ITEM_KEY, u64::MAX);
         let cursor = self.search_le(self.sb.root, &key)?;
 
-        // A tree named in the superblock but absent from the root tree is
-        // corruption, not an empty filesystem.
-        let missing = || LuksError::CorruptFs("btrfs root item is missing");
         if !cursor.valid() {
-            return Err(missing());
+            return Ok(None);
         }
         let found = cursor.key()?;
         if found.objectid != objectid || found.item_type != tree::ROOT_ITEM_KEY {
-            return Err(missing());
+            return Ok(None);
         }
         let data = cursor.data()?;
 
         if data.len() < 239 {
             return Err(LuksError::CorruptFs("btrfs root item truncated"));
         }
-        Ok(TreeRoot {
+        let root = TreeRoot {
             objectid,
             bytenr: u64::from_le_bytes(data[176..184].try_into().unwrap()),
             level: data[238],
             root_dirid: u64::from_le_bytes(data[168..176].try_into().unwrap()),
             generation: u64::from_le_bytes(data[160..168].try_into().unwrap()),
             flags: u64::from_le_bytes(data[208..216].try_into().unwrap()),
-        })
+        };
+        // The root item is the "parent" of the tree's root node.
+        tree::check_generation(root.generation, &self.read_node(root.bytenr)?)?;
+        Ok(Some(root))
+    }
+
+    /// The **current** root of the tree with this objectid, as of now.
+    ///
+    /// A tree's root bytenr moves on every commit (copy-on-write), so a root
+    /// captured earlier may point at blocks a later transaction has freed and
+    /// reused. Anything held across a lock release must hold the objectid and
+    /// call this on each use (R3r). Sees the active batch, like `fs_tree`.
+    ///
+    /// `Ok(None)` means the subvolume no longer exists (deleted since the
+    /// caller last looked); the top-level tree always exists.
+    pub fn current_tree(&self, objectid: u64) -> Result<Option<TreeRoot>> {
+        let target = self.target_tree();
+        if target.objectid == objectid {
+            return Ok(Some(target));
+        }
+        if objectid == tree::FS_TREE_OBJECTID {
+            return Ok(Some(self.fs_tree()));
+        }
+        self.find_tree_root(objectid)
     }
 
     pub fn fs_tree(&self) -> TreeRoot {
@@ -382,6 +432,16 @@ impl<D: ReadAt> Btrfs<D> {
             }
         }
         self.fs_tree()
+    }
+
+    /// Snapshot of the current filesystem mutation identity `(generation, fs_root_bytenr, active_batch_files)`.
+    /// When this tuple is identical across reads, no tree roots have moved and no files have been mutated.
+    pub fn mutation_tag(&self) -> (u64, u64, usize) {
+        #[cfg(feature = "dangerous-write-support")]
+        if let Some(ref batch) = self.active_batch {
+            return (batch.generation, batch.fs_root.0, batch.accumulated_files);
+        }
+        (self.sb.generation, self.fs_tree.bytenr, 0)
     }
 
     pub fn superblock(&self) -> &Superblock {
@@ -439,12 +499,42 @@ impl<D: ReadAt> Btrfs<D> {
             self.fs_tree = fs_tree;
         }
         self.nodes.clear();
-        self.csum_tree = self.tree_root(tree::CSUM_TREE_OBJECTID).ok();
+        match self.find_tree_root(tree::CSUM_TREE_OBJECTID) {
+            Ok(root) => {
+                self.csum_tree = root;
+                self.csum_tree_failed = false;
+            }
+            // Not "no checksums": remember the failure so reads retry the
+            // lookup and surface the actual error (L3c-O6).
+            Err(_) => {
+                self.csum_tree = None;
+                self.csum_tree_failed = true;
+            }
+        }
         if let Ok(mut guard) = self.statfs_cache.lock() {
             *guard = None;
         }
         if let Ok(mut guard) = self.subvol_cache.lock() {
             *guard = None;
+        }
+    }
+
+    /// Unallocated device bytes writes must leave alone (see
+    /// `chunk_alloc::unallocated_reserve`).
+    #[cfg(feature = "dangerous-write-support")]
+    pub fn unallocated_reserve(&self) -> u64 {
+        self.reserve_override
+            .unwrap_or_else(|| write::chunk_alloc::unallocated_reserve(self.sb.total_bytes))
+    }
+
+    /// Replace the reserve. For tests that deliberately allocate the last
+    /// free device bytes of a tiny fixture; never called by the app.
+    #[doc(hidden)]
+    #[cfg(feature = "dangerous-write-support")]
+    pub fn set_unallocated_reserve_for_tests(&mut self, bytes: u64) {
+        self.reserve_override = Some(bytes);
+        if let Ok(mut g) = self.statfs_cache.lock() {
+            *g = None;
         }
     }
 
@@ -517,7 +607,12 @@ impl<D: ReadAt> Btrfs<D> {
                     .saturating_sub(write::chunk_alloc::BTRFS_BLOCK_RESERVED_1M_FOR_SUPER)
                     .saturating_sub(allocated_dev_bytes);
 
-                let allocatable_unalloc_dev_bytes = (unalloc_dev_bytes / (64 * 1024)) * (64 * 1024);
+                // Writes never take the unallocated reserve (see
+                // `chunk_alloc::unallocated_reserve`), so do not advertise it.
+                let allocatable_unalloc_dev_bytes = (unalloc_dev_bytes
+                    .saturating_sub(self.unallocated_reserve())
+                    / (64 * 1024))
+                    * (64 * 1024);
 
                 let total_free_data = free_data.saturating_add(allocatable_unalloc_dev_bytes);
 

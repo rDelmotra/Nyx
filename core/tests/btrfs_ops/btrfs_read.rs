@@ -21,6 +21,10 @@
 //! Regenerate with `tools/gen-btrfs-fixtures.sh` (needs Linux — see the header
 //! of that script).
 
+#[path = "../common/temp_guard.rs"]
+mod temp_guard;
+use temp_guard::TempPath;
+
 use luks_core::device::{FileDevice, ReadAt};
 use luks_core::error::LuksError;
 use luks_core::fs::btrfs::{crc32c::crc32c, superblock::Superblock, CsumType, ExtentKind, Key, Node};
@@ -174,7 +178,9 @@ fn crc32c_agrees_with_the_stored_superblock_checksum() {
     device("plain.img").read_at(0x1_0000, &mut raw).unwrap();
     let stored = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
     assert_eq!(crc32c(&raw[32..]), stored);
-    assert_eq!(stored, 0xf7b4_210d);
+    // Value of plain.img as regenerated 2026-10-04 (btrfs-progs v6.6.3); mkfs
+    // stamps a time, so a regenerated image changes it.
+    assert_eq!(stored, 0xfd2a_b5f3);
 }
 
 // --- mirror selection ------------------------------------------------------
@@ -716,8 +722,9 @@ fn searching_costs_the_depth_of_the_tree_not_its_size() {
     fs.walk_tree(root, &mut |_, _| Ok(())).unwrap();
     let walked = load(&fs) - before;
 
-    // level 1 tree: root node plus one leaf.
-    assert_eq!(searched, 2, "a search should read one node per level");
+    // level 1 tree: root node plus one leaf. Mount already read and verified
+    // the root against its root item, so the root is cached by now.
+    assert_eq!(searched, 1, "a search should read one node per level below the cached root");
     assert!(
         walked > searched * 4,
         "walking read {walked} nodes, searching {searched} — the fixture is \
@@ -1851,6 +1858,7 @@ fn a_single_corrupted_byte_of_file_data_is_caught() {
     // one path, and this test deletes it on the way out.
     let corrupt = std::env::temp_dir()
         .join(format!("luks-btrfs-corrupt-{}.img", std::process::id()));
+    let corrupt = TempPath::new(corrupt);
     std::fs::write(&corrupt, &image).unwrap();
 
     let fs = Btrfs::mount(FileDevice::open(&corrupt).unwrap()).expect("still mounts");

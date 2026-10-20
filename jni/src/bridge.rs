@@ -47,6 +47,8 @@ static READ_FILE_RACE_HOOK: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new
 /// stays navigable in read-only builds and while Pass 2b grows this boundary.
 #[cfg(feature = "dangerous-write-support")]
 mod writer;
+mod reader;
+pub use reader::OpenFileHandle;
 
 // ---------------------------------------------------------------- error codes
 
@@ -129,6 +131,20 @@ pub mod code {
     /// unsupported format would tell the user their drive is incompatible
     /// when it is one tap from writable.
     pub const READ_ONLY_VOLUME: i32 = 22;
+    /// A file open for reading was deleted, replaced, or modified since it was
+    /// opened. The read was refused instead of returning another file's bytes.
+    /// The remedy is to re-list and start the transfer again.
+    pub const FILE_CHANGED: i32 = 23;
+
+    /// Reserved for Kotlin: the app refused a write because the F8 health
+    /// check found errors. Never produced natively; listed so the number is
+    /// not reused.
+    #[allow(dead_code)]
+    pub const HEALTH_READ_ONLY: i32 = 24;
+    /// The USB adapter cannot flush its write cache and does not report a
+    /// write-through cache, so writes are refused before any is issued.
+    /// Reads keep working. Distinct from `TRANSPORT`: nothing failed.
+    pub const WRITES_UNSAFE: i32 = 25;
 }
 
 pub fn error_code(e: &LuksError) -> i32 {
@@ -151,6 +167,8 @@ pub fn error_code(e: &LuksError) -> i32 {
         | UnsupportedFs(_)
         | AmbiguousFs => code::UNSUPPORTED,
         ReadOnlyVolume => code::READ_ONLY_VOLUME,
+        FileChanged => code::FILE_CHANGED,
+        UnsafeWriteCache => code::WRITES_UNSAFE,
         FsNeedsRecovery => code::NEEDS_FSCK,
         FilesystemFull | NoFreeInodes => code::NO_SPACE,
         BtrfsItemTooLarge { .. } => code::ITEM_TOO_LARGE,
@@ -163,14 +181,15 @@ pub fn error_code(e: &LuksError) -> i32 {
         Cancelled => code::CANCELLED,
         NotFound(_) | NotADirectory(_) | IsADirectory(_) | BadInode(_) => code::NOT_FOUND,
         DirectoryNotEmpty(_) => code::DIRECTORY_NOT_EMPTY,
-        ScsiProtocol(_) | ScsiCommandFailed { .. } | UsbTransfer(_) => code::TRANSPORT,
+        ScsiProtocol(_) | ScsiCommandFailed { .. } | UsbTransfer(_) | UsbErrno { .. } => {
+            code::TRANSPORT
+        }
         Io { .. } => code::IO,
         ChecksumMismatch
         | Truncated { .. }
         | ImplausibleHeaderSize(_)
         | JsonNotUtf8
         | JsonParse(_)
-        | BadIntegerField { .. }
         | Missing(_)
         | BadExtentHeader(_)
         | BadExtentTree(_)
@@ -217,6 +236,18 @@ pub struct SharedDevice {
     /// rather than "this handle". See [`VolumeHandle::write_file`] for why a
     /// device may have only one writer.
     writer: Arc<std::sync::atomic::AtomicBool>,
+    /// What the drive has said about flushing, mirrored here after each flush
+    /// so `info_json` never waits behind device I/O: 0 unknown, 1 supported,
+    /// 2 rejected. Shared by every clone, like `writer`.
+    #[cfg_attr(
+        not(feature = "dangerous-write-support"),
+        allow(dead_code, reason = "only the write path flushes")
+    )]
+    flush_state: Arc<std::sync::atomic::AtomicU8>,
+    /// Write-safety verdict (`WriteAt::check_write_safety`): 0 not yet
+    /// decided, 1 writes allowed, 2 refused. Shared by every clone.
+    #[cfg(feature = "dangerous-write-support")]
+    write_gate: Arc<std::sync::atomic::AtomicU8>,
 }
 
 /// What a device must be able to do for this build: read only by default,
@@ -236,13 +267,54 @@ impl SharedDevice {
         SharedDevice {
             inner: Arc::new(Mutex::new(device)),
             writer: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            flush_state: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            #[cfg(feature = "dangerous-write-support")]
+            write_gate: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         }
     }
 
-    /// A poisoned lock means some earlier call panicked mid-read. The device
-    /// itself has no invariant we can corrupt — reads are stateless apart from
-    /// the SCSI tag counter — so recovering the guard is better than turning
-    /// every later call into a panic.
+    /// Decide once per device session whether writes may start, and refuse
+    /// with `UnsafeWriteCache` if the adapter cannot guarantee ordering.
+    /// Probes with a flush (no write) the first time. A transport error is
+    /// returned without latching a verdict.
+    #[cfg(feature = "dangerous-write-support")]
+    pub fn ensure_writes_safe(&self) -> Result<()> {
+        use std::sync::atomic::Ordering::{Acquire, Release};
+        match self.write_gate.load(Acquire) {
+            1 => return Ok(()),
+            2 => return Err(LuksError::UnsafeWriteCache),
+            _ => {}
+        }
+        let dev = self.lock();
+        let verdict = dev.check_write_safety();
+        let state = match dev.flush_support() {
+            None => 0,
+            Some(true) => 1,
+            Some(false) => 2,
+        };
+        self.flush_state.store(state, Release);
+        match &verdict {
+            Ok(()) => self.write_gate.store(1, Release),
+            Err(LuksError::UnsafeWriteCache) => self.write_gate.store(2, Release),
+            Err(_) => {}
+        }
+        verdict
+    }
+
+    /// Whether a panic ever unwound through the device lock. Poison is never
+    /// cleared (`lock` recovers the guard without clearing it), so this is a
+    /// permanent latch: a volume on this device fences its write session on it
+    /// (T3 / F4-A6).
+    pub fn is_poisoned(&self) -> bool {
+        self.inner.is_poisoned()
+    }
+
+    /// A poisoned lock means some earlier call panicked inside a device call.
+    /// Reads are stateless apart from the SCSI tag counter, so the guard is
+    /// still recovered rather than turning every later call into a panic. But
+    /// a panic mid-write may have left a CBW/data/CSW sequence half done, so
+    /// the poison stays set (never cleared) and write sessions fence on it
+    /// (see [`SharedDevice::is_poisoned`]).
     // The `+ 'static` is not decoration: inside `Arc<Mutex<dyn ..>>` the elided
     // object lifetime defaults to 'static, but in a `MutexGuard<'_, dyn ..>`
     // return type it defaults to the guard's own lifetime. Spelling it out keeps
@@ -269,11 +341,33 @@ impl ReadAt for SharedDevice {
 #[cfg(feature = "dangerous-write-support")]
 impl luks_core::device::WriteAt for SharedDevice {
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+        // Backstop: no byte goes out before the verdict exists, whatever path
+        // (ext4, btrfs, raw) reached the device.
+        self.ensure_writes_safe()?;
         self.lock().write_at(offset, buf)
     }
 
     fn flush(&self) -> Result<()> {
-        self.lock().flush()
+        let dev = self.lock();
+        let result = dev.flush();
+        // Mirror what the drive said while still holding the lock, so a
+        // reader of the atomic never sees a state older than this flush.
+        let state = match dev.flush_support() {
+            None => 0,
+            Some(true) => 1,
+            Some(false) => 2,
+        };
+        self.flush_state.store(state, std::sync::atomic::Ordering::Release);
+        result
+    }
+
+    /// Lock-free: reads the mirror written by `flush`.
+    fn flush_support(&self) -> Option<bool> {
+        match self.flush_state.load(std::sync::atomic::Ordering::Acquire) {
+            1 => Some(true),
+            2 => Some(false),
+            _ => None,
+        }
     }
 }
 
@@ -304,6 +398,8 @@ pub struct Handle {
 pub enum Payload {
     Device(DeviceHandle),
     Volume(VolumeHandle),
+    /// An open read handle: a file pinned by identity (F4 Part B).
+    File(OpenFileHandle),
     #[cfg(feature = "dangerous-write-support")]
     Writer(WriterHandle),
 }
@@ -355,12 +451,62 @@ pub enum FileWriterEnum {
     Btrfs(luks_core::fs::btrfs::write::file::BtrfsFileWriter),
 }
 
-/// Opaque streaming state. It deliberately owns neither a device nor a volume.
+/// The JNI-side name of an open writer. It carries **no writer state**: that
+/// lives only in the owning volume's registry (`VolumeHandle::writers`), so
+/// closing or dropping the volume reaches every open writer (F4-A1).
 #[cfg(feature = "dangerous-write-support")]
 pub struct WriterHandle {
     pub volume_handle: i64,
     pub volume_id: u64,
-    pub writer: Mutex<Option<FileWriterEnum>>,
+    pub writer_id: u64,
+}
+
+/// Open writers of one volume, keyed by id. See [`VolumeHandle::writers`].
+#[cfg(feature = "dangerous-write-support")]
+#[derive(Default)]
+pub struct WriterTable {
+    next: u64,
+    /// Set by `close()`; nothing may register after it.
+    closed: bool,
+    map: HashMap<u64, FileWriterEnum>,
+}
+
+/// Failure of an operation that names a writer.
+#[cfg(feature = "dangerous-write-support")]
+#[derive(Debug)]
+pub enum WriterError {
+    /// The id/handle is unknown: finished, closed, released by a volume close,
+    /// or never issued. Maps to `BAD_HANDLE`. Nothing is leaked by it.
+    BadHandle(&'static str),
+    Luks(LuksError),
+}
+
+#[cfg(feature = "dangerous-write-support")]
+impl WriterError {
+    /// The JNI error code this maps to.
+    pub fn code(&self) -> i32 {
+        match self {
+            WriterError::BadHandle(_) => code::BAD_HANDLE,
+            WriterError::Luks(e) => error_code(e),
+        }
+    }
+}
+
+#[cfg(feature = "dangerous-write-support")]
+impl From<LuksError> for WriterError {
+    fn from(e: LuksError) -> Self {
+        WriterError::Luks(e)
+    }
+}
+
+#[cfg(feature = "dangerous-write-support")]
+impl std::fmt::Display for WriterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WriterError::BadHandle(m) => f.write_str(m),
+            WriterError::Luks(e) => e.fmt(f),
+        }
+    }
 }
 
 pub struct DeviceHandle {
@@ -396,6 +542,9 @@ pub struct VolumeHandle {
     fs: Mutex<MountedFs>,
     pub partition_offset: u64,
     pub encrypted: bool,
+    /// LUKS cipher shape for the debug log header: (cipher, key bits, cipher
+    /// sector). `None` for a plain volume. Never key material.
+    luks_params: Option<(String, Option<u32>, u32)>,
     /// The device's writer flag, shared with every other volume on it.
     /// See [`VolumeHandle::write_file`].
     #[cfg_attr(
@@ -403,6 +552,13 @@ pub struct VolumeHandle {
         allow(dead_code, reason = "only the write path claims it")
     )]
     device_writer: Arc<std::sync::atomic::AtomicBool>,
+    /// The shared device, kept so `info_json` can report what the drive said
+    /// about flushing (`flushSupported`).
+    #[cfg_attr(
+        not(feature = "dangerous-write-support"),
+        allow(dead_code, reason = "only the write path reports flush support")
+    )]
+    dev: SharedDevice,
     /// Why this volume's write session was fenced, if it was.
     ///
     /// `None` means writes are allowed. `Some(reason)` means an earlier write
@@ -443,11 +599,22 @@ pub struct VolumeHandle {
         allow(dead_code, reason = "only the write path consults it")
     )]
     plain_writes_armed: std::sync::atomic::AtomicBool,
+    /// Every open file writer of this volume (F4-A1). The only owner of writer
+    /// state, so `close()` / `Drop` can release them regardless of what the
+    /// Java side does. **Lock order: `fs` before `writers`**, everywhere.
+    #[cfg(feature = "dangerous-write-support")]
+    writers: Mutex<WriterTable>,
 }
 
 impl Drop for VolumeHandle {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering;
+        // Best-effort final close: release writers, publish an unfenced btrfs
+        // batch. The outcome is logged (code + stage only, no paths).
+        #[cfg(feature = "dangerous-write-support")]
+        if let Err(e) = self.close() {
+            crate::log::e(&format!("VolumeHandle drop: final close failed [{}] stage=drop", error_code(&e)));
+        }
         if self.holds_writer.load(Ordering::Acquire) {
             self.device_writer.store(false, Ordering::Release);
         }
@@ -499,10 +666,38 @@ impl VolumeHandle {
         {
             return Err(LuksError::ReadOnlyVolume);
         }
+        // Poison latches the fence (F4-A6 / T3): a panic under the `fs` lock or
+        // inside a device call leaves state unknown. A poisoned `fs` keeps
+        // reporting `SessionPoisoned` (MUTEX_POISONED) so the diagnosis stays
+        // distinguishable; a poisoned device lock reports as a fence.
+        #[cfg(feature = "dangerous-write-support")]
+        {
+            if self.fs.is_poisoned() {
+                self.latch_fence("filesystem lock poisoned: a write panicked");
+                return Err(LuksError::SessionPoisoned);
+            }
+            if self.dev.is_poisoned() {
+                self.latch_fence("device lock poisoned: a panic unwound through a device call");
+            }
+        }
         if let Some(reason) = self.fence_reason() {
             return Err(LuksError::WriteSessionFenced(reason));
         }
-        let guard = self.fs.lock().map_err(|_| LuksError::SessionPoisoned)?;
+        // Refuse before any write is issued when the adapter cannot guarantee
+        // that tree blocks reach the disk before the superblock.
+        #[cfg(feature = "dangerous-write-support")]
+        self.dev.ensure_writes_safe()?;
+        let guard = match self.fs.lock() {
+            Ok(g) => g,
+            Err(poisoned) => {
+                // Poisoned between the check above and the lock. Release the
+                // guard before latching: `latch_fence` takes this same lock.
+                drop(poisoned);
+                #[cfg(feature = "dangerous-write-support")]
+                self.latch_fence("filesystem lock poisoned: a write panicked");
+                return Err(LuksError::SessionPoisoned);
+            }
+        };
         if let Some(reason) = self.fence_reason() {
             return Err(LuksError::WriteSessionFenced(reason));
         }
@@ -570,7 +765,12 @@ impl VolumeHandle {
         // the one write-side action that is still safe after a panic, and
         // leaving the batch live is precisely what this exists to prevent.
         let mut fs = self.fs.lock().unwrap_or_else(|p| p.into_inner());
+        self.fence_writes_locked(&mut fs, reason);
+    }
 
+    /// `fence_writes` for a caller that already holds the `fs` lock.
+    #[cfg(feature = "dangerous-write-support")]
+    fn fence_writes_locked(&self, fs: &mut MountedFs, reason: impl std::fmt::Display) {
         let mut fence = self.write_fence.lock().unwrap_or_else(|p| p.into_inner());
         if fence.is_some() {
             return;
@@ -578,8 +778,16 @@ impl VolumeHandle {
         *fence = Some(reason.to_string());
         drop(fence);
 
-        if let MountedFs::Btrfs(btrfs) = &mut *fs {
+        if let MountedFs::Btrfs(btrfs) = fs {
             btrfs.discard_active_batch();
+        }
+    }
+
+    /// Fence for a poison detected without holding `fs` (no-op if already fenced).
+    #[cfg(feature = "dangerous-write-support")]
+    fn latch_fence(&self, reason: &str) {
+        if self.fence_reason().is_none() {
+            self.fence_writes(reason);
         }
     }
 
@@ -853,7 +1061,11 @@ impl DeviceHandle {
             })
             .collect();
 
-        json!({
+        #[cfg_attr(
+            not(feature = "dangerous-write-support"),
+            allow(unused_mut, reason = "only write builds add flushSupported")
+        )]
+        let mut info = json!({
             "vendor": self.vendor,
             "product": self.product,
             "blockSize": self.block_size,
@@ -861,8 +1073,12 @@ impl DeviceHandle {
             "sizeBytes": self.block_count * self.block_size as u64,
             "tableKind": match self.table.kind { TableKind::Gpt => "GPT", TableKind::Mbr => "MBR" },
             "partitions": parts,
-        })
-        .to_string()
+        });
+        #[cfg(feature = "dangerous-write-support")]
+        {
+            info["flushSupported"] = json!(luks_core::device::WriteAt::flush_support(&self.dev));
+        }
+        info.to_string()
     }
 
     /// Derive the master key and mount the filesystem inside.
@@ -893,6 +1109,14 @@ impl DeviceHandle {
             &header,
             password,
         )?;
+        // Header shape for the debug log. Logging must never fail an unlock
+        // that already succeeded, so a missing piece is left out, not an error
+        // (LuksVolume::open above already required the segment and a keyslot).
+        let key_bits = volume.key_bits();
+        let luks_params = header
+            .primary_segment()
+            .ok()
+            .map(|seg| (seg.encryption.clone(), Some(key_bits), seg.sector_size));
         let fs = MountedFs::mount(luks_core::volume::VolumeSource::Luks(volume))?;
         let id = NEXT_VOLUME_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(VolumeHandle {
@@ -900,9 +1124,13 @@ impl DeviceHandle {
             fs: Mutex::new(fs),
             partition_offset,
             encrypted: true,
+            luks_params,
             device_writer: Arc::clone(&self.dev.writer),
+            dev: self.dev.clone(),
             write_fence: Mutex::new(None),
             holds_writer: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "dangerous-write-support")]
+            writers: Mutex::new(WriterTable::default()),
             // Irrelevant when encrypted; armed so the gate is a no-op here.
             plain_writes_armed: std::sync::atomic::AtomicBool::new(true),
         })
@@ -937,9 +1165,13 @@ impl DeviceHandle {
             fs: Mutex::new(fs),
             partition_offset,
             encrypted: false,
+            luks_params: None,
             device_writer: Arc::clone(&self.dev.writer),
+            dev: self.dev.clone(),
             write_fence: Mutex::new(None),
             holds_writer: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "dangerous-write-support")]
+            writers: Mutex::new(WriterTable::default()),
             // Default-closed: a plain volume mounts read-only until the user
             // explicitly consents. See `plain_writes_armed`.
             plain_writes_armed: std::sync::atomic::AtomicBool::new(false),
@@ -998,7 +1230,11 @@ impl VolumeHandle {
     /// empty string".
     pub fn info_json(&self) -> String {
         let fs = self.fs_for_reading();
-        json!({
+        #[cfg_attr(
+            not(feature = "dangerous-write-support"),
+            allow(unused_mut, reason = "only write builds add flushSupported")
+        )]
+        let mut info = json!({
             "partitionOffset": self.partition_offset,
             "fsType": fs.kind().name(),
             "label": fs.label(),
@@ -1011,12 +1247,40 @@ impl VolumeHandle {
             // find out what this library can do by asking it, not by assuming
             // its own build flavour matches.
             "canWrite": cfg!(feature = "dangerous-write-support"),
-        })
-        .to_string()
+        });
+        if let Some((cipher, key_bits, sector)) = &self.luks_params {
+            info["cipher"] = json!(cipher);
+            info["keyBits"] = json!(key_bits);
+            info["cipherSector"] = json!(sector);
+        }
+        // `true`/`false` once the drive has answered a SYNCHRONIZE CACHE,
+        // `null` until the first flush. `false` means a flush is a silent
+        // no-op and "committed" is not known to be on the medium (D3).
+        #[cfg(feature = "dangerous-write-support")]
+        {
+            info["flushSupported"] = json!(luks_core::device::WriteAt::flush_support(&self.dev));
+        }
+        info.to_string()
+    }
+
+    /// A listing plus how many entries had an unreadable inode (ext4 only;
+    /// always 0 on btrfs). The entries are still listed, with size and mtime 0,
+    /// so the UI can say "N entries couldn't be read" instead of showing them
+    /// as empty files without comment.
+    fn list_dir_counted(&self, path: &str) -> Result<(Vec<luks_core::fs::DirEntry>, usize)> {
+        use luks_core::fs::MountedFs;
+        let fs = self.fs_for_reading();
+        match &*fs {
+            MountedFs::Ext4(e) => {
+                let (entries, unreadable) = e.list_dir_checked(path)?;
+                Ok((entries, unreadable.len()))
+            }
+            MountedFs::Btrfs(b) => Ok((b.list_dir(path)?, 0)),
+        }
     }
 
     pub fn list_dir_json(&self, path: &str) -> Result<String> {
-        let mut entries = self.fs_for_reading().list_dir(path)?;
+        let (mut entries, unreadable) = self.list_dir_counted(path)?;
         // "." and ".." are real dirents; the UI never wants them, and filtering
         // here keeps every future shell from re-deciding it.
         entries.retain(|e| e.name != "." && e.name != "..");
@@ -1053,11 +1317,11 @@ impl VolumeHandle {
             })
             .collect();
 
-        Ok(json!({ "path": path, "entries": items }).to_string())
+        Ok(json!({ "path": path, "entries": items, "unreadable": unreadable }).to_string())
     }
 
     pub fn list_directory_paged(&self, path: &str, offset: usize, limit: usize) -> Result<String> {
-        let mut entries = self.fs_for_reading().list_dir(path)?;
+        let (mut entries, unreadable) = self.list_dir_counted(path)?;
         entries.retain(|e| e.name != "." && e.name != "..");
         entries.sort_by(|a, b| {
             b.file_type
@@ -1103,6 +1367,8 @@ impl VolumeHandle {
             "next_offset": next_offset,
             "has_more": has_more,
             "total_count": total_count,
+            // Across the whole directory, not just this page.
+            "unreadable": unreadable,
         })
         .to_string())
     }
@@ -1141,7 +1407,8 @@ impl VolumeHandle {
     ///
     /// The cap is not paranoia: the result becomes a Java `byte[]`, and a
     /// gigabyte file would blow the app heap long before the read finished.
-    /// Anything large goes through [`read_chunk`](Self::read_chunk) instead.
+    /// Anything large goes through [`open_file`](Self::open_file) and
+    /// [`read_at`](Self::read_at) instead.
     ///
     /// # Load-bearing: one lock, not two
     ///
@@ -1162,7 +1429,7 @@ impl VolumeHandle {
         if info.size > max_bytes {
             return Err(LuksError::UnsupportedFsFeature(format!(
                 "file is {} bytes, over the {} byte limit for a single read; \
-                 use readChunk",
+                 use openFile/readAt",
                 info.size, max_bytes
             )));
         }
@@ -1180,21 +1447,11 @@ impl VolumeHandle {
         if data.len() as u64 > max_bytes {
             return Err(LuksError::UnsupportedFsFeature(format!(
                 "file is {} bytes, over the {} byte limit for a single read; \
-                 use readChunk",
+                 use openFile/readAt",
                 data.len(), max_bytes
             )));
         }
         Ok(data)
-    }
-
-    /// Fill `buf` from `offset`, returning how many bytes were written.
-    /// A short return means end of file.
-    pub fn read_chunk(&self, path: &str, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        let file = self.fs_for_reading().open(path)?;
-        if !file.file_type().is_file() {
-            return Err(LuksError::IsADirectory(path.to_string()));
-        }
-        self.fs_for_reading().read_open(&file, offset, buf)
     }
 
     /// Stream a file to an `io::Write` destination in chunks, checking for cancellation between chunks.
@@ -1304,6 +1561,101 @@ impl VolumeHandle {
     pub fn sha256_json(&self, path: &str, chunk_bytes: usize) -> Result<String> {
         self.sha256_json_with_cancel(path, chunk_bytes, 0)
     }
+}
+
+impl VolumeHandle {
+    /// F8: run the drive-health check and return its JSON (see [`health_json`]).
+    ///
+    /// `cancel_token` is a token from `register_cancel_token` (0 = none); the
+    /// checker polls it between units of work and stops with
+    /// `unknown/cancelled`.
+    pub fn health_check_json(&self, cancel_token: u64) -> String {
+        self.health_check_json_with(|| cancel_token != 0 && is_cancelled(cancel_token))
+    }
+
+    /// [`health_check_json`](Self::health_check_json) with the cancel poll
+    /// supplied by the caller (tests drive cancellation and panics through it).
+    ///
+    /// # Locking, panics, fences
+    ///
+    /// * One `fs` lock for the whole scan (A6): the scan sees one coherent
+    ///   state, and a transfer that wants the lock waits at most one poll
+    ///   interval because Kotlin signals the token first.
+    /// * The checker runs under `catch_unwind` **inside** the lock (A7). The
+    ///   guard is held outside the closure, so a panic unwinds only to this
+    ///   frame and the guard drops normally: the mutex is not poisoned and
+    ///   `fs_for_writing` keeps working. A checker panic is a bug in the
+    ///   checker, not a sign the drive is in an unknown state: it only reads.
+    /// * Taken with `fs_for_reading`, so a fenced or poisoned session is
+    ///   checked too. The checker reads from the device, never from the
+    ///   in-memory write state, and a fenced session is exactly when the user
+    ///   wants to know what the drive looks like. Refusing there would make the
+    ///   light go grey in the one situation it matters.
+    pub fn health_check_json_with(&self, cancel: impl Fn() -> bool) -> String {
+        crate::install_panic_hook();
+        let started = std::time::Instant::now();
+        let fs = self.fs_for_reading();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &*fs {
+            MountedFs::Ext4(e) => e.check_health(&cancel),
+            MountedFs::Btrfs(b) => b.check_health(&cancel),
+        }));
+        drop(fs);
+        let report = match outcome {
+            Ok(r) => r,
+            Err(_payload) => {
+                // Logs and records the source location only, never the payload
+                // (it can hold names); the text it returns is not surfaced.
+                crate::report_panic();
+                luks_core::fs::health::Findings::default()
+                    .unknown(luks_core::fs::health::UnknownReason::Internal, started.elapsed())
+            }
+        };
+        health_json(&report)
+    }
+}
+
+/// The JSON the app reads: kinds and counts only, no samples, no paths.
+///
+/// `writeSafe` is true for a clean drive, and for a leaks verdict whose every
+/// finding is `write_safe()`. It is false for corrupt and for unknown (an
+/// unjudged drive is not "safe", but Kotlin only gates on corrupt / unsafe
+/// leaks, so unknown never blocks a write by itself).
+pub fn health_json(report: &luks_core::fs::health::HealthReport) -> String {
+    use luks_core::fs::health::{UnknownReason, Verdict};
+    let verdict = match report.verdict {
+        Verdict::Clean => "clean",
+        Verdict::Leaks => "leaks",
+        Verdict::Corrupt => "corrupt",
+        Verdict::Unknown => "unknown",
+    };
+    let unknown = report.unknown.map(|r| match r {
+        UnknownReason::Cancelled => "cancelled",
+        UnknownReason::Unsupported => "unsupported",
+        UnknownReason::TooLarge => "too_large",
+        UnknownReason::Busy => "busy",
+        UnknownReason::Io => "io",
+        UnknownReason::Internal => "internal",
+    });
+    let write_safe = match report.verdict {
+        Verdict::Clean => true,
+        Verdict::Leaks => report.findings.keys().all(|k| k.write_safe()),
+        Verdict::Corrupt | Verdict::Unknown => false,
+    };
+    // An unknown verdict carries no findings across the boundary: whatever the
+    // checker saw before it stopped is not a judgement.
+    let findings: serde_json::Map<String, Value> = if report.verdict == Verdict::Unknown {
+        serde_json::Map::new()
+    } else {
+        report.findings.iter().map(|(k, n)| (k.name().to_string(), json!(n))).collect()
+    };
+    json!({
+        "verdict": verdict,
+        "unknown": unknown,
+        "writeSafe": write_safe,
+        "findings": findings,
+        "elapsedMs": report.elapsed.as_millis() as u64,
+    })
+    .to_string()
 }
 
 /// Time the CPU-side work in isolation, with no USB involved.
@@ -1475,6 +1827,7 @@ pub fn device_ref(handle: i64) -> std::result::Result<DeviceHandleRef, &'static 
     match &h.payload {
         Payload::Device(_) => Ok(DeviceHandleRef(h)),
         Payload::Volume(_) => Err("handle is a volume, not a device"),
+        Payload::File(_) => Err("handle is an open file, not a device"),
         #[cfg(feature = "dangerous-write-support")]
         Payload::Writer(_) => Err("handle is a file writer, not a device"),
     }
@@ -1485,6 +1838,7 @@ pub fn volume_ref(handle: i64) -> std::result::Result<VolumeHandleRef, &'static 
     match &h.payload {
         Payload::Volume(_) => Ok(VolumeHandleRef(h)),
         Payload::Device(_) => Err("handle is a device, not a volume"),
+        Payload::File(_) => Err("handle is an open file, not a volume"),
         #[cfg(feature = "dangerous-write-support")]
         Payload::Writer(_) => Err("handle is a file writer, not a volume"),
     }
@@ -1503,6 +1857,7 @@ pub fn writer_ref(handle: i64) -> std::result::Result<WriterHandleRef, &'static 
 enum HandleKind {
     Device,
     Volume,
+    File,
     #[cfg(feature = "dangerous-write-support")]
     Writer,
 }
@@ -1520,6 +1875,7 @@ fn drop_handle(handle: i64, want: HandleKind) {
         let kind = match &entry.payload {
             Payload::Device(_) => HandleKind::Device,
             Payload::Volume(_) => HandleKind::Volume,
+            Payload::File(_) => HandleKind::File,
             #[cfg(feature = "dangerous-write-support")]
             Payload::Writer(_) => HandleKind::Writer,
         };
@@ -1527,13 +1883,43 @@ fn drop_handle(handle: i64, want: HandleKind) {
     } else {
         false
     };
-    if should_remove {
-        map.remove(&id);
-    }
+    // Remove under the lock, but drop the Arc only after releasing it: the
+    // last reference runs `VolumeHandle::drop`, whose final commit does device
+    // I/O and must not block every other handle lookup (H1).
+    let removed = if should_remove { map.remove(&id) } else { None };
+    drop(lock);
+    drop(removed);
 }
 
 pub fn drop_device(handle: i64) {
     drop_handle(handle, HandleKind::Device)
+}
+
+pub fn drop_file(handle: i64) {
+    drop_handle(handle, HandleKind::File)
+}
+
+/// A reference to an open-file handle in the registry. Keeps the entry alive
+/// for the duration of a call even if another thread closes it meanwhile.
+#[derive(Clone)]
+pub struct FileHandleRef(Arc<Handle>);
+
+impl std::ops::Deref for FileHandleRef {
+    type Target = OpenFileHandle;
+    fn deref(&self) -> &OpenFileHandle {
+        match &self.0.payload {
+            Payload::File(f) => f,
+            _ => unreachable!("FileHandleRef invariant violated"),
+        }
+    }
+}
+
+pub fn file_ref(handle: i64) -> std::result::Result<FileHandleRef, &'static str> {
+    let h = handle_ref(handle)?;
+    match &h.payload {
+        Payload::File(_) => Ok(FileHandleRef(h)),
+        _ => Err("handle is not an open file"),
+    }
 }
 
 pub fn drop_volume(handle: i64) {
@@ -1543,6 +1929,43 @@ pub fn drop_volume(handle: i64) {
 #[cfg(feature = "dangerous-write-support")]
 pub fn drop_writer(handle: i64) {
     drop_handle(handle, HandleKind::Writer)
+}
+
+/// F4-A5: end the volume's session, then drop its handle. Returns the final
+/// close result (open-writer release + btrfs commit) so Java learns whether
+/// acknowledged files reached the medium. The handle is dropped either way.
+/// An unknown/already-closed handle is `Ok` (idempotent).
+pub fn close_volume(handle: i64) -> Result<()> {
+    let outcome = match volume_ref(handle) {
+        #[cfg(feature = "dangerous-write-support")]
+        Ok(vol) => vol.close(),
+        #[cfg(not(feature = "dangerous-write-support"))]
+        Ok(_) => Ok(()),
+        Err(_) => Ok(()),
+    };
+    drop_volume(handle);
+    outcome
+}
+
+/// F4-A4: `nativeCloseWriter`. The global writer handle is always removed.
+/// * unknown writer handle -> `BadHandle` (nothing to leak);
+/// * volume already gone -> `Ok`: its close released the writer (A5);
+/// * writer already finished/released inside a live volume -> `Ok`.
+#[cfg(feature = "dangerous-write-support")]
+pub fn close_writer_handle(volume: i64, writer: i64) -> std::result::Result<(), WriterError> {
+    let wh = writer_ref(writer).map_err(WriterError::BadHandle)?;
+    if wh.volume_handle != volume {
+        return Err(WriterError::BadHandle("writer belongs to another volume"));
+    }
+    let outcome = match volume_ref(volume) {
+        Ok(vol) if vol.id == wh.volume_id => match vol.abandon_file(wh.writer_id) {
+            Err(WriterError::BadHandle(_)) => Ok(()),
+            other => other,
+        },
+        _ => Ok(()),
+    };
+    drop_writer(writer);
+    outcome
 }
 
 #[cfg(test)]
@@ -1640,6 +2063,17 @@ mod tests {
         assert_eq!(v["encrypted"], true);
     }
 
+    /// The debug log's session header names the cipher and key size so a log
+    /// says which crypto path ran. Shape only, never key material.
+    #[test]
+    fn volume_info_json_reports_cipher_parameters() {
+        let vol = unlock_fixture();
+        let v: Value = serde_json::from_str(&vol.info_json()).unwrap();
+        assert_eq!(v["cipher"], "aes-xts-plain64");
+        assert!(matches!(v["keyBits"].as_u64(), Some(256 | 512)), "keyBits {}", v["keyBits"]);
+        assert!(matches!(v["cipherSector"].as_u64(), Some(512 | 4096)), "cipherSector {}", v["cipherSector"]);
+    }
+
     #[test]
     fn unlock_then_list_the_root_directory() {
         let vol = unlock_fixture();
@@ -1672,11 +2106,13 @@ mod tests {
     }
 
     #[test]
-    fn read_chunk_reads_from_the_middle_and_stops_at_eof() {
+    fn read_at_reads_from_the_middle_and_stops_at_eof() {
         let vol = unlock_fixture();
+        let file = vol.open_file("/proof.txt").unwrap();
         let mut buf = [0u8; 64];
-        let got = vol.read_chunk("/proof.txt", 6, &mut buf).unwrap();
+        let got = vol.read_at(&file, 6, &mut buf).unwrap();
         assert_eq!(&buf[..got], b"disk stack works\n");
+        assert_eq!(vol.read_at(&file, 1 << 20, &mut buf).unwrap(), 0, "past EOF reads nothing");
     }
 
     #[test]
@@ -1747,7 +2183,17 @@ mod tests {
         use std::sync::mpsc;
         use std::time::Duration;
 
+        /// Deletes the scratch image on drop, including during panic unwind.
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                if let Err(e) = std::fs::remove_file(&self.0) {
+                    eprintln!("scratch cleanup failed: {e}");
+                }
+            }
+        }
         let scratch_path = std::env::temp_dir().join("luks-jni-read-file-race.img");
+        let _scratch_guard = Scratch(scratch_path.clone());
         std::fs::copy(
             concat!(
                 env!("CARGO_MANIFEST_DIR"),
@@ -1817,8 +2263,6 @@ mod tests {
              against, not bytes read from a file that changed size after \
              the check ran under a separate lock acquisition"
         );
-
-        let _ = std::fs::remove_file(&scratch_path);
     }
 
     /// `sha256_json` streams; `read_file` slurps. They must agree, or the
@@ -2014,6 +2458,15 @@ mod tests {
             code::TRANSPORT
         );
         assert_eq!(error_code(&LuksError::FsNeedsRecovery), code::NEEDS_FSCK);
+        // UsbErrno (a kernel transfer failure with its errno) is a transport
+        // failure whatever the errno, including a disconnect and the Dead state.
+        for errno in [110, 19, 108, 71] {
+            assert_eq!(
+                error_code(&LuksError::usb_errno(errno, "x")),
+                code::TRANSPORT,
+                "errno {errno}"
+            );
+        }
         assert_eq!(
             error_code(&LuksError::BadMagic { found: [0; 6] }),
             code::NOT_LUKS
@@ -2334,6 +2787,9 @@ mod tests {
         std::fs::write(&fat32_path, &fat32_buf).expect("write FAT32 scratch image");
         let fs_dev = luks_core::device::FileDevice::open(&fat32_path).expect("open FAT32 scratch");
         let fs_len = fs_dev.len().unwrap();
+        // Unlink now: the open fd keeps the image alive, and nothing is left in
+        // $TMPDIR even if an assertion below panics.
+        std::fs::remove_file(&fat32_path).expect("unlink FAT32 scratch");
         let disk = TestMbrDisk::new(fs_dev, 0x0C);
         let total_blocks = (512 + fs_len) / 512;
         let dev = DeviceHandle::new(disk, 512, total_blocks, "TEST".into(), "FAT32".into())
@@ -2355,6 +2811,9 @@ mod tests {
         let fs_len = std::fs::metadata(&scratch).unwrap().len();
         let fs_dev = luks_core::device::FileDevice::open_writable(&scratch, fs_len)
             .expect("open scratch writable");
+        // Unlink now: the open fd keeps the image alive, and nothing is left in
+        // $TMPDIR even if the test panics.
+        std::fs::remove_file(&scratch).expect("unlink scratch");
         let disk = TestMbrDisk::new(fs_dev, 0x83);
         let dev = DeviceHandle::new(disk, 512, (512 + fs_len) / 512, "T".into(), "E".into())
             .expect("scan MBR disk");
@@ -2433,5 +2892,226 @@ mod tests {
             "a LUKS volume must not need arming"
         );
     }
-}
 
+    // ------------------------------------------------------------- F8 health
+
+    /// A plain ext2/ext4 volume on a scratch copy of `fixture` with `patch`
+    /// applied to the image bytes first. Unlinked at once: the fd keeps it alive and
+    /// nothing is left in $TMPDIR if an assertion panics.
+    fn patched_plain(fixture: &str, test: &str, patch: impl FnOnce(&mut Vec<u8>)) -> VolumeHandle {
+        let src = format!("{}/../fixtures/ext4/{fixture}", env!("CARGO_MANIFEST_DIR"));
+        let mut bytes = std::fs::read(src).expect("read fixture");
+        patch(&mut bytes);
+        let scratch = std::env::temp_dir().join(format!("luks-jni-health-{test}.img"));
+        std::fs::write(&scratch, &bytes).expect("write scratch");
+        #[cfg(feature = "dangerous-write-support")]
+        let fs_dev = {
+            let len = bytes.len() as u64;
+            luks_core::device::FileDevice::open_writable(&scratch, len).expect("open scratch")
+        };
+        #[cfg(not(feature = "dangerous-write-support"))]
+        let fs_dev = luks_core::device::FileDevice::open(&scratch).expect("open scratch");
+        std::fs::remove_file(&scratch).expect("unlink scratch");
+        let fs_len = bytes.len() as u64;
+        let disk = TestMbrDisk::new(fs_dev, 0x83);
+        let dev = DeviceHandle::new(disk, 512, (512 + fs_len) / 512, "T".into(), "E".into())
+            .expect("scan MBR disk");
+        dev.open_plain(512).expect("open plain ext4")
+    }
+
+    /// small-1k has metadata_csum: a hand-patched bitmap or superblock would
+    /// (rightly) fail its checksum, so shape tests that patch use ext2-1k.
+    fn patched_plain_ext4(test: &str, patch: impl FnOnce(&mut Vec<u8>)) -> VolumeHandle {
+        patched_plain("small-1k.img", test, patch)
+    }
+
+    fn patched_plain_ext2(test: &str, patch: impl FnOnce(&mut Vec<u8>)) -> VolumeHandle {
+        patched_plain("ext2-1k.img", test, patch)
+    }
+
+    /// Group 0's block bitmap offset in a 1 KiB-block image (GDT is block 2).
+    fn bitmap0_offset(img: &[u8]) -> usize {
+        u32::from_le_bytes(img[2048..2052].try_into().unwrap()) as usize * 1024
+    }
+
+    fn health(vol: &VolumeHandle) -> Value {
+        serde_json::from_str(&vol.health_check_json(0)).expect("health json")
+    }
+
+    #[test]
+    fn a_clean_image_reports_clean_and_write_safe() {
+        let vol = patched_plain_ext4("clean", |_| {});
+        let h = health(&vol);
+        assert_eq!(h["verdict"], "clean", "{h}");
+        assert_eq!(h["writeSafe"], true);
+        assert!(h["unknown"].is_null());
+        assert_eq!(h["findings"].as_object().unwrap().len(), 0);
+        assert!(h["elapsedMs"].is_u64());
+    }
+
+    /// The btrfs half goes through the same entry point (read-only open of the
+    /// committed fixture; nothing is written).
+    #[test]
+    fn a_clean_btrfs_image_reports_clean() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../fixtures/btrfs/plain.img");
+        let fs_dev = luks_core::device::FileDevice::open(path).expect("open btrfs fixture");
+        let fs_len = fs_dev.len().unwrap();
+        let disk = TestMbrDisk::new(fs_dev, 0x83);
+        let dev = DeviceHandle::new(disk, 512, (512 + fs_len) / 512, "T".into(), "B".into())
+            .expect("scan MBR disk");
+        let vol = dev.open_plain(512).expect("open plain btrfs");
+        let h = health(&vol);
+        assert_eq!(h["verdict"], "clean", "{h}");
+        assert_eq!(h["writeSafe"], true);
+    }
+
+    #[test]
+    fn a_leaked_block_is_leaks_and_write_safe() {
+        // Set the first free bit of group 0's bitmap: a block nobody owns.
+        let vol = patched_plain_ext2("leak", |img| {
+            let off = bitmap0_offset(img);
+            let byte = (0..1024)
+                .find(|&i| img[off + i] != 0xFF)
+                .expect("a free bit in group 0");
+            let bit = (0..8).find(|b| img[off + byte] & (1 << b) == 0).unwrap();
+            img[off + byte] |= 1 << bit;
+        });
+        let h = health(&vol);
+        assert_eq!(h["verdict"], "leaks", "{h}");
+        assert_eq!(h["findings"]["leaked_blocks"], 1, "{h}");
+        assert_eq!(h["writeSafe"], true, "{h}");
+    }
+
+    #[test]
+    fn a_dirty_flag_is_leaks_but_not_write_safe() {
+        // s_state (superblock + 0x3A): drop VALID_FS (bit 0).
+        let vol = patched_plain_ext2("dirty", |img| img[1024 + 0x3A] &= !1);
+        let h = health(&vol);
+        assert_eq!(h["verdict"], "leaks", "{h}");
+        assert_eq!(h["findings"]["marked_dirty"], 1, "{h}");
+        assert_eq!(h["writeSafe"], false, "{h}");
+    }
+
+    #[test]
+    fn a_cleared_bitmap_bit_under_live_data_is_corrupt() {
+        // Clear every used bit in group 0's bitmap: owned blocks now look free.
+        let vol = patched_plain_ext2("corrupt", |img| {
+            let off = bitmap0_offset(img);
+            img[off..off + 16].fill(0);
+        });
+        let h = health(&vol);
+        assert_eq!(h["verdict"], "corrupt", "{h}");
+        assert_eq!(h["writeSafe"], false);
+        assert!(h["findings"]["block_in_use_but_free"].as_u64().unwrap() > 0, "{h}");
+    }
+
+    #[test]
+    fn a_cancelled_check_is_unknown_cancelled_with_no_findings() {
+        let vol = patched_plain_ext2("cancel", |img| img[1024 + 0x3A] &= !1);
+        let h: Value = serde_json::from_str(&vol.health_check_json_with(|| true)).unwrap();
+        assert_eq!(h["verdict"], "unknown", "{h}");
+        assert_eq!(h["unknown"], "cancelled");
+        assert_eq!(h["writeSafe"], false);
+        assert_eq!(h["findings"].as_object().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn a_registered_token_cancels_through_the_native_registry() {
+        let vol = patched_plain_ext4("token", |_| {});
+        let token = register_cancel_token();
+        cancel_operation(token);
+        let h: Value = serde_json::from_str(&vol.health_check_json(token)).unwrap();
+        unregister_cancel_token(token);
+        assert_eq!(h["unknown"], "cancelled", "{h}");
+        // An unsignalled token does not stop the check.
+        let live = register_cancel_token();
+        let h: Value = serde_json::from_str(&vol.health_check_json(live)).unwrap();
+        unregister_cancel_token(live);
+        assert_eq!(h["verdict"], "clean", "{h}");
+    }
+
+    #[test]
+    fn every_unknown_reason_and_no_samples_cross_the_boundary() {
+        use luks_core::fs::health::{FindingKind, Findings, UnknownReason};
+        use std::time::Duration;
+        for (reason, name) in [
+            (UnknownReason::Cancelled, "cancelled"),
+            (UnknownReason::Unsupported, "unsupported"),
+            (UnknownReason::TooLarge, "too_large"),
+            (UnknownReason::Busy, "busy"),
+            (UnknownReason::Io, "io"),
+            (UnknownReason::Internal, "internal"),
+        ] {
+            let mut f = Findings::default();
+            f.add(FindingKind::LeakedBlocks, 3, Some(12345));
+            let j: Value =
+                serde_json::from_str(&health_json(&f.unknown(reason, Duration::from_millis(7)))).unwrap();
+            assert_eq!(j["verdict"], "unknown");
+            assert_eq!(j["unknown"], name);
+            assert_eq!(j["elapsedMs"], 7);
+            assert_eq!(j["findings"].as_object().unwrap().len(), 0);
+        }
+        let mut f = Findings::default();
+        f.add(FindingKind::LeakedBlocks, 3, Some(12345));
+        let text = health_json(&f.finish(Duration::ZERO));
+        assert!(!text.contains("12345"), "block numbers must not cross: {text}");
+    }
+
+    #[test]
+    fn write_safe_is_decided_per_finding_kind() {
+        use luks_core::fs::health::{FindingKind, Findings};
+        use std::time::Duration;
+        let safe = |kinds: &[FindingKind]| {
+            let mut f = Findings::default();
+            for k in kinds {
+                f.add(*k, 1, None);
+            }
+            let j: Value = serde_json::from_str(&health_json(&f.finish(Duration::ZERO))).unwrap();
+            (j["verdict"].as_str().unwrap().to_string(), j["writeSafe"].as_bool().unwrap())
+        };
+        assert_eq!(safe(&[FindingKind::LeakedBlocks, FindingKind::LeakedInodes]), ("leaks".into(), true));
+        assert_eq!(safe(&[FindingKind::LeakedBlocks, FindingKind::UnattachedInode]), ("leaks".into(), false));
+        assert_eq!(safe(&[FindingKind::LinkCountLow]), ("leaks".into(), false));
+        assert_eq!(safe(&[FindingKind::DoubleOwnedBlock]), ("corrupt".into(), false));
+    }
+
+    /// A checker panic is `unknown/internal`; the fs lock is not poisoned.
+    #[test]
+    fn a_checker_panic_is_unknown_internal_and_does_not_poison_the_lock() {
+        let vol = patched_plain_ext4("panic", |_| {});
+        let h: Value = serde_json::from_str(&vol.health_check_json_with(|| panic!("boom"))).unwrap();
+        assert_eq!(h["verdict"], "unknown", "{h}");
+        assert_eq!(h["unknown"], "internal");
+        assert!(!vol.fs.is_poisoned(), "the checker panic must not poison the fs mutex");
+        // And the volume still reads and still checks.
+        assert_eq!(health(&vol)["verdict"], "clean");
+        vol.read_file("/hello.txt", 1024).expect("read after a checker panic");
+    }
+
+    /// The same, for the write side: the next mutating call works and the
+    /// session is not fenced.
+    #[cfg(feature = "dangerous-write-support")]
+    #[test]
+    fn after_a_checker_panic_the_next_write_works_and_the_session_is_not_fenced() {
+        let vol = patched_plain_ext4("panic-write", |_| {});
+        vol.arm_plain_writes();
+        let h: Value = serde_json::from_str(&vol.health_check_json_with(|| panic!("boom"))).unwrap();
+        assert_eq!(h["unknown"], "internal");
+        assert!(vol.fence_reason().is_none(), "a checker panic must not fence the session");
+        vol.write_file("/", "after.txt", b"ok").expect("write after a checker panic");
+        assert_eq!(vol.read_file("/after.txt", 16).unwrap(), b"ok");
+        // The file we just wrote leaves the drive clean.
+        assert_eq!(health(&vol)["verdict"], "clean");
+    }
+
+    /// Fenced sessions are checked read-only, not refused.
+    #[cfg(feature = "dangerous-write-support")]
+    #[test]
+    fn a_fenced_session_can_still_be_checked() {
+        let vol = patched_plain_ext4("fenced", |_| {});
+        vol.arm_plain_writes();
+        vol.fence_writes("test fence");
+        assert!(vol.fence_reason().is_some());
+        assert_eq!(health(&vol)["verdict"], "clean");
+    }
+}

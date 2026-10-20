@@ -2,7 +2,6 @@ use crate::device::{ReadAt, WriteAt};
 use crate::error::{LuksError, Result};
 use crate::fs::btrfs::write::alloc::FreeSpaceMap;
 use crate::fs::btrfs::write::batch::Batch;
-use crate::fs::btrfs::write::commit::commit_transaction;
 use crate::fs::btrfs::write::gate;
 use crate::fs::btrfs::Btrfs;
 
@@ -68,6 +67,10 @@ impl BtrfsFileWriter {
 
 impl<D: ReadAt + WriteAt> Btrfs<D> {
     pub fn begin_file(&mut self, size: u64) -> Result<BtrfsFileWriter> {
+        if self.commit_pending {
+            // M1: a commit is in doubt; only its retry (or a discard) is allowed.
+            return Err(LuksError::WriterBusy);
+        }
         gate::check_writeable_fs(self.superblock())?;
         gate::check_writeable_subvolume(&self.fs_tree())?;
 
@@ -104,6 +107,30 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
             .map(|bg| bg.total_free_bytes)
             .sum();
 
+        // Refuse before anything is written (or any chunk is committed) when
+        // the request cannot fit without eating the unallocated-space reserve,
+        // or when too little metadata space is left for a commit to succeed.
+        let free_metadata: u64 = allocator
+            .block_groups
+            .iter()
+            .filter(|bg| bg.block_group.flags & 0x4 != 0)
+            .map(|bg| bg.total_free_bytes)
+            .sum();
+        if free_metadata < crate::fs::btrfs::write::chunk_alloc::metadata_floor(self.superblock().node_size) {
+            return Err(LuksError::FilesystemFull);
+        }
+        if total_free_data < disk_num_bytes {
+            let dev_extents = crate::fs::btrfs::write::chunk_alloc::read_dev_extents(self, self.superblock().dev_id)?;
+            let headroom = crate::fs::btrfs::write::chunk_alloc::data_chunk_headroom(
+                self.unallocated_reserve(),
+                self.superblock().total_bytes,
+                &dev_extents,
+            );
+            if total_free_data.saturating_add(headroom) < disk_num_bytes {
+                return Err(LuksError::FilesystemFull);
+            }
+        }
+
         while total_free_data < disk_num_bytes {
             self.commit_active_batch()?;
             self.allocate_data_chunk_excluding(&[])?;
@@ -125,17 +152,22 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
                 Ok((bytenr, chunk_len)) => {
                     if let Some(ref mut batch) = self.active_batch {
                         if let Err(e) = batch.record_allocation(bytenr, chunk_len) {
-                            for &(r_bytenr, r_len) in &data_runs {
-                                let _ = batch.release_allocation(r_bytenr, r_len);
-                            }
-                            return Err(e);
+                            return Err(release_failure_outranks(e, release_runs(batch, &data_runs)));
                         }
                     }
                     data_runs.push((bytenr, chunk_len));
                     allocated += chunk_len;
                 }
                 Err(LuksError::FilesystemFull) => {
-                    self.commit_active_batch()?;
+                    // The commit is non-destructive: on failure the batch stays
+                    // as `active_batch`, so give back the runs this call
+                    // reserved in its ledger before reporting the error.
+                    if let Err(e) = self.commit_active_batch() {
+                        if let Some(ref mut batch) = self.active_batch {
+                            return Err(release_failure_outranks(e, release_runs(batch, &data_runs)));
+                        }
+                        return Err(e);
+                    }
                     self.allocate_data_chunk_excluding(&data_runs)?;
                     self.active_batch = Some(Batch::open(self)?);
                     allocator = self.active_batch.as_ref().unwrap().allocator.clone();
@@ -148,9 +180,7 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
                 }
                 Err(e) => {
                     if let Some(ref mut batch) = self.active_batch {
-                        for &(r_bytenr, r_len) in &data_runs {
-                            let _ = batch.release_allocation(r_bytenr, r_len);
-                        }
+                        return Err(release_failure_outranks(e, release_runs(batch, &data_runs)));
                     }
                     return Err(e);
                 }
@@ -177,6 +207,10 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
     /// from existing free space. If free space is exhausted, `write_chunk`
     /// returns `FilesystemFull` (Valve A).
     pub fn begin_file_streaming(&mut self) -> Result<BtrfsFileWriter> {
+        if self.commit_pending {
+            // M1: a commit is in doubt; only its retry (or a discard) is allowed.
+            return Err(LuksError::WriterBusy);
+        }
         gate::check_writeable_fs(self.superblock())?;
         gate::check_writeable_subvolume(&self.fs_tree())?;
 
@@ -391,6 +425,21 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
         Ok(())
     }
 
+    /// Add a finished writer's file to the live batch.
+    ///
+    /// `Ok` means the file is in the batch, NOT that it is on the medium; the
+    /// batch is committed by `should_commit`, `commit_active_batch`, or the next
+    /// non-batch mutator.
+    ///
+    /// A commit failure here never loses earlier acknowledged files: the batch
+    /// is always restored to `active_batch`.
+    /// * Failure before any superblock write: this file is taken back out of
+    ///   the batch (so the returned `Err` is true: it is not published), and
+    ///   the earlier files stay pending for a later commit.
+    /// * Failure after the first superblock write began: the disk may already
+    ///   hold the transaction including this file. The batch is kept unchanged
+    ///   so a retry is idempotent (see `commit.rs`); the `Err` then means "not
+    ///   confirmed durable", and the file may still be published by the retry.
     pub fn finish_file(
         &mut self,
         writer: BtrfsFileWriter,
@@ -414,27 +463,35 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
                     total_bytes: writer.written_bytes,
                 });
                 if batch.should_commit() {
-                    let txn = batch.commit_and_rearm(self)?;
-                    commit_transaction(self, txn)?;
+                    if let Err(ce) = batch.commit_and_rearm(self) {
+                        if ce.superblock_write_started {
+                            self.active_batch = Some(batch);
+                            return Err(ce.error);
+                        }
+                        batch.rollback(mark);
+                        let rel = release_runs(&mut batch, &writer.data_runs);
+                        self.active_batch = Some(batch);
+                        return Err(release_failure_outranks(ce.error, rel));
+                    }
                 }
                 self.active_batch = Some(batch);
                 Ok(ino)
             }
             Err(e) => {
+                // `rollback(mark)` restores the batch to exactly its pre-file
+                // state (the ledger again holds this writer's runs from begin),
+                // so earlier files are intact and nothing needs committing here.
                 batch.rollback(mark);
-                for &(bytenr, run_len) in &writer.data_runs {
-                    let _ = batch.release_allocation(bytenr, run_len);
-                }
-                if batch.has_uncommitted_files() {
-                    let txn = batch.commit_and_rearm(self)?;
-                    commit_transaction(self, txn)?;
-                }
+                let rel = release_runs(&mut batch, &writer.data_runs);
                 self.active_batch = Some(batch);
-                Err(e)
+                Err(release_failure_outranks(e, rel))
             }
         }
     }
 
+    /// Release a writer's reservations. If earlier files are pending in the
+    /// batch they are committed as a courtesy (teardown relies on this); a
+    /// failed commit keeps the batch for retry and returns the error.
     pub fn abandon_file(&mut self, writer: BtrfsFileWriter) -> Result<()> {
         self.has_open_writer = false;
         crate::forensic::record_btrfs(crate::forensic::BtrfsEvent::AbandonFile {
@@ -442,16 +499,60 @@ impl<D: ReadAt + WriteAt> Btrfs<D> {
             total_bytes: writer.written_bytes,
         });
         if let Some(mut batch) = self.active_batch.take() {
-            for &(bytenr, run_len) in &writer.data_runs {
-                batch.release_allocation(bytenr, run_len)?;
-            }
-            if batch.has_uncommitted_files() {
-                let txn = batch.commit_and_rearm(self)?;
-                commit_transaction(self, txn)?;
+            let rel = release_runs(&mut batch, &writer.data_runs);
+            let mut outcome = rel;
+            if outcome.is_ok() && batch.has_uncommitted_files() {
+                if let Err(ce) = batch.commit_and_rearm(self) {
+                    outcome = Err(ce.error);
+                }
             }
             self.active_batch = Some(batch);
+            return outcome;
         }
         Ok(())
+    }
+
+    /// Release a writer's in-memory state on a session that must not touch the
+    /// medium again (fenced or poisoned). **Never commits**, unlike
+    /// [`abandon_file`](Self::abandon_file), which commits earlier pending files
+    /// as a courtesy. Clears `has_open_writer` and, if a batch still exists,
+    /// returns the writer's runs to its ledger. A fence normally discards the
+    /// batch already, in which case there is nothing to return.
+    ///
+    /// The result reports a ledger disagreement (W16) for the caller to log; it
+    /// is never a reason to keep the writer.
+    pub fn forget_writer(&mut self, writer: BtrfsFileWriter) -> Result<()> {
+        self.has_open_writer = false;
+        crate::forensic::record_btrfs(crate::forensic::BtrfsEvent::AbandonFile {
+            runs_count: writer.data_runs.len(),
+            total_bytes: writer.written_bytes,
+        });
+        match self.active_batch.as_mut() {
+            Some(batch) => release_runs(batch, &writer.data_runs),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Release every run from the batch's reservation ledger. All runs are
+/// attempted; the first failure is returned. A failure means the ledger and the
+/// writer disagree (double release / foreign range): never ignorable (W16).
+fn release_runs(batch: &mut Batch, runs: &[(u64, u64)]) -> Result<()> {
+    let mut first = None;
+    for &(bytenr, len) in runs {
+        if let Err(e) = batch.release_allocation(bytenr, len) {
+            first.get_or_insert(e);
+        }
+    }
+    first.map_or(Ok(()), Err)
+}
+
+/// Pick the error to report when cleanup ran inside an error path: a failed
+/// release is ledger corruption and outranks the error that got us here.
+fn release_failure_outranks(primary: LuksError, release: Result<()>) -> LuksError {
+    match release {
+        Ok(()) => primary,
+        Err(rel) => rel,
     }
 }
 

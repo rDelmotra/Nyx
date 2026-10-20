@@ -27,6 +27,7 @@ use jni::sys::{jbyteArray, jint, jlong, jstring};
 use jni::JNIEnv;
 
 use luks_core::error::LuksError;
+use zeroize::Zeroize;
 
 #[cfg(target_os = "android")]
 #[allow(dead_code)]
@@ -82,10 +83,46 @@ impl From<LuksError> for Fail {
     }
 }
 
+#[cfg(feature = "dangerous-write-support")]
+impl From<bridge::WriterError> for Fail {
+    fn from(e: bridge::WriterError) -> Self {
+        match e {
+            bridge::WriterError::BadHandle(m) => Fail::Msg(bridge::code::BAD_HANDLE, m.to_string()),
+            bridge::WriterError::Luks(e) => Fail::Luks(e),
+        }
+    }
+}
+
+/// The text of `e` that may cross into Java, logcat or the UI.
+///
+/// Core's `Display` stays as it is (tests and tools read it), but several
+/// variants interpolate a path or a name that lives on the encrypted volume or
+/// on the host. Those keep their kind and lose the payload; the error code
+/// travels separately. Every other variant carries only numbers or static
+/// text, so it passes through unchanged.
+fn redacted(e: &LuksError) -> String {
+    use LuksError::*;
+    match e {
+        NotFound(_) => "not found".into(),
+        NotADirectory(_) => "not a directory".into(),
+        IsADirectory(_) => "is a directory".into(),
+        DirectoryNotEmpty(_) => "directory is not empty".into(),
+        SymlinkLoop(_) => "too many levels of symbolic links".into(),
+        WrongWriteTarget { expected, detail, .. } => format!(
+            "refusing to write: the target is not the {expected}-byte device it was confirmed as ({detail})"
+        ),
+        UnverifiableWriteTarget { .. } => {
+            "refusing to write: could not determine the target's size to confirm it".into()
+        }
+        Io { source, .. } => format!("I/O error: {source}"),
+        other => other.to_string(),
+    }
+}
+
 impl Fail {
     fn parts(&self) -> (i32, String) {
         match self {
-            Fail::Luks(e) => (bridge::error_code(e), e.to_string()),
+            Fail::Luks(e) => (bridge::error_code(e), redacted(e)),
             Fail::Msg(c, m) => (*c, m.clone()),
         }
     }
@@ -101,41 +138,61 @@ type R<T> = std::result::Result<T, Fail>;
 /// payload, throw, and return a default value the caller discards because an
 /// exception is pending.
 fn guard<'l, T>(env: &mut JNIEnv<'l>, default: T, f: impl FnOnce(&mut JNIEnv<'l>) -> R<T>) -> T {
+    install_panic_hook();
     let outcome = catch_unwind(AssertUnwindSafe(|| f(env)));
     match outcome {
         Ok(Ok(value)) => value,
         Ok(Err(fail)) => {
             let (code, msg) = fail.parts();
-            #[cfg(debug_assertions)]
-            log::e(&format!("guard failed [{}]: {}", code, msg));
-            #[cfg(not(debug_assertions))]
-            log::e(&format!("guard failed [{}]", code));
+            // `msg` is redacted (see `redacted`): variant kind, no payload.
+            log::e(&format!("guard failed [{code}] {msg}"));
             throw(env, code, &msg);
             default
         }
-        Err(payload) => {
-            let msg = panic_message(&payload);
-            let err_msg = format!("internal error (this is a bug): {msg}");
-            log::e(&format!("guard panicked: {}", err_msg));
-            luks_core::forensic::record_panic(file!(), line!(), 0, &msg);
-            throw(
-                env,
-                bridge::code::PANIC,
-                &err_msg,
-            );
+        Err(_payload) => {
+            let err_msg = report_panic();
+            throw(env, bridge::code::PANIC, &err_msg);
             default
         }
     }
 }
 
-fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
-    if let Some(s) = payload.downcast_ref::<&str>() {
-        (*s).to_string()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "panic with a non-string payload".to_string()
-    }
+thread_local! {
+    /// Where the most recent panic on this thread happened. The panic payload
+    /// is formatted from whatever values the panicking code held, which can be
+    /// a path or a name, so it is never read: only the source location is.
+    static PANIC_SITE: std::cell::RefCell<Option<(String, u32, u32)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn install_panic_hook() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if let Some(loc) = info.location() {
+                let site = (loc.file().to_string(), loc.line(), loc.column());
+                PANIC_SITE.with(|s| *s.borrow_mut() = Some(site));
+            }
+            // The default hook prints the payload to stderr (logcat). Under
+            // the host test harness keep it, so failures stay readable.
+            if cfg!(test) {
+                previous(info);
+            }
+        }));
+    });
+}
+
+/// Log and forensically record the panic just caught on this thread, and
+/// return the text to throw. Never touches the payload.
+fn report_panic() -> String {
+    let (file, line, col) = PANIC_SITE
+        .with(|s| s.borrow_mut().take())
+        .unwrap_or_else(|| (file!().to_string(), line!(), 0));
+    let file = file.as_str();
+    log::e(&format!("guard panicked at {file}:{line}"));
+    luks_core::forensic::record_panic(file, line, col, "panic (payload withheld)");
+    format!("internal error (this is a bug): panic at {file}:{line}")
 }
 
 /// Throw `LuksException(message, code)`.
@@ -207,6 +264,30 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeDumpForensicLog<'l>
     guard(&mut env, std::ptr::null_mut(), |env| {
         let dump = luks_core::forensic::dump_text();
         out_string(env, dump)
+    })
+}
+
+/// Take the lossless notable-event queue (F9 C4) as
+/// `{"dropped":n,"events":[..]}`. Destructive: what is returned is removed.
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeDrainEvents<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+) -> jstring {
+    guard(&mut env, std::ptr::null_mut(), |env| {
+        out_string(env, luks_core::forensic::drain_notable_json())
+    })
+}
+
+/// Snapshot of the whole forensic ring as `{"dropped":n,"events":[..]}`. The
+/// ring is NOT cleared.
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeRingJson<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+) -> jstring {
+    guard(&mut env, std::ptr::null_mut(), |env| {
+        out_string(env, luks_core::forensic::ring_json())
     })
 }
 
@@ -305,8 +386,9 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeCloseVolume<'l>(
 ) {
     guard(&mut env, (), |_env| {
         log::i("nativeCloseVolume");
-        bridge::drop_volume(handle);
-        Ok(())
+        // Throws LuksException if the final close (open-writer release or the
+        // btrfs batch commit) failed; the handle is dropped either way.
+        Ok(bridge::close_volume(handle)?)
     })
 }
 
@@ -550,32 +632,229 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeReadFile<'l>(
     })
 }
 
-/// Read up to `len` bytes at `offset`. A shorter result means end of file.
+/// Pin the file at `path` by identity and return a read handle (F4 B1).
 ///
-/// Returns a fresh array rather than filling a caller-supplied one: writing into
-/// a Java array from Rust means handing out a `&mut [i8]` aliasing JVM memory,
-/// and the copy is not the bottleneck at USB speeds.
+/// The path is resolved exactly once, here. Reads go through
+/// [`nativeReadAt`](Java_dev_luksandroid_LuksNative_nativeReadAt) by inode and
+/// are refused with `FILE_CHANGED` if the file is deleted, replaced or modified
+/// after this call. Close with `nativeCloseFile`.
 #[no_mangle]
-pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeReadChunk<'l>(
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeOpenFile<'l>(
     mut env: JNIEnv<'l>,
     _class: JClass<'l>,
     handle: jlong,
     path: JString<'l>,
+) -> jlong {
+    guard(&mut env, 0, |env| {
+        let vol = bridge::volume_ref(handle).map_err(bad_handle)?;
+        let path = jstr(env, &path)?;
+        let file = vol.open_file(&path)?;
+        Ok(bridge::into_raw(bridge::Payload::File(file)))
+    })
+}
+
+/// Read up to `len` bytes at `offset` of an open file. A shorter result means
+/// end of file.
+///
+/// Returns a fresh array rather than filling a caller-supplied one: writing into
+/// a Java array from Rust means handing out a `&mut [i8]` aliasing JVM memory,
+/// and the copy is not the bottleneck at USB speeds.
+///
+/// Failures name the offset and the handle, never a path.
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeReadAt<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    volume: jlong,
+    file: jlong,
     offset: jlong,
     len: jint,
 ) -> jbyteArray {
     guard(&mut env, std::ptr::null_mut(), |env| {
-        let vol = bridge::volume_ref(handle).map_err(bad_handle)?;
-        let path = jstr(env, &path)?;
+        let vol = bridge::volume_ref(volume).map_err(bad_handle)?;
+        let fh = bridge::file_ref(file).map_err(bad_handle)?;
+        if fh.volume_id() != vol.id {
+            return Err(bad_handle("file belongs to another volume"));
+        }
         if offset < 0 || len <= 0 {
             return Err(Fail::Msg(
                 bridge::code::GENERIC,
-                format!("bad chunk request offset={offset} len={len}"),
+                format!("bad read request file={file} offset={offset} len={len}"),
             ));
         }
         let mut buf = vec![0u8; (len as usize).min(16 * 1024 * 1024)];
-        let got = vol.read_chunk(&path, offset as u64, &mut buf)?;
-        out_bytes(env, &buf[..got])
+        let got = vol.read_at(&fh, offset as u64, &mut buf).map_err(|e| {
+            Fail::Msg(
+                bridge::error_code(&e),
+                format!("read of file handle {file} at offset {offset} failed: {e}"),
+            )
+        })?;
+        let res = out_bytes(env, &buf[..got]);
+        buf.zeroize();
+        res
+    })
+}
+
+/// Up to `len` bytes at `offset` read directly into a direct off-heap `ByteBuffer`.
+/// Avoids intermediate heap allocation and copies across JNI.
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeReadAtDirect<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    volume: jlong,
+    file: jlong,
+    offset: jlong,
+    data: JByteBuffer<'l>,
+    len: jint,
+) -> jint {
+    guard(&mut env, 0, |env| {
+        let vol = bridge::volume_ref(volume).map_err(bad_handle)?;
+        let fh = bridge::file_ref(file).map_err(bad_handle)?;
+        if fh.volume_id() != vol.id {
+            return Err(bad_handle("file belongs to another volume"));
+        }
+        if offset < 0 || len <= 0 {
+            return Err(Fail::Msg(
+                bridge::code::GENERIC,
+                format!("bad read request file={file} offset={offset} len={len}"),
+            ));
+        }
+        let len = usize::try_from(len)
+            .map_err(|_| Fail::Msg(bridge::code::GENERIC, "negative chunk length".into()))?;
+
+        let ptr = env.get_direct_buffer_address(&data)
+            .map_err(|e| Fail::Msg(bridge::code::GENERIC, format!("not a direct ByteBuffer: {e}")))?;
+        let cap = env.get_direct_buffer_capacity(&data)
+            .map_err(|e| Fail::Msg(bridge::code::GENERIC, format!("cannot query direct buffer capacity: {e}")))?;
+
+        if len > cap {
+            return Err(Fail::Msg(bridge::code::GENERIC, "chunk length exceeds buffer capacity".into()));
+        }
+        if ptr.is_null() {
+            return Err(Fail::Msg(bridge::code::GENERIC, "direct buffer address is null".into()));
+        }
+
+        let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+        let got = vol.read_at(&fh, offset as u64, slice).map_err(|e| {
+            Fail::Msg(
+                bridge::error_code(&e),
+                format!("read of file handle {file} at offset {offset} failed: {e}"),
+            )
+        })?;
+        Ok(got as jint)
+    })
+}
+
+/// Sibling of `nativeReadAtDirect` that checks `cancel_token` and refuses if cancelled.
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeReadAtDirectWithCancel<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    volume: jlong,
+    file: jlong,
+    offset: jlong,
+    data: JByteBuffer<'l>,
+    len: jint,
+    cancel_token: jlong,
+) -> jint {
+    guard(&mut env, 0, |env| {
+        let vol = bridge::volume_ref(volume).map_err(bad_handle)?;
+        let fh = bridge::file_ref(file).map_err(bad_handle)?;
+        if fh.volume_id() != vol.id {
+            return Err(bad_handle("file belongs to another volume"));
+        }
+        let token = if cancel_token > 0 { cancel_token as u64 } else { 0 };
+        if token > 0 && bridge::is_cancelled(token) {
+            return Err(Fail::Luks(luks_core::error::LuksError::Cancelled));
+        }
+        if offset < 0 || len <= 0 {
+            return Err(Fail::Msg(
+                bridge::code::GENERIC,
+                format!("bad read request file={file} offset={offset} len={len}"),
+            ));
+        }
+        let len = usize::try_from(len)
+            .map_err(|_| Fail::Msg(bridge::code::GENERIC, "negative chunk length".into()))?;
+
+        let ptr = env.get_direct_buffer_address(&data)
+            .map_err(|e| Fail::Msg(bridge::code::GENERIC, format!("not a direct ByteBuffer: {e}")))?;
+        let cap = env.get_direct_buffer_capacity(&data)
+            .map_err(|e| Fail::Msg(bridge::code::GENERIC, format!("cannot query direct buffer capacity: {e}")))?;
+
+        if len > cap {
+            return Err(Fail::Msg(bridge::code::GENERIC, "chunk length exceeds buffer capacity".into()));
+        }
+        if ptr.is_null() {
+            return Err(Fail::Msg(bridge::code::GENERIC, "direct buffer address is null".into()));
+        }
+
+        let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+        let got = vol.read_at(&fh, offset as u64, slice).map_err(|e| {
+            Fail::Msg(
+                bridge::error_code(&e),
+                format!("read of file handle {file} at offset {offset} failed: {e}"),
+            )
+        })?;
+        Ok(got as jint)
+    })
+}
+
+/// Size of an open file, taken from the handle (identity-checked), not from a
+/// second path lookup. `FILE_CHANGED` if the file is no longer the one opened.
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeFileSize<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    volume: jlong,
+    file: jlong,
+) -> jlong {
+    guard(&mut env, 0, |_env| {
+        let vol = bridge::volume_ref(volume).map_err(bad_handle)?;
+        let fh = bridge::file_ref(file).map_err(bad_handle)?;
+        if fh.volume_id() != vol.id {
+            return Err(bad_handle("file belongs to another volume"));
+        }
+        let size = vol.file_size(&fh).map_err(|e| {
+            Fail::Msg(
+                bridge::error_code(&e),
+                format!("size of file handle {file} failed: {e}"),
+            )
+        })?;
+        Ok(size as jlong)
+    })
+}
+
+/// Cumulative `[verified, unverified]` bytes `nativeReadAt` has returned on
+/// this handle. Verified = matched against a stored data checksum (btrfs).
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeFileCoverage<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    file: jlong,
+) -> jni::sys::jlongArray {
+    guard(&mut env, std::ptr::null_mut(), |env| {
+        let fh = bridge::file_ref(file).map_err(bad_handle)?;
+        let (verified, unverified) = fh.coverage();
+        let arr = env.new_long_array(2).map_err(|e| {
+            Fail::Msg(bridge::code::GENERIC, format!("jni: new long[2] failed: {e}"))
+        })?;
+        env.set_long_array_region(&arr, 0, &[verified as jlong, unverified as jlong])
+            .map_err(|e| Fail::Msg(bridge::code::GENERIC, format!("jni: set long[] failed: {e}")))?;
+        Ok(arr.into_raw())
+    })
+}
+
+/// Release an open-file handle. Idempotent: an unknown or already-closed
+/// handle is not an error (a close must be safe to call from a `finally`).
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeCloseFile<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    file: jlong,
+) {
+    guard(&mut env, (), |_env| {
+        bridge::drop_file(file);
+        Ok(())
     })
 }
 
@@ -614,6 +893,24 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeSha256WithCancel<'l
         let path = jstr(env, &path)?;
         let token = if cancel_token > 0 { cancel_token as u64 } else { 0 };
         let json = vol.sha256_json_with_cancel(&path, chunk_bytes.max(0) as usize, token)?;
+        out_string(env, &json)
+    })
+}
+
+/// F8: drive-health check. JSON `{verdict, unknown, writeSafe, findings,
+/// elapsedMs}`; see `bridge::health_json`. Never throws for a damaged drive:
+/// damage is the answer. `cancel_token` <= 0 means none.
+#[no_mangle]
+pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeHealthCheck<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    handle: jlong,
+    cancel_token: jlong,
+) -> jstring {
+    guard(&mut env, std::ptr::null_mut(), |env| {
+        let vol = bridge::volume_ref(handle).map_err(bad_handle)?;
+        let token = if cancel_token > 0 { cancel_token as u64 } else { 0 };
+        let json = vol.health_check_json(token);
         out_string(env, &json)
     })
 }
@@ -760,12 +1057,12 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeBeginFile<'l>(
         let vol = bridge::volume_ref(volume).map_err(bad_handle)?;
         let size = u64::try_from(size)
             .map_err(|_| Fail::Msg(bridge::code::GENERIC, "negative file size".into()))?;
-        let writer = vol.begin_file(size)?;
+        let writer_id = vol.begin_file(size)?;
         Ok(bridge::into_raw(bridge::Payload::Writer(
             bridge::WriterHandle {
                 volume_handle: volume,
                 volume_id: vol.id,
-                writer: std::sync::Mutex::new(Some(writer)),
+                writer_id,
             },
         )))
     })
@@ -780,12 +1077,12 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeBeginFileStreaming<
 ) -> jlong {
     guard(&mut env, 0, |_env| {
         let vol = bridge::volume_ref(volume).map_err(bad_handle)?;
-        let writer = vol.begin_file_streaming()?;
+        let writer_id = vol.begin_file_streaming()?;
         Ok(bridge::into_raw(bridge::Payload::Writer(
             bridge::WriterHandle {
                 volume_handle: volume,
                 volume_id: vol.id,
-                writer: std::sync::Mutex::new(Some(writer)),
+                writer_id,
             },
         )))
     })
@@ -823,11 +1120,7 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeWriteChunk<'l>(
         }
 
         let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-        let mut slot = wh.writer.lock().unwrap_or_else(|p| p.into_inner());
-        let state = slot
-            .as_mut()
-            .ok_or_else(|| bad_handle("writer is finished or closed"))?;
-        Ok(vol.write_file_chunk(state, slice)?)
+        Ok(vol.write_file_chunk(wh.writer_id, slice)?)
     })
 }
 
@@ -864,12 +1157,8 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeWriteChunkWithCance
         }
 
         let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-        let mut slot = wh.writer.lock().unwrap_or_else(|p| p.into_inner());
-        let state = slot
-            .as_mut()
-            .ok_or_else(|| bad_handle("writer is finished or closed"))?;
         let token = if cancel_token > 0 { cancel_token as u64 } else { 0 };
-        Ok(vol.write_file_chunk_with_cancel(state, slice, token)?)
+        Ok(vol.write_file_chunk_with_cancel(wh.writer_id, slice, token)?)
     })
 }
 
@@ -891,14 +1180,10 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeFinishFile<'l>(
         }
         let parent_path = jstr(env, &parent_path)?;
         let name = jstr(env, &name)?;
-        let state = wh
-            .writer
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .take()
-            .ok_or_else(|| bad_handle("writer is finished or closed"))?;
         let start = std::time::Instant::now();
-        let result = vol.finish_file(state, &parent_path, &name);
+        // The volume releases the writer on every error path (F4-A3); the
+        // global handle is spent either way.
+        let result = vol.finish_file(wh.writer_id, &parent_path, &name);
         bridge::drop_writer(writer);
         let ino = result?;
         log::i(&format!("nativeFinishFile: file finished in {} ms", start.elapsed().as_millis()));
@@ -931,19 +1216,8 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeCloseWriter<'l>(
     writer: jlong,
 ) {
     guard(&mut env, (), |_env| {
-        let vol = bridge::volume_ref(volume).map_err(bad_handle)?;
-        let wh = bridge::writer_ref(writer).map_err(bad_handle)?;
-        if wh.volume_id != vol.id {
-            return Err(bad_handle("writer belongs to another volume"));
-        }
-        let abandon_res = if let Some(state) = wh.writer.lock().unwrap_or_else(|p| p.into_inner()).take() {
-            vol.abandon_file(state)
-        } else {
-            Ok(())
-        };
-        bridge::drop_writer(writer);
-        abandon_res?;
-        Ok(())
+        // Idempotent after the volume is gone (F4-A4): see `close_writer_handle`.
+        Ok(bridge::close_writer_handle(volume, writer)?)
     })
 }
 
@@ -1017,4 +1291,194 @@ pub extern "system" fn Java_dev_luksandroid_LuksNative_nativeStatFs<'l>(
         let json = vol.statfs_json()?;
         out_string(env, &json)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SECRET: &str = "Volumes/secret-folder/tax-return.pdf";
+
+    fn assert_clean(what: &str, text: &str) {
+        assert!(!text.contains("secret-folder"), "{what} leaked a path: {text}");
+        assert!(!text.contains("tax-return"), "{what} leaked a name: {text}");
+    }
+
+    /// Every variant that interpolates a path or name, through the one
+    /// function that builds the Java exception message. The control at the
+    /// end proves the assertion can fail: core's own Display does leak.
+    #[test]
+    fn exception_message_never_carries_a_path() {
+        let io = || std::io::Error::from(std::io::ErrorKind::NotFound);
+        let errors = [
+            LuksError::NotFound(SECRET.into()),
+            LuksError::NotADirectory(SECRET.into()),
+            LuksError::IsADirectory(SECRET.into()),
+            LuksError::DirectoryNotEmpty(SECRET.into()),
+            LuksError::SymlinkLoop(SECRET.into()),
+            LuksError::AlreadyExists(SECRET.into()),
+            LuksError::WrongWriteTarget { path: SECRET.into(), expected: 7, detail: "d" },
+            LuksError::UnverifiableWriteTarget { path: SECRET.into() },
+            LuksError::Io { path: SECRET.into(), source: io() },
+        ];
+        let mut leaked_by_display = 0;
+        for e in errors {
+            let (code, msg) = Fail::Luks(e).parts();
+            assert_clean("Fail::parts", &msg);
+            assert!(!msg.is_empty() && code != 0);
+        }
+        for e in [LuksError::NotFound(SECRET.into()), LuksError::SymlinkLoop(SECRET.into())] {
+            if e.to_string().contains("secret-folder") {
+                leaked_by_display += 1;
+            }
+        }
+        assert_eq!(leaked_by_display, 2, "control: raw Display must leak, or this test is vacuous");
+    }
+
+    /// A panic whose payload is a formatted path reaches neither the thrown
+    /// text nor the forensic ring.
+    #[test]
+    fn panic_report_never_carries_the_payload() {
+        install_panic_hook();
+        let outcome = catch_unwind(|| {
+            let name = SECRET;
+            if !name.is_empty() {
+                panic!("cannot open {name}");
+            }
+        });
+        assert!(outcome.is_err());
+        let text = report_panic();
+        assert_clean("panic text", &text);
+        assert!(text.contains("lib.rs"), "location kept: {text}");
+        let panics: Vec<_> = luks_core::forensic::snapshot()
+            .into_iter()
+            .filter_map(|r| match r.event {
+                luks_core::forensic::ForensicEvent::Panic(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        assert!(!panics.is_empty(), "panic was not recorded");
+        for p in panics {
+            assert_clean("forensic panic", &format!("{} {}", p.file, p.message));
+        }
+    }
+
+    /// Every `Java_dev_luksandroid_LuksNative_*` export in this crate has a
+    /// matching `external fun` in `LuksNative.kt`, and the reverse. A rename or
+    /// a forgotten declaration on either side is an UnsatisfiedLinkError at
+    /// runtime, so it is checked from the two source files.
+    #[test]
+    fn jni_exports_match_the_kotlin_external_funs() {
+        const PREFIX: &str = "Java_dev_luksandroid_LuksNative_";
+        let rust: std::collections::BTreeSet<String> = include_str!("lib.rs")
+            .lines()
+            .filter_map(|l| l.strip_prefix("pub extern \"system\" fn "))
+            .filter_map(|l| l.strip_prefix(PREFIX))
+            .map(|l| l.split(|c: char| !c.is_alphanumeric() && c != '_').next().unwrap_or("").to_string())
+            .collect();
+        let kt_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../android/app/src/main/java/dev/luksandroid/LuksNative.kt");
+        let kt = std::fs::read_to_string(kt_path).unwrap_or_else(|e| panic!("cannot read {kt_path}: {e}"));
+        let kotlin: std::collections::BTreeSet<String> = kt
+            .lines()
+            .filter_map(|l| l.trim_start().strip_prefix("external fun "))
+            .map(|l| l.split('(').next().unwrap_or("").trim().to_string())
+            .collect();
+        assert!(rust.contains("nativeDrainEvents") && rust.contains("nativeRingJson"), "scan found {rust:?}");
+        assert!(kotlin.len() > 10, "Kotlin scan found too little: {kotlin:?}");
+        let only_rust: Vec<_> = rust.difference(&kotlin).collect();
+        let only_kotlin: Vec<_> = kotlin.difference(&rust).collect();
+        assert!(only_rust.is_empty(), "exported but not declared in LuksNative.kt: {only_rust:?}");
+        assert!(only_kotlin.is_empty(), "declared in LuksNative.kt but not exported: {only_kotlin:?}");
+    }
+
+    /// A panic whose payload is a formatted path reaches the JSON handed to
+    /// Kotlin as file:line only: no message, no payload text.
+    #[test]
+    fn event_json_for_a_panic_carries_no_path_text() {
+        install_panic_hook();
+        luks_core::forensic::drain_notable();
+        let outcome = catch_unwind(|| {
+            let name = SECRET;
+            if !name.is_empty() {
+                panic!("cannot open {name}");
+            }
+        });
+        assert!(outcome.is_err());
+        let _ = report_panic();
+        for (what, json) in [
+            ("ring", luks_core::forensic::ring_json()),
+            ("drain", luks_core::forensic::drain_notable_json()),
+        ] {
+            assert_clean(what, &json);
+            assert!(!json.contains("cannot open"), "{what}: panic message leaked: {json}");
+            let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+            let panics: Vec<_> = v["events"]
+                .as_array()
+                .expect("events array")
+                .iter()
+                .filter(|o| o["ev"] == "panic")
+                .collect();
+            assert!(!panics.is_empty(), "{what}: panic event missing from {json}");
+            // Other tests in this process panic too, from other files.
+            for p in &panics {
+                assert!(p["at"].as_str().is_some_and(|f| f.ends_with(".rs")), "{what}: {p}");
+                assert!(p["line"].is_u64());
+                assert!(p.get("message").is_none() && p.get("file").is_none(), "{what}: {p}");
+            }
+            assert!(
+                panics.iter().any(|p| p["at"].as_str().is_some_and(|f| f.ends_with("lib.rs"))),
+                "{what}: this test's own panic site (lib.rs) is missing: {json}"
+            );
+        }
+    }
+
+    /// `LuksError::forensic_code` is a copy of `error_code` living in core
+    /// (core cannot see the jni constants). This is what keeps them equal.
+    #[test]
+    fn forensic_code_agrees_with_the_jni_wire_code() {
+        let io = || std::io::Error::from(std::io::ErrorKind::NotFound);
+        let errors = [
+            LuksError::WrongPassword,
+            LuksError::BadMagic { found: [0; 6] },
+            LuksError::NoPartitionTable,
+            LuksError::UnsupportedVersion(9),
+            LuksError::Luks1NotImplemented,
+            LuksError::UnsupportedFsFeature("x".into()),
+            LuksError::NotExt4(0),
+            LuksError::UnknownFs,
+            LuksError::AmbiguousFs,
+            LuksError::ChecksumMismatch,
+            LuksError::Truncated { needed: 2, got: 1 },
+            LuksError::OutOfBounds,
+            LuksError::CorruptFs("x"),
+            LuksError::FsChecksumMismatch("x"),
+            LuksError::BadInode(1),
+            LuksError::NotFound("x".into()),
+            LuksError::NotADirectory("x".into()),
+            LuksError::IsADirectory("x".into()),
+            LuksError::DirectoryNotEmpty("x".into()),
+            LuksError::ScsiProtocol("x"),
+            LuksError::ScsiCommandFailed { opcode: 0x2a, sense: None },
+            LuksError::UsbTransfer("x".into()),
+            LuksError::usb_errno(110, "x"),
+            LuksError::FsNeedsRecovery,
+            LuksError::Io { path: "x".into(), source: io() },
+            LuksError::FilesystemFull,
+            LuksError::NoFreeInodes,
+            LuksError::WrongWriteTarget { path: "x".into(), expected: 1, detail: "x" },
+            LuksError::UnverifiableWriteTarget { path: "x".into() },
+            LuksError::AlreadyExists("x".into()),
+            LuksError::WriterBusy,
+            LuksError::BtrfsItemTooLarge { what: "x", item_bytes: 1, node_size: 1 },
+            LuksError::SessionPoisoned,
+            LuksError::Cancelled,
+            LuksError::WriteSessionFenced("x".into()),
+            LuksError::ReadOnlyVolume,
+            LuksError::FileChanged,
+            LuksError::KdfFailed("x".into()),
+        ];
+        for e in &errors {
+            assert_eq!(e.forensic_code(), bridge::error_code(e), "{e:?}");
+        }
+    }
 }

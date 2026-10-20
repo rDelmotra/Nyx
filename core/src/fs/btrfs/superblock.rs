@@ -169,6 +169,11 @@ pub struct Superblock {
     pub num_devices: u64,
     /// `dev_item.devid` — the id this device answers to in every chunk stripe.
     pub dev_id: u64,
+    /// `dev_item.bytes_used` embedded in the superblock (offset 0xd9). The
+    /// kernel rewrites it on every commit from the device's allocated bytes;
+    /// `btrfs check` compares it with the chunk tree's DEV_ITEM and warns on
+    /// a mismatch (btrfs-progs `check_super_dev_item`).
+    pub dev_bytes_used: u64,
     pub sector_size: u32,
     pub node_size: u32,
     pub stripe_size: u32,
@@ -210,10 +215,19 @@ impl Superblock {
             }
 
             let mut buf = vec![0u8; SUPER_SIZE];
-            if device.read_at(offset, &mut buf).is_err() {
-                // A short device whose length we could not learn. Not an error
-                // in itself: the copy simply is not there.
-                continue;
+            if let Err(e) = device.read_at(offset, &mut buf) {
+                // Only "this copy is past the end of the device" may be
+                // skipped. Any other failure leaves a copy we could not look
+                // at, and it may be the newest: mounting an older one would
+                // show the filesystem as it was a transaction ago. With an
+                // unknown device length, running off the end is reported as
+                // `Truncated` / `OutOfBounds` and is the same "not there".
+                let absent = device_len.is_none()
+                    && matches!(e, LuksError::Truncated { .. } | LuksError::OutOfBounds);
+                if absent {
+                    continue;
+                }
+                return Err(e);
             }
 
             match Superblock::parse(&buf, offset) {
@@ -328,6 +342,7 @@ impl Superblock {
             num_devices,
             // dev_item starts at 0xc9 and opens with its devid.
             dev_id: u64le(b, 0xc9),
+            dev_bytes_used: u64le(b, 0xd9),
             sector_size,
             node_size,
             stripe_size: u32le(b, 0x9c),
@@ -348,6 +363,10 @@ impl Superblock {
 
     pub fn is_mixed_groups(&self) -> bool {
         self.incompat_flags & INCOMPAT_MIXED_GROUPS != 0
+    }
+
+    pub fn has_simple_quota(&self) -> bool {
+        self.incompat_flags & INCOMPAT_SIMPLE_QUOTA != 0
     }
 
     /// Whether tree blocks are recorded as skinny `METADATA_ITEM`s (key
@@ -389,6 +408,9 @@ impl Superblock {
 
         buf[0xb4..0xbc].copy_from_slice(&self.compat_ro_flags.to_le_bytes());
         buf[0xbc..0xc4].copy_from_slice(&self.incompat_flags.to_le_bytes());
+
+        // dev_item.bytes_used (dev_item starts at 0xc9: devid, total_bytes, bytes_used).
+        buf[0xd9..0xe1].copy_from_slice(&self.dev_bytes_used.to_le_bytes());
 
         buf[0xc6] = self.root_level;
         buf[0xc7] = self.chunk_root_level;

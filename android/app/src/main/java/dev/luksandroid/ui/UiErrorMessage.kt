@@ -1,6 +1,7 @@
 package dev.luksandroid.ui
 
 import dev.luksandroid.LuksException
+import dev.luksandroid.SessionClosedException
 import dev.luksandroid.Trace
 import kotlinx.coroutines.CancellationException
 import java.io.FileNotFoundException
@@ -35,7 +36,7 @@ object UiErrorMessage {
         LuksException.WRONG_TARGET -> "The target USB device does not match the active session."
         LuksException.UNVERIFIABLE_TARGET -> "Unable to verify the USB mass-storage interface."
         LuksException.ALREADY_EXISTS -> "An item with this name already exists in the destination folder."
-        LuksException.WRITER_BUSY -> "Another write operation is currently in progress. Please wait for it to complete."
+        LuksException.WRITER_BUSY -> "Drive is busy with a transfer — try again when it finishes."
         LuksException.ITEM_TOO_LARGE -> "The item is too large for the filesystem tree structure limits."
         LuksException.MUTEX_POISONED -> "Drive state was compromised by a previous error. Please lock and unlock the volume to retry."
         LuksException.CANCELLED -> "The operation was cancelled."
@@ -44,8 +45,19 @@ object UiErrorMessage {
         LuksException.WRITE_SESSION_FENCED ->
             "A previous write left the drive's state unknown, so further writes are blocked. " +
                 "Lock and unlock the volume again to continue."
+        LuksException.FILE_CHANGED ->
+            "The file was changed or replaced while it was being read, so the copy was stopped. " +
+                "Refresh the folder and try again."
+        LuksException.HEALTH_READ_ONLY -> HEALTH_READ_ONLY_MESSAGE
+        LuksException.WRITES_UNSAFE ->
+            "This USB adapter cannot guarantee writes reach the disk; writing is disabled to protect it. " +
+                "You can still read files."
         else -> "An unexpected error occurred (code $code)."
     }
+
+    /** Shown wherever a write is refused because the health check found errors. */
+    const val HEALTH_READ_ONLY_MESSAGE =
+        "This drive has errors. Repair it on Linux (e2fsck -f / btrfs check) before writing."
 
     /**
      * Formats user-facing message with operation context and logs the error safely.
@@ -85,19 +97,11 @@ object UiErrorMessage {
                 Trace.err(LuksException.GENERIC, op)
                 if (operation.isNotBlank()) "$operation failed: Permission denied." else "Permission denied."
             }
-            is IllegalStateException -> {
-                val code = if (t.message?.contains("locking", ignoreCase = true) == true ||
-                    t.message?.contains("closed", ignoreCase = true) == true ||
-                    t.message?.contains("not unlocked", ignoreCase = true) == true
-                ) {
-                    LuksException.BAD_HANDLE
-                } else {
-                    LuksException.GENERIC
-                }
-                getUserMessage(code, op)
-            }
+            // By type, never by message text: a message can be anything, including a path.
+            is SessionClosedException -> getUserMessage(LuksException.BAD_HANDLE, op)
             else -> {
                 Trace.err(LuksException.GENERIC, op)
+                Trace.e("$op: unmapped ${Trace.throwableSummary(t)}")
                 if (operation.isNotBlank()) {
                     "$operation failed: An unexpected error occurred."
                 } else {

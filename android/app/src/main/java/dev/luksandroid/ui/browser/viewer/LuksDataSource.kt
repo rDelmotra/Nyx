@@ -38,6 +38,17 @@ class LuksDataSource(
     private var opened: Boolean = false
     private var sessionJob: Job? = null
 
+    /**
+     * Read handle for [path] (0 = none), so every block is read by identity: a file replaced
+     * under the player fails with FILE_CHANGED instead of mixing in another file's bytes. Its
+     * lifetime matches the block cache's: closed when the path changes, when it went stale,
+     * and on [release].
+     */
+    private var file: Long = 0L
+    /** The volume [file] was opened on, kept so it can be closed without a session lease. */
+    private var fileVolume: dev.luksandroid.LuksVolume? = null
+    private var handleStale: Boolean = false
+
     // LRU Block Cache: Block Index (position / blockSize) -> ByteArray
     private val blockCache = object : LinkedHashMap<Long, ByteArray>(maxBlocks, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Long, ByteArray>?): Boolean {
@@ -84,17 +95,40 @@ class LuksDataSource(
         }
         val cleanPath = if (targetPath.isEmpty()) "/" else targetPath
 
-        // Invalidate cache only if switching to a different file
-        if (cleanPath != path) {
+        // Invalidate cache only if switching to a different file, or if the handle's file
+        // changed (its cached blocks may then belong to the old file).
+        if (cleanPath != path || handleStale) {
+            closeHandle()
             clearAndZeroBlockCache()
             path = cleanPath
         }
 
         transferInitializing(dataSpec)
 
+        // Open first, then take the size FROM THE HANDLE: a second path-based stat could name
+        // a different file than the one the reads will be pinned to.
+        if (file == 0L) {
+            try {
+                runBlocking {
+                    session.withLease { v ->
+                        file = v.openFile(path)
+                        fileVolume = v
+                    }
+                }
+            } catch (t: Throwable) {
+                throw DataSourceException(
+                    "Could not open LUKS file $path",
+                    t,
+                    PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND
+                )
+            }
+            handleStale = false
+        }
+
         totalFileSize = try {
-            runBlocking { session.withLease { v -> v.fileInfo(path).size } }
+            runBlocking { session.withLease { v -> v.fileSizeOf(file) } }
         } catch (t: Throwable) {
+            if ((t as? dev.luksandroid.LuksException)?.isFileChanged == true) handleStale = true
             throw DataSourceException(
                 "Could not stat LUKS file $path",
                 t,
@@ -162,10 +196,11 @@ class LuksDataSource(
         if (fetchSize <= 0) return EMPTY_BYTE_ARRAY
 
         val data = try {
-            runBlocking { session.withLease { v -> v.readChunk(path, startOffset, fetchSize) } }
+            runBlocking { session.withLease { v -> v.readAt(file, startOffset, fetchSize) } }
         } catch (t: Throwable) {
+            if ((t as? dev.luksandroid.LuksException)?.isFileChanged == true) handleStale = true
             throw DataSourceException(
-                "Native readChunk failed at $path:$startOffset",
+                "Native readAt failed at $path:$startOffset",
                 t,
                 PlaybackException.ERROR_CODE_IO_UNSPECIFIED
             )
@@ -187,9 +222,22 @@ class LuksDataSource(
         }
     }
 
+    /**
+     * Closes the read handle. No session lease: closing only needs the native id, and this
+     * runs from [release] (possibly the finalizer) and after the session may be gone.
+     */
+    private fun closeHandle() {
+        val f = file
+        val v = fileVolume
+        file = 0L
+        fileVolume = null
+        if (f != 0L) dev.luksandroid.Trace.cleanup("data_source_close_file") { v?.closeFile(f) }
+    }
+
     fun release() {
         sessionJob?.cancel()
         sessionJob = null
+        closeHandle()
         clearAndZeroBlockCache()
     }
 

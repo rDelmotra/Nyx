@@ -41,6 +41,13 @@ fn u64le(b: &[u8], o: usize) -> u64 {
 #[derive(Debug, Clone)]
 pub struct Inode {
     pub objectid: u64,
+    /// `btrfs_inode_item.generation`: the transaction that created this inode.
+    /// With the objectid it tells a file from a later one that reused the
+    /// number.
+    pub generation: u64,
+    /// `btrfs_inode_item.transid`: the transaction that last modified the
+    /// inode item. Changes when the file's size, times, mode or link count do.
+    pub transid: u64,
     pub size: u64,
     /// Bytes actually allocated. Smaller than `size` for a compressed or
     /// sparse file, which is the cheapest signal that either is in play.
@@ -69,6 +76,8 @@ impl Inode {
 
         Ok(Inode {
             objectid,
+            generation: u64le(data, 0),
+            transid: u64le(data, 8),
             size: u64le(data, 16),
             nbytes: u64le(data, 24),
             nlink: u32le(data, 40),
@@ -85,6 +94,16 @@ impl Inode {
 
     pub fn file_type(&self) -> FileType {
         mode_to_type(self.mode)
+    }
+
+    /// Whether `now` (a fresh read of the same objectid in the same
+    /// subvolume) is still the file this value was read as.
+    pub fn same_file_as(&self, now: &Inode) -> bool {
+        self.objectid == now.objectid
+            && self.generation == now.generation
+            && self.transid == now.transid
+            && self.mode & 0xF000 == now.mode & 0xF000
+            && self.size == now.size
     }
 
     pub fn info(&self) -> FileInfo {

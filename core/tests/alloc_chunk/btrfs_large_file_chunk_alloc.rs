@@ -15,6 +15,10 @@
 //! 4. Real Linux kernel mount reads back the written files and verifies byte-for-byte SHA256 match.
 #![cfg(feature = "dangerous-write-support")]
 
+#[path = "../common/temp_guard.rs"]
+mod temp_guard;
+use temp_guard::{TempPath};
+
 #[path = "../common/mod.rs"]
 mod common;
 
@@ -41,7 +45,7 @@ fn fixture(name: &str) -> PathBuf {
 
 static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn copy_to_temp(src_name: &str) -> PathBuf {
+fn copy_to_temp(src_name: &str) -> TempPath {
     let src = fixture(src_name);
     let temp_dir = std::env::temp_dir();
     let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -55,7 +59,7 @@ fn copy_to_temp(src_name: &str) -> PathBuf {
             .as_nanos()
     ));
     fs::copy(&src, &dst).expect("copy fixture to temp");
-    dst
+    TempPath::new(dst)
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -201,6 +205,10 @@ fn test_streaming_large_file_triggers_chunk_allocation_and_oracle_clean() {
 
     let dev = FileDevice::open_writable(&temp_img, file_len).expect("open writable");
     let mut fs = Btrfs::mount(dev).expect("mount writable btrfs");
+    // Premise of this test is allocating the last free device bytes of a tiny
+    // fixture; the production unallocated-space reserve is waived here (the
+    // reserve itself is covered by btrfs_unallocated_reserve).
+    fs.set_unallocated_reserve_for_tests(0);
 
     let initial_chunk_count = fs.chunk_map().len();
     let extent_tree = ExtentTree::read(&fs).expect("read extent tree");
@@ -317,6 +325,10 @@ fn test_atomic_create_file_with_data_large_file_triggers_chunk_allocation() {
 
     let dev = FileDevice::open_writable(&temp_img, file_len).expect("open writable");
     let mut fs = Btrfs::mount(dev).expect("mount writable btrfs");
+    // Premise of this test is allocating the last free device bytes of a tiny
+    // fixture; the production unallocated-space reserve is waived here (the
+    // reserve itself is covered by btrfs_unallocated_reserve).
+    fs.set_unallocated_reserve_for_tests(0);
 
     let initial_chunk_count = fs.chunk_map().len();
 
@@ -376,6 +388,10 @@ fn test_multiple_files_crossing_chunk_boundary() {
 
     let dev = FileDevice::open_writable(&temp_img, file_len).expect("open writable");
     let mut fs = Btrfs::mount(dev).expect("mount writable btrfs");
+    // Premise of this test is allocating the last free device bytes of a tiny
+    // fixture; the production unallocated-space reserve is waived here (the
+    // reserve itself is covered by btrfs_unallocated_reserve).
+    fs.set_unallocated_reserve_for_tests(0);
 
     let initial_chunk_count = fs.chunk_map().len();
 
@@ -466,6 +482,10 @@ fn test_large_file_chunk_alloc_across_all_fixtures() {
 
         let dev = FileDevice::open_writable(&temp_img, file_len).expect("open writable");
         let mut fs = Btrfs::mount(dev).expect("mount writable btrfs");
+        // Premise of this test is allocating the last free device bytes of a tiny
+        // fixture; the production unallocated-space reserve is waived here (the
+        // reserve itself is covered by btrfs_unallocated_reserve).
+        fs.set_unallocated_reserve_for_tests(0);
 
         let initial_chunk_count = fs.chunk_map().len();
         let extent_tree = ExtentTree::read(&fs).expect("read extent tree");

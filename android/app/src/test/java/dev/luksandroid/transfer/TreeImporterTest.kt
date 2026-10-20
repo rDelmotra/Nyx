@@ -185,6 +185,41 @@ class TreeImporterTest {
         volume.seedRoot("/dst")
     }
 
+    // ---- V2: declared size is a contract --------------------------------------
+
+    @Test
+    fun `V2 a source longer than its declared size stops the tree and publishes nothing`() {
+        val outcome = TreeImporter.importTree(
+            volume, plan(file("a.txt", 3)), "/dst",
+            FakeSource(mapOf("id:a.txt" to "abcdef".toByteArray())), CollisionMode.SKIP,
+        )
+        assertFalse(outcome.succeeded)
+        assertEquals("a.txt", outcome.stoppedAtPath)
+        assertEquals(0, outcome.filesCopied)
+        assertNull(volume.fileAt("/dst", "a.txt"))
+        assertTrue(volume.writersCreated.single().abandoned)
+    }
+
+    @Test
+    fun `V2 a source shorter than its declared size stops the tree and publishes nothing`() {
+        val outcome = TreeImporter.importTree(
+            volume, plan(file("a.txt", 9)), "/dst",
+            FakeSource(mapOf("id:a.txt" to "abc".toByteArray())), CollisionMode.SKIP,
+        )
+        assertFalse(outcome.succeeded)
+        assertNull(volume.fileAt("/dst", "a.txt"))
+        assertTrue(volume.writersCreated.single().abandoned)
+    }
+
+    @Test
+    fun `V2 an unknown declared size is not a mismatch`() {
+        val outcome = TreeImporter.importTree(
+            volume, plan(file("a.txt", -1)), "/dst",
+            FakeSource(mapOf("id:a.txt" to "abc".toByteArray())), CollisionMode.SKIP,
+        )
+        assertTrue(outcome.succeeded)
+    }
+
     // ---- nested tree, structure and content --------------------------------
 
     @Test
@@ -351,6 +386,25 @@ class TreeImporterTest {
         // into was deleted once the rename over it failed.
         assertEquals(setOf("photo.jpg"), volume.namesAt("/dst"))
         assertTrue(volume.deletedPaths.isNotEmpty())
+    }
+
+    // ---- transferTempName: REPLACE temp name stays within 255 bytes -------------
+
+    @Test
+    fun `transferTempName keeps short names intact`() {
+        assertEquals(".transfer-tmp-a.txt-42", transferTempName("a.txt", 42L))
+    }
+
+    @Test
+    fun `transferTempName clamps a long multibyte name to 255 bytes on a character boundary`() {
+        val name = "\u00e9".repeat(200) + "\uD83D\uDE00".repeat(50)
+        val temp = transferTempName(name, 123456789L)
+        val bytes = temp.toByteArray(Charsets.UTF_8)
+        assertTrue("temp name is ${bytes.size} bytes", bytes.size <= 255)
+        assertTrue(temp.startsWith(".transfer-tmp-"))
+        assertTrue(temp.endsWith("-123456789"))
+        // Round-trips as valid UTF-8 (no split code point / lone surrogate).
+        assertEquals(temp, String(bytes, Charsets.UTF_8))
     }
 
     // ---- uniqueName: pure name suffixing --------------------------------------

@@ -23,6 +23,10 @@
 //! the inode fields themselves.
 #![cfg(feature = "dangerous-write-support")]
 
+#[path = "../common/temp_guard.rs"]
+mod temp_guard;
+use temp_guard::{TempStr};
+
 #[path = "../common/mod.rs"]
 mod common;
 
@@ -35,10 +39,10 @@ fn fixture(name: &str) -> String {
     format!("{}/../fixtures/ext4/{name}", env!("CARGO_MANIFEST_DIR"))
 }
 
-fn scratch(name: &str, test: &str) -> String {
+fn scratch(name: &str, test: &str) -> TempStr {
     let dst = std::env::temp_dir().join(format!("ext4-file-{test}-{name}"));
     std::fs::copy(fixture(name), &dst).expect("copy fixture");
-    dst.to_string_lossy().into_owned()
+    TempStr::new(dst.to_string_lossy().into_owned())
 }
 
 fn open(path: &str) -> Ext4<FileDevice> {
@@ -317,7 +321,7 @@ fn a_multi_megabyte_named_file_is_clean_and_reads_back_byte_for_byte() {
 }
 
 #[test]
-fn an_abandoned_writer_rolls_back_its_allocations() {
+fn an_abandoned_writer_leaves_no_allocation_behind() {
     let path = scratch("csum-uuid-4k.img", "abandon");
     let content = vec![0xAAu8; 128 * 1024]; // 128 KiB
     let mut fs = open(&path);
@@ -329,9 +333,18 @@ fn an_abandoned_writer_rolls_back_its_allocations() {
     let mut writer = fs.begin_file(content.len() as u64).expect("begin file");
     fs.write_chunk(&mut writer, &content).expect("write chunk");
 
-    // Blocks and inodes should be consumed
-    assert!(fs.superblock().free_blocks_count < free_blocks_before);
-    assert!(fs.superblock().free_inodes_count < free_inodes_before);
+    // F2a: the reservation is memory-only. Nothing is consumed until publish,
+    // neither in the counters nor on disk.
+    assert_eq!(
+        fs.superblock().free_blocks_count,
+        free_blocks_before,
+        "an open writer must not touch the block counter"
+    );
+    assert_eq!(
+        fs.superblock().free_inodes_count,
+        free_inodes_before,
+        "an open writer must not touch the inode counter"
+    );
 
     // Abandon it instead of finish
     fs.abandon_file(writer);

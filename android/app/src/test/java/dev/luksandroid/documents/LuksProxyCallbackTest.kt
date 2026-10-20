@@ -60,7 +60,17 @@ class LuksProxyCallbackTest {
         var writeSupported: Boolean = true
         override val canWrite: Boolean get() = writeSupported
 
+        /** Path-based stats; a read proxy must size itself from its handle instead. */
+        var pathStatCalls = 0
+
+        override fun fileSizeOf(file: Long): Long {
+            throwOnFileInfo?.let { throw it }
+            val path = openHandles[file] ?: throw IllegalStateException("size of a handle that is not open: $file")
+            return fileInfoMap[path]?.size ?: fileDataMap[path]?.size?.toLong() ?: 1024L
+        }
+
         override fun fileInfo(path: String): FileInfo {
+            pathStatCalls++
             throwOnFileInfo?.let { throw it }
             return fileInfoMap[path] ?: FileInfo(
                 path = path,
@@ -80,8 +90,27 @@ class LuksProxyCallbackTest {
             return fileDataMap[path]?.size?.toLong() ?: 1024L
         }
 
-        override fun readChunk(path: String, offset: Long, len: Int): ByteArray {
+        /** Read handles: id -> path. Reads are by handle, never by path (F4 B5). */
+        val openHandles = mutableMapOf<Long, String>()
+        var opensTotal = 0
+        var closesTotal = 0
+        private var nextHandle = 1L
+
+        override fun openFile(path: String): Long {
+            opensTotal++
+            val id = nextHandle++
+            openHandles[id] = path
+            return id
+        }
+
+        override fun closeFile(file: Long) {
+            closesTotal++
+            openHandles.remove(file)
+        }
+
+        override fun readAt(file: Long, offset: Long, len: Int): ByteArray {
             throwOnRead?.let { throw it }
+            val path = openHandles[file] ?: throw IllegalStateException("read on a handle that is not open: $file")
             val data = fileDataMap[path] ?: ByteArray(1024) { (it % 256).toByte() }
             if (offset >= data.size) return ByteArray(0)
             val end = minOf(data.size.toLong(), offset + len).toInt()
@@ -188,6 +217,12 @@ class LuksProxyCallbackTest {
         val callback = LuksReadProxyCallback(session = session, documentId = "/sample.txt")
         val size = callback.onGetSize()
         assertEquals(256L, size)
+        assertEquals("onGetSize must size from the handle, not a path lookup", 0, testVolume.pathStatCalls)
+        assertEquals("sizing opens the one handle onRead will reuse", 1, testVolume.opensTotal)
+        callback.onRead(0L, 10, ByteArray(10))
+        assertEquals("onRead reuses the handle onGetSize opened", 1, testVolume.opensTotal)
+        callback.onRelease()
+        assertEquals(1, testVolume.closesTotal)
     }
 
     /**
@@ -280,6 +315,51 @@ class LuksProxyCallbackTest {
         // 4. Read size <= 0 returns 0
         val readZero = callback.onRead(0L, 0, buffer1)
         assertEquals(0, readZero)
+    }
+
+    /** F4 B5: one path resolution per proxy; every read is by handle; onRelease closes it. */
+    @Test
+    fun testF4_onRead_opensOncePerProxyReadsByHandleAndClosesOnRelease() {
+        val original = ByteArray(300) { (it % 50).toByte() }
+        testVolume.fileDataMap["/movie.bin"] = original
+        val callback = LuksReadProxyCallback(session = session, documentId = "/movie.bin")
+
+        val a = ByteArray(100)
+        val b = ByteArray(100)
+        assertEquals(100, callback.onRead(0L, 100, a))
+        assertEquals(100, callback.onRead(100L, 100, b))
+        assertArrayEquals(original.copyOfRange(0, 100), a)
+        assertArrayEquals(original.copyOfRange(100, 200), b)
+
+        assertEquals("the path must be resolved once per proxy, not once per read", 1, testVolume.opensTotal)
+        assertEquals("a read proxy keeps its handle open until onRelease", 0, testVolume.closesTotal)
+        assertEquals(1, testVolume.openHandles.size)
+
+        callback.onRelease()
+        assertEquals("onRelease must close the handle", 1, testVolume.closesTotal)
+        assertTrue("no handle may outlive its proxy", testVolume.openHandles.isEmpty())
+
+        callback.onRelease()
+        assertEquals("a second release must not double-close", 1, testVolume.closesTotal)
+    }
+
+    @Test
+    fun testF4_onRead_fileChangedBecomesEioNotData() {
+        testVolume.fileDataMap["/movie.bin"] = ByteArray(300)
+        val callback = LuksReadProxyCallback(session = session, documentId = "/movie.bin")
+        assertEquals(100, callback.onRead(0L, 100, ByteArray(100)))
+
+        testVolume.throwOnRead = LuksException("file changed", LuksException.FILE_CHANGED)
+        val buf = ByteArray(100)
+        try {
+            callback.onRead(100L, 100, buf)
+            fail("a changed file must fail the read")
+        } catch (e: ErrnoException) {
+            assertEquals(OsConstants.EIO, e.errno)
+        }
+        assertTrue("the failed read must leave the buffer untouched", buf.all { it == 0.toByte() })
+        callback.onRelease()
+        assertTrue(testVolume.openHandles.isEmpty())
     }
 
     @Test

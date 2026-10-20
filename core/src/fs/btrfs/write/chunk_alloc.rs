@@ -22,7 +22,8 @@ use crate::fs::btrfs::write::cow::{cow_tree_insert, cow_tree_mutate};
 use crate::fs::btrfs::write::exclude::compute_sb_exclusions;
 use crate::fs::btrfs::write::extent_tree::{BlockGroupItem, ExtentTree};
 use crate::fs::btrfs::write::gate;
-use crate::fs::btrfs::write::txn::{converge_and_finalize, record_cow_result, Transaction};
+use crate::fs::btrfs::write::extent_tree::{converge_and_finalize, record_cow_result};
+use crate::fs::btrfs::write::txn::Transaction;
 use crate::fs::btrfs::Btrfs;
 
 /// 64 KiB alignment / minimum stripe boundary.
@@ -76,6 +77,55 @@ pub fn decide_data_chunk_size(total_rw_bytes: u64) -> u64 {
     stripe = stripe.min(SZ_1G);
     stripe = (stripe / SZ_64K) * SZ_64K;
     stripe * data_stripes
+}
+
+/// Size the kernel would use for one new single-device METADATA chunk
+/// (`decide_stripe_size_regular`: 256 MiB default, 1 GiB when the device is
+/// larger than 50 GiB, never more than 10% of the device).
+pub fn decide_metadata_chunk_size(total_rw_bytes: u64) -> u64 {
+    let default = if total_rw_bytes > 50 * SZ_1G { SZ_1G } else { 256 * 1024 * 1024 };
+    let capped = default.min(total_rw_bytes / 10);
+    (capped / SZ_64K) * SZ_64K
+}
+
+/// Unallocated device space this writer must never consume.
+///
+/// The writer only ever creates DATA chunks, so if data chunks were allowed to
+/// take every unallocated byte, the kernel could no longer allocate a METADATA
+/// chunk and the filesystem would hit metadata ENOSPC (read-only remount,
+/// needs a balance). The reserve is room for two metadata chunks: a DUP
+/// metadata chunk (the usual profile on a single device) occupies twice its
+/// size on the device, so `2 * metadata chunk size` is one DUP chunk. It is
+/// never below 1 GiB (256 MiB chunks on devices up to 50 GiB), i.e.
+/// `max(1 GiB, 2 * metadata chunk)`, and is capped at 10% of the device so
+/// tiny test images remain usable (256 MiB device: about 25 MiB).
+pub fn unallocated_reserve(total_rw_bytes: u64) -> u64 {
+    let want = SZ_1G.max(decide_metadata_chunk_size(total_rw_bytes).saturating_mul(2));
+    let cap = (total_rw_bytes / 10 / SZ_64K) * SZ_64K;
+    want.min(cap)
+}
+
+/// Device bytes not covered by any chunk (excluding the 1 MiB superblock area),
+/// given the device's `DEV_EXTENT` list.
+pub fn unallocated_dev_bytes(total_dev_bytes: u64, dev_extents: &[(u64, u64)]) -> u64 {
+    let allocated: u64 = dev_extents.iter().map(|(_, len)| *len).sum();
+    total_dev_bytes
+        .saturating_sub(BTRFS_BLOCK_RESERVED_1M_FOR_SUPER)
+        .saturating_sub(allocated)
+}
+
+/// Minimum free bytes inside existing METADATA block groups before a file
+/// write is started. One commit CoWs up to ~6 trees; 128 nodes covers that
+/// with splits and a batch of files (2 MiB at 16 KiB nodes).
+pub fn metadata_floor(node_size: u32) -> u64 {
+    128 * node_size as u64
+}
+
+/// Largest new DATA chunk (64 KiB aligned) that still leaves
+/// [`unallocated_reserve`] bytes unallocated.
+pub fn data_chunk_headroom(reserve: u64, total_dev_bytes: u64, dev_extents: &[(u64, u64)]) -> u64 {
+    let spare = unallocated_dev_bytes(total_dev_bytes, dev_extents).saturating_sub(reserve);
+    (spare / SZ_64K) * SZ_64K
 }
 
 /// Search 3: First-fit physical hole search across a device's extents.
@@ -221,6 +271,8 @@ pub fn allocate_data_chunk_transaction_excluding<D: ReadAt>(
         MIN_STRIPE_SIZE_FLOOR,
     )?;
 
+    // Never let a data chunk eat into the metadata reserve: clamp, or refuse.
+    let alloc_len = alloc_len.min(data_chunk_headroom(fs.unallocated_reserve(), sb.total_bytes, &dev_extents));
     if alloc_len < MIN_STRIPE_SIZE_FLOOR {
         return Err(LuksError::FilesystemFull);
     }
@@ -250,6 +302,7 @@ pub fn allocate_data_chunk_transaction_excluding<D: ReadAt>(
 
     let new_generation = sb.generation + 1;
     let extent_tree = ExtentTree::read(fs)?;
+    gate::check_no_shared_history_or_quota(fs, &extent_tree)?;
     let mut allocator = FreeSpaceMap::from_extent_tree_and_chunk_map(&extent_tree, fs.chunk_map())?;
     if !reserved.is_empty() {
         let reserved_ranges: Vec<std::ops::Range<u64>> = reserved
@@ -298,6 +351,7 @@ pub fn allocate_data_chunk_transaction_excluding<D: ReadAt>(
 
     // 4a. Update DEV_ITEM in CHUNK_TREE: bytes_used += alloc_len
     let dev_item_key = Key::new(DEV_ITEMS_OBJECTID, DEV_ITEM_KEY, devid);
+    let mut chunk_tree_dev_used = 0u64;
     let chunk_res1 = cow_tree_mutate(
         fs,
         &pending_blocks,
@@ -320,6 +374,7 @@ pub fn allocate_data_chunk_transaction_excluding<D: ReadAt>(
                 .checked_add(alloc_len)
                 .ok_or(LuksError::CorruptFs("dev item bytes_used overflow"))?;
             data[0x10..0x18].copy_from_slice(&new_used.to_le_bytes());
+            chunk_tree_dev_used = new_used;
             Ok(())
         },
     )?;
@@ -423,7 +478,7 @@ pub fn allocate_data_chunk_transaction_excluding<D: ReadAt>(
     allocator.exclude_ranges(&exclusions);
 
     // 7. Converge and finalize transaction
-    let txn = converge_and_finalize(
+    let mut txn = converge_and_finalize(
         fs,
         new_generation,
         fs.fs_tree(),
@@ -440,6 +495,8 @@ pub fn allocate_data_chunk_transaction_excluding<D: ReadAt>(
         Vec::new(),
     )?;
 
+    txn.new_chunks = vec![new_chunk.clone()];
+    txn.final_dev_bytes_used = Some(chunk_tree_dev_used);
     Ok((txn, new_chunk))
 }
 

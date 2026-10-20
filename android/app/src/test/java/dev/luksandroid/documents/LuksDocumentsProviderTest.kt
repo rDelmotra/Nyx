@@ -117,7 +117,27 @@ class LuksDocumentsProviderTest {
             return fileDataMap[path]?.size?.toLong() ?: 1024L
         }
 
-        override fun readChunk(path: String, offset: Long, len: Int): ByteArray {
+        private val openHandles = mutableMapOf<Long, String>()
+        private var nextHandle = 1L
+
+        override fun openFile(path: String): Long {
+            val id = nextHandle++
+            openHandles[id] = path
+            return id
+        }
+
+        override fun closeFile(file: Long) {
+            openHandles.remove(file)
+        }
+
+        override fun fileSizeOf(file: Long): Long {
+            throwOnFileInfo?.let { throw it }
+            val path = openHandles[file] ?: throw IllegalStateException("size of a handle that is not open: $file")
+            return fileDataMap[path]?.size?.toLong() ?: 1024L
+        }
+
+        override fun readAt(file: Long, offset: Long, len: Int): ByteArray {
+            val path = openHandles[file] ?: throw IllegalStateException("read on a handle that is not open: $file")
             val data = fileDataMap[path] ?: ByteArray(1024) { (it % 256).toByte() }
             if (offset >= data.size) return ByteArray(0)
             val end = minOf(data.size.toLong(), offset + len).toInt()

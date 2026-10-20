@@ -349,50 +349,6 @@ impl InteriorNode {
         (node_size as usize).saturating_sub(used)
     }
 
-    /// Insert a child key pointer into this interior node in sorted key order.
-    pub fn insert_entry(
-        &mut self,
-        key: Key,
-        blockptr: u64,
-        generation: u64,
-        node_size: u32,
-    ) -> Result<()> {
-        if KEY_PTR_SIZE > self.free_space(node_size) {
-            return Err(LuksError::FilesystemFull);
-        }
-
-        let pos = match self.entries.binary_search_by(|e| e.key.cmp(&key)) {
-            Ok(p) => p,
-            Err(p) => p,
-        };
-        self.entries
-            .insert(pos, InteriorEntry { key, blockptr, generation });
-        Ok(())
-    }
-
-    /// Update an existing child pointer pointing at `old_blockptr`.
-    pub fn update_entry_by_blockptr(
-        &mut self,
-        old_blockptr: u64,
-        new_key: Option<Key>,
-        new_blockptr: u64,
-        new_generation: u64,
-    ) -> Result<()> {
-        let entry = self
-            .entries
-            .iter_mut()
-            .find(|e| e.blockptr == old_blockptr)
-            .ok_or_else(|| LuksError::NotFound("interior node block pointer not found".into()))?;
-
-        if let Some(k) = new_key {
-            entry.key = k;
-        }
-        entry.blockptr = new_blockptr;
-        entry.generation = new_generation;
-        self.entries.sort_by_key(|e| e.key);
-        Ok(())
-    }
-
     /// Split an overflowing interior node into `(left_interior, right_interior, pivot_key)`.
     pub fn split(&self, right_bytenr: u64) -> Result<(InteriorNode, InteriorNode, Key)> {
         if self.entries.len() < 2 {
@@ -555,38 +511,6 @@ pub fn build_regular_file_extent(
     data[37..45].copy_from_slice(&0u64.to_le_bytes()); // offset = 0
     data[45..53].copy_from_slice(&num_bytes.to_le_bytes()); // num_bytes
     data
-}
-
-/// Build the checksum payload for `disk_num_bytes` of data starting at sector boundary.
-///
-/// Computes a checksum for every `sector_size` (e.g. 4096) bytes.
-///
-/// This produces the checksums for one **contiguous run**, with no regard for
-/// whether the result fits in a tree node — [`build_extent_csum_items`] is what
-/// callers writing a whole file want, because past ~15 MiB the answer here is
-/// too large to store as a single item.
-pub fn build_extent_csum_payload(
-    csum_type: crate::fs::btrfs::superblock::CsumType,
-    sector_size: u32,
-    disk_num_bytes: u64,
-    data: &[u8],
-) -> Vec<u8> {
-    let sector = sector_size as usize;
-    let nr_sectors = (disk_num_bytes as usize).div_ceil(sector);
-    let mut payload = Vec::with_capacity(nr_sectors * csum_type.size());
-
-    for i in 0..nr_sectors {
-        let start = i * sector;
-        let mut sector_buf = vec![0u8; sector];
-        if start < data.len() {
-            let copy_end = (start + sector).min(data.len());
-            sector_buf[..copy_end - start].copy_from_slice(&data[start..copy_end]);
-        }
-        let csum = csum_type.calculate(&sector_buf);
-        payload.extend_from_slice(&csum[..csum_type.size()]);
-    }
-
-    payload
 }
 
 /// Bytes the kernel leaves unused in a leaf that holds one maximum-sized

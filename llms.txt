@@ -1,0 +1,37 @@
+# LUKS-Android
+
+> An open-source, rootless userspace storage and cryptographic stack for Android: unlock, read, and write LUKS/LUKS2 encrypted external drives formatted with Btrfs or ext4 over USB-OTG without root privileges.
+
+## Overview
+Android devices do not provide native kernel drivers or mount support for Btrfs, ext4, or LUKS2-encrypted external storage. Connecting a standard Linux drive to an unrooted Android phone results in an "Issue with USB drive / Tap to format" system error. 
+
+LUKS-Android solves this by implementing the entire cryptographic transform, SCSI translation, and filesystem engines in userspace via Android's USB Host API (`/dev/bus/usb`). It requires zero root privileges, zero kernel modifications, and zero network access.
+
+## Core Capabilities
+- **Rootless & Zero-Root Operation:** Runs entirely in unprivileged userspace. Does not require Magisk, unlocked bootloaders, or custom ROMs.
+- **LUKS2 Container Cryptography:** Full support for Argon2id and PBKDF2 key derivation functions with AES-256-XTS ciphers, hardware-accelerated via ARMv8 crypto extensions (`pmull`, `aes`).
+- **Memory Security & Key Zeroization:** Master keys, subkeys, and cipher schedules implement Rust `Zeroize` and `ZeroizeOnDrop`, clearing backing memory buffers as soon as an operation finishes. Zero plaintext logging.
+- **Hardware-Backed Biometric Unlock:** Vaults LUKS2 passphrases inside hardware-isolated `AndroidKeyStore` using AES-256-GCM with per-use `BiometricPrompt` authentication and auto-invalidation on enrollment changes.
+- **Btrfs Filesystem Engine:** Full read and write support. Complete Copy-on-Write (CoW) B-tree mutation engine, live Castagnoli CRC32c checksum verification, dynamic multi-gigabyte chunk allocation, and Free-Space Tree (FST) CoW management.
+- **Btrfs Subvolume Support:** First-class write transactions targeting subvolumes (`@`, `@home`, snapshots) via single-tree encapsulation, extent backrefs, and packed checksum trimming.
+- **Plain (Non-LUKS) Volume Support:** Directly browse, read, and write unencrypted ext4 and Btrfs drives with 7-point superblock detection and explicit per-session write confirmation.
+- **Transparent Decompression:** Reads compressed Btrfs extents on-the-fly supporting Zstandard (zstd), LZO, and Zlib algorithms.
+- **ext4 Filesystem Engine:** Extent tree traversals, directory hash-tree indexing, block group bitmap allocations, and file creation/deletion validated against Linux `e2fsck`.
+- **In-App Media Player:** Native video and audio playback directly from decrypted LUKS2 containers and plain drives powered by AndroidX Media3 (ExoPlayer). Utilizes a 1 MiB (4 × 256 KiB) in-memory LRU block cache that eliminates device flash wear with zero disk extraction.
+- **Air-Gapped & Offline Security:** The application requests zero network permissions (`android.permission.INTERNET` is completely omitted from `AndroidManifest.xml`).
+- **SCSI Bulk-Only Transport (BOT):** Userspace USBFS engine driving 128 KiB chunked SCSI transfers over `/dev/bus/usb` with a non-blocking URB arena and generational drain recovery.
+- **Fail-Closed Safety Model:** Release builds enforce compile-time write gating (`dangerous-write-support`). Any transport stall, cable disconnect, or corruption fences the session instantly.
+
+## Hardware & System Requirements
+- Android Version: Android 10+ (API level 29 or higher).
+- Architecture: 64-bit ARM (`arm64-v8a`).
+- Hardware: USB-C port or USB-OTG adapter with USB Mass Storage device (thumb drive, external SATA/NVMe SSD, HDD enclosure).
+
+## Key Links & Resources
+- Repository: https://github.com/rDelmotra/LUBA
+- Latest Release: https://github.com/rDelmotra/LUBA/releases/latest
+- Architecture & Benchmarks: doc/architecture.md
+- Testing & Kernel Oracle Verification: doc/testing.md
+- Security Policy: SECURITY.md
+- Contribution Guidelines: CONTRIBUTING.md
+- Licenses: MIT or Apache-2.0

@@ -68,6 +68,7 @@
 !SECURITY.md
 *.txt
 !fixtures/luks/EXPECTED.txt
+!llms.txt
 *.img
 !fixtures/luks/*.img
 *.png

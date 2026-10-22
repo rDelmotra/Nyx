@@ -9,7 +9,7 @@
 Unlock, read, and write LUKS/LUKS2 encrypted external drives formatted with Btrfs or ext4 over USB-OTG.<br/>
 Zero root, zero kernel modules, 100% offline and air-gapped, fail-closed safety.</p>
 
-<a href="https://github.com/rDelmotra/LUBA/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/rDelmotra/LUBA?style=flat-square&logo=github&label=release&color=0969da&labelColor=0d1117"></a>
+<a href="https://github.com/rDelmotra/Nyx/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/rDelmotra/Nyx?style=flat-square&logo=github&label=release&color=0969da&labelColor=0d1117"></a>
 <img alt="Android 10+ (API 29+)" src="https://img.shields.io/badge/android-10%2B%20(API%2029%2B)-3DDC84?style=flat-square&logo=android&logoColor=white&labelColor=0d1117">
 <img alt="Architecture: arm64-v8a" src="https://img.shields.io/badge/arch-arm64--v8a-blue?style=flat-square&labelColor=0d1117">
 <img alt="Core: Rust 1.80+" src="https://img.shields.io/badge/core-Rust%201.80%2B-dea584?style=flat-square&logo=rust&logoColor=white&labelColor=0d1117">
@@ -68,7 +68,7 @@ How LUKS-Android compares to standard Android external storage handling and trad
 
 ## Quickstart
 
-**[⬇ Download the latest release](https://github.com/rDelmotra/LUBA/releases/latest)** — grab `app-release.apk` (v0.4.0) directly, no build required. Requires Android 10+ (API 29) on an `arm64-v8a` device.
+**[⬇ Download the latest release](https://github.com/rDelmotra/Nyx/releases/latest)** — grab `app-release.apk` (v0.4.0) directly, no build required. Requires Android 10+ (API 29) on an `arm64-v8a` device.
 
 > [!NOTE]
 > The `v0.4.0` release introduces **hardware-backed biometric unlock** (fingerprint / face authentication via Android Keystore backed AES-GCM passphrase vault), alongside **in-app media playback** with zero-wear in-memory block caching, air-gapped zero-network security, and full ext4/Btrfs write support.
@@ -78,7 +78,7 @@ How LUKS-Android compares to standard Android external storage handling and trad
 
 | Target | Artifact | Size | Description |
 | :--- | :--- | :--- | :--- |
-| **Android Release (Recommended)** | [`app-release.apk`](https://github.com/rDelmotra/LUBA/releases/latest) | `~6.2 MB` | Prebuilt, signed v2/v3, ready to install |
+| **Android Release (Recommended)** | [`app-release.apk`](https://github.com/rDelmotra/Nyx/releases/latest) | `~6.2 MB` | Prebuilt, signed v2/v3, ready to install |
 | **Android Debug** *(build from source)* | `app-debug.apk` | `~32 MB` | For development and live diagnostics |
 | **Native Core (Rust crate)** | `luks_core` / `luks_jni` | `< 2 MB` | Standalone Rust engine or JNI bridge |
 
@@ -99,7 +99,7 @@ adb install -r android/app/build/outputs/apk/release/app-release.apk
 ```
 
 > [!TIP]
-> **No ADB?** Open the [release APK link](https://github.com/rDelmotra/LUBA/releases/latest) directly on your Android phone and tap the downloaded file to install. Android will prompt to allow "Install unknown apps" for the browser or file manager used.
+> **No ADB?** Open the [release APK link](https://github.com/rDelmotra/Nyx/releases/latest) directly on your Android phone and tap the downloaded file to install. Android will prompt to allow "Install unknown apps" for the browser or file manager used.
 
 ---
 

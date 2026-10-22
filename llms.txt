@@ -28,8 +28,8 @@ LUKS-Android solves this by implementing the entire cryptographic transform, SCS
 - Hardware: USB-C port or USB-OTG adapter with USB Mass Storage device (thumb drive, external SATA/NVMe SSD, HDD enclosure).
 
 ## Key Links & Resources
-- Repository: https://github.com/rDelmotra/LUBA
-- Latest Release: https://github.com/rDelmotra/LUBA/releases/latest
+- Repository: https://github.com/rDelmotra/Nyx
+- Latest Release: https://github.com/rDelmotra/Nyx/releases/latest
 - Architecture & Benchmarks: doc/architecture.md
 - Testing & Kernel Oracle Verification: doc/testing.md
 - Security Policy: SECURITY.md

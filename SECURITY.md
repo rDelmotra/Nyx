@@ -12,13 +12,13 @@ LUKS-Android decrypts LUKS2 volumes and handles passphrases, derived key materia
 
 ## Out of scope
 
-UI bugs, crashes without a security implication, performance regressions, and feature requests — file these as normal [issues](https://github.com/rDelmotra/LUBA/issues) instead.
+UI bugs, crashes without a security implication, performance regressions, and feature requests — file these as normal [issues](https://github.com/rDelmotra/Nyx/issues) instead.
 
 ## Reporting a vulnerability
 
 Please use GitHub's private vulnerability reporting for this repository (**Security** tab → **Report a vulnerability**) rather than a public issue, so it isn't disclosed before a fix is available:
 
-<https://github.com/rDelmotra/LUBA/security/advisories/new>
+<https://github.com/rDelmotra/Nyx/security/advisories/new>
 
 Include what you can: affected file/commit, reproduction steps, and impact (what an attacker gains). Hardware-dependent findings should include device model, USB bridge chipset, and drive filesystem where relevant.
 

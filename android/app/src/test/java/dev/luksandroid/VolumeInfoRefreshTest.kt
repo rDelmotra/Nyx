@@ -37,3 +37,29 @@ class VolumeInfoRefreshTest {
         assertEquals(after, v.infoCalls)
     }
 }
+
+class WriteDurabilityRefreshTest {
+    private class V : LuksVolume(0L) {
+        var mode: String = "\"cache_off\""
+        var infoCalls = 0
+        init {
+            LuksVolume::class.java.getDeclaredField("handle").also { it.isAccessible = true }.setLong(this, 1L)
+            LuksVolume::class.java.getDeclaredField("cachedInfo").also { it.isAccessible = true }
+                .set(this, parseVolumeInfo(readInfoJson()))
+        }
+        override fun readInfoJson(): String { infoCalls++; return """{"label":"x","flushSupported":false,"writeDurability":$mode}""" }
+        override fun nativeCommit() {}
+    }
+
+    @Test
+    fun `cache_off keeps being re-read so a mid-session downgrade shows up`() {
+        val v = V()
+        assertEquals("cache_off", v.info.writeDurability)
+        v.mode = "\"unverified\""
+        v.commitActiveBatch()
+        assertEquals("unverified", v.info.writeDurability)
+        val after = v.infoCalls
+        v.commitActiveBatch()
+        assertEquals(after, v.infoCalls)
+    }
+}

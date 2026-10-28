@@ -49,6 +49,16 @@ const OP_SYNCHRONIZE_CACHE_10: u8 = 0x35;
 /// The 16-byte form, tried when a bridge does not know the 10-byte one.
 #[cfg(feature = "dangerous-write-support")]
 const OP_SYNCHRONIZE_CACHE_16: u8 = 0x91;
+/// MODE SELECT(6) / (10): used only to switch the drive's volatile write
+/// cache off (and back on at close). See [`ScsiBlockDevice::force_write_cache_off`].
+#[cfg(feature = "dangerous-write-support")]
+const OP_MODE_SELECT_6: u8 = 0x15;
+#[cfg(feature = "dangerous-write-support")]
+const OP_MODE_SELECT_10: u8 = 0x55;
+/// MODE SENSE page-control field (CDB byte 2, bits 7-6): 01b = changeable
+/// values, a mask of the bits MODE SELECT may alter.
+#[cfg(feature = "dangerous-write-support")]
+const PC_CHANGEABLE: u8 = 0x40;
 const SA_READ_CAPACITY_16: u8 = 0x10;
 
 /// READ(10) carries a 16-bit block count and a 32-bit LBA.
@@ -116,11 +126,13 @@ pub fn opcode_name(op: u8) -> String {
         0x00 => "TEST UNIT READY",
         0x03 => "REQUEST SENSE",
         0x12 => "INQUIRY",
+        0x15 => "MODE SELECT(6)",
         0x1A => "MODE SENSE(6)",
         0x25 => "READ CAPACITY(10)",
         0x28 => "READ(10)",
         0x2A => "WRITE(10)",
         0x35 => "SYNCHRONIZE CACHE(10)",
+        0x55 => "MODE SELECT(10)",
         0x5A => "MODE SENSE(10)",
         0x88 => "READ(16)",
         0x8A => "WRITE(16)",
@@ -255,6 +267,99 @@ fn parse_caching_page_wce(mode_sense_6: bool, data: &[u8]) -> Option<bool> {
     Some(page[2] & 0x04 != 0)
 }
 
+/// The Caching mode page located inside a MODE SENSE response, copied out.
+#[cfg(feature = "dangerous-write-support")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CachingPage {
+    /// Medium type from the mode parameter header, echoed back on select.
+    medium_type: u8,
+    /// The whole page: code, length, and `length` bytes of parameters.
+    page: Vec<u8>,
+}
+
+#[cfg(feature = "dangerous-write-support")]
+impl CachingPage {
+    const WCE: u8 = 0x04;
+
+    fn wce(&self) -> bool {
+        self.page[2] & Self::WCE != 0
+    }
+}
+
+/// Find the whole Caching page in a MODE SENSE(6)/(10) response. `None` unless
+/// the page is complete (page length fits inside what was returned), is the
+/// non-subpage form of page 0x08, and is long enough to hold the WCE byte:
+/// a MODE SELECT must echo the page back in full, never a truncated copy.
+#[cfg(feature = "dangerous-write-support")]
+fn locate_caching_page(ten: bool, data: &[u8]) -> Option<CachingPage> {
+    let header_len = if ten { 8 } else { 4 };
+    if data.len() < header_len {
+        return None;
+    }
+    let medium_type = if ten { data[2] } else { data[1] };
+    let bdl = if ten {
+        u16::from_be_bytes([data[6], data[7]]) as usize
+    } else {
+        data[3] as usize
+    };
+    let start = header_len.checked_add(bdl)?;
+    let head = data.get(start..start.checked_add(2)?)?;
+    // PS (bit 7) is ignored on read; SPF (bit 6) must be clear: this is the
+    // plain page format.
+    if head[0] & 0x7F != MODE_PAGE_CACHING || head[1] < 1 {
+        return None;
+    }
+    let end = start.checked_add(2 + head[1] as usize)?;
+    let page = data.get(start..end)?.to_vec();
+    Some(CachingPage { medium_type, page })
+}
+
+/// CDB for MODE SELECT with PF=1 and **SP=0**: the change applies to the
+/// current values only and the drive forgets it at the next power cycle. Never
+/// SP=1: this crate must not permanently alter a user's drive.
+#[cfg(feature = "dangerous-write-support")]
+fn mode_select_cdb(ten: bool, param_len: usize) -> Vec<u8> {
+    const PF: u8 = 0x10;
+    if ten {
+        let mut cdb = vec![0u8; 10];
+        cdb[0] = OP_MODE_SELECT_10;
+        cdb[1] = PF;
+        cdb[7..9].copy_from_slice(&(param_len as u16).to_be_bytes());
+        cdb
+    } else {
+        let mut cdb = vec![0u8; 6];
+        cdb[0] = OP_MODE_SELECT_6;
+        cdb[1] = PF;
+        cdb[4] = param_len as u8;
+        cdb
+    }
+}
+
+/// MODE SELECT parameter list: a mode parameter header with no block
+/// descriptors, then the Caching page as read except PS cleared and WCE set to
+/// `wce`. In the header the mode data length is reserved for MODE SELECT (0),
+/// the medium type is echoed, the device-specific parameter is 0 (WP and
+/// DPOFUA are reserved on select) and the block descriptor length is 0.
+#[cfg(feature = "dangerous-write-support")]
+fn mode_select_params(ten: bool, cur: &CachingPage, wce: bool) -> Vec<u8> {
+    let mut out = if ten {
+        // MDL(2), medium type, device-specific, LONGLBA, reserved, BDL(2)
+        vec![0, 0, cur.medium_type, 0, 0, 0, 0, 0]
+    } else {
+        // MDL, medium type, device-specific, BDL
+        vec![0, cur.medium_type, 0, 0]
+    };
+    let at = out.len();
+    out.extend_from_slice(&cur.page);
+    out[at] &= 0x3F; // PS is reserved on select
+    if wce {
+        out[at + 2] |= CachingPage::WCE;
+    } else {
+        out[at + 2] &= !CachingPage::WCE;
+    }
+    out
+}
+
 /// The LBA and block count of a READ/WRITE(10/16) CDB, for the forensic ring.
 /// `(None, None)` for every other command, and for a CDB too short to hold the
 /// fields (the CBW encoder is what rejects that; this must not panic first).
@@ -314,7 +419,35 @@ pub struct ScsiBlockDevice<T: BulkTransport> {
     /// the drive said rather than the absence of a rejection.
     #[cfg(feature = "dangerous-write-support")]
     flush_accepted: std::sync::atomic::AtomicBool,
+    /// A MODE SELECT that may have changed the drive's write cache was sent.
+    /// Decides whether `restore_write_cache` has anything to undo.
+    #[cfg(feature = "dangerous-write-support")]
+    cache_touched: std::sync::atomic::AtomicBool,
+    /// The drive's write cache was switched off by us and a MODE SENSE
+    /// read-back confirmed it. Makes a missing flush command safe.
+    #[cfg(feature = "dangerous-write-support")]
+    cache_forced_off: std::sync::atomic::AtomicBool,
+    /// How writes are made durable on this drive: one of the `DURABILITY_*`
+    /// values. Can move to `UNVERIFIED` mid-session, never back.
+    #[cfg(feature = "dangerous-write-support")]
+    durability: std::sync::atomic::AtomicU8,
 }
+
+/// Not decided yet (no safety check has run).
+#[cfg(feature = "dangerous-write-support")]
+const DURABILITY_UNKNOWN: u8 = 0;
+/// SYNCHRONIZE CACHE is accepted: normal ordering via flush.
+#[cfg(feature = "dangerous-write-support")]
+const DURABILITY_FLUSH: u8 = 1;
+/// No flush, but the drive reports its write cache already off.
+#[cfg(feature = "dangerous-write-support")]
+const DURABILITY_WRITE_THROUGH: u8 = 2;
+/// No flush; we switched the cache off (non-persistently) and it read back off.
+#[cfg(feature = "dangerous-write-support")]
+const DURABILITY_CACHE_OFF: u8 = 3;
+/// No flush and no way to confirm write-through: proceeds as Linux does.
+#[cfg(feature = "dangerous-write-support")]
+const DURABILITY_UNVERIFIED: u8 = 4;
 
 impl<T: BulkTransport> ScsiBlockDevice<T> {
     /// Probe the device: identify it, wait for it to be ready, read its size.
@@ -331,6 +464,12 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
             no_flush_command: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "dangerous-write-support")]
             flush_accepted: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "dangerous-write-support")]
+            cache_touched: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "dangerous-write-support")]
+            cache_forced_off: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "dangerous-write-support")]
+            durability: std::sync::atomic::AtomicU8::new(DURABILITY_UNKNOWN),
         };
 
         let inquiry = dev.inquiry()?;
@@ -978,31 +1117,40 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
         Ok(buf[2] & 0x80 != 0)
     }
 
-    /// MODE SENSE(6) for the Caching mode page (0x08), truncated to whatever
-    /// the drive actually sent.
+    /// MODE SENSE(6) or (10) for the Caching mode page (0x08), truncated to
+    /// whatever the drive actually sent. `pc` is the page-control field
+    /// already shifted into CDB position (0 = current values).
+    fn mode_sense_caching(&self, ten: bool, pc: u8) -> Result<Vec<u8>> {
+        if !ten {
+            let mut cdb = vec![0u8; 6];
+            cdb[0] = OP_MODE_SENSE_6;
+            cdb[2] = pc | MODE_PAGE_CACHING;
+            cdb[4] = u8::MAX; // allocation length: the 6-byte form's field is one byte
+            let mut buf = vec![0u8; u8::MAX as usize];
+            let n = self.command(cdb, Direction::In, &mut buf)?;
+            buf.truncate(n);
+            Ok(buf)
+        } else {
+            let mut cdb = vec![0u8; 10];
+            cdb[0] = OP_MODE_SENSE_10;
+            cdb[2] = pc | MODE_PAGE_CACHING;
+            let alloc: u16 = 512;
+            cdb[7..9].copy_from_slice(&alloc.to_be_bytes());
+            let mut buf = vec![0u8; alloc as usize];
+            let n = self.command(cdb, Direction::In, &mut buf)?;
+            buf.truncate(n);
+            Ok(buf)
+        }
+    }
+
     fn mode_sense_6_caching(&self) -> Result<Vec<u8>> {
-        let mut cdb = vec![0u8; 6];
-        cdb[0] = OP_MODE_SENSE_6;
-        cdb[2] = MODE_PAGE_CACHING;
-        cdb[4] = u8::MAX; // allocation length: the 6-byte form's field is one byte
-        let mut buf = vec![0u8; u8::MAX as usize];
-        let n = self.command(cdb, Direction::In, &mut buf)?;
-        buf.truncate(n);
-        Ok(buf)
+        self.mode_sense_caching(false, 0)
     }
 
     /// The 10-byte fallback, for a bridge that answers MODE SENSE(10) but not
     /// the 6-byte form.
     fn mode_sense_10_caching(&self) -> Result<Vec<u8>> {
-        let mut cdb = vec![0u8; 10];
-        cdb[0] = OP_MODE_SENSE_10;
-        cdb[2] = MODE_PAGE_CACHING;
-        let alloc: u16 = 512;
-        cdb[7..9].copy_from_slice(&alloc.to_be_bytes());
-        let mut buf = vec![0u8; alloc as usize];
-        let n = self.command(cdb, Direction::In, &mut buf)?;
-        buf.truncate(n);
-        Ok(buf)
+        self.mode_sense_caching(true, 0)
     }
 
     /// Ask the drive whether MODE SENSE(6)/(10) had anything to say about the
@@ -1037,6 +1185,142 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
             }
         }
         WriteCacheState::Unknown
+    }
+
+    /// The Caching page's current values, from MODE SENSE(6) if that yields a
+    /// usable page, else (10). Returns which form answered. Failures are
+    /// swallowed into `None`, like [`write_cache_state`](Self::write_cache_state).
+    #[cfg(feature = "dangerous-write-support")]
+    fn current_caching_page(&self) -> Option<(bool, CachingPage)> {
+        for ten in [false, true] {
+            if let Ok(data) = self.mode_sense_caching(ten, 0) {
+                if let Some(p) = locate_caching_page(ten, &data) {
+                    return Some((ten, p));
+                }
+            }
+        }
+        None
+    }
+
+    /// Send MODE SELECT (SP=0) with the page from `cur` and WCE = `wce`.
+    #[cfg(feature = "dangerous-write-support")]
+    fn mode_select_caching(&self, ten: bool, cur: &CachingPage, wce: bool) -> Result<()> {
+        let mut params = mode_select_params(ten, cur, wce);
+        let cdb = mode_select_cdb(ten, params.len());
+        let sent = self.command(cdb, Direction::Out, &mut params)?;
+        if sent != params.len() {
+            return Err(LuksError::ScsiProtocol("short MODE SELECT data phase"));
+        }
+        Ok(())
+    }
+
+    /// Try to switch the drive's volatile write cache off, **for this power-on
+    /// only**, when the adapter has no flush command.
+    ///
+    /// `Ok(true)`: a MODE SENSE read-back reports WCE clear; every write is
+    /// now write-through. `Ok(false)`: not achieved (no readable caching page,
+    /// WCE reported not changeable, MODE SELECT rejected, or the drive accepted
+    /// it and still reports the cache on). `Err`: a transport failure. No data
+    /// block is written by any of this.
+    #[cfg(feature = "dangerous-write-support")]
+    fn force_write_cache_off(&self) -> Result<bool> {
+        use std::sync::atomic::Ordering as O;
+        let Some((ten, cur)) = self.current_caching_page() else {
+            return Ok(false);
+        };
+        if !cur.wce() {
+            return Ok(false);
+        }
+        // Not changeable by the drive's own account: do not even try. If the
+        // changeable-values query itself fails that is not evidence either
+        // way; the read-back below is what decides.
+        if let Ok(data) = self.mode_sense_caching(ten, PC_CHANGEABLE) {
+            if let Some(mask) = locate_caching_page(ten, &data) {
+                if !mask.wce() {
+                    return Ok(false);
+                }
+            }
+        }
+        self.cache_touched.store(true, O::Release);
+        match self.mode_select_caching(ten, &cur, false) {
+            Ok(()) => {}
+            Err(LuksError::ScsiCommandFailed { .. }) => return Ok(false),
+            Err(e) => return Err(e),
+        }
+        // A successful MODE SELECT commonly leaves a UNIT ATTENTION (mode
+        // parameters changed) that fails the next command once; the failure
+        // itself clears it, so one retry is legitimate. Anything but an
+        // explicit WCE-clear answer counts as "not off".
+        for _ in 0..2 {
+            if self.write_cache_state() == WriteCacheState::Disabled {
+                self.cache_forced_off.store(true, O::Release);
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Best effort, errors ignored: put the write cache back as the drive had
+    /// it (on) if this session touched it. Safe to call repeatedly. Every write
+    /// was write-through while the cache was off, so nothing is pending.
+    #[cfg(feature = "dangerous-write-support")]
+    pub fn restore_write_cache(&self) {
+        use std::sync::atomic::Ordering as O;
+        if !self.cache_touched.swap(false, O::AcqRel) {
+            return;
+        }
+        self.cache_forced_off.store(false, O::Release);
+        if let Some((ten, cur)) = self.current_caching_page() {
+            if !cur.wce() {
+                let _ = self.mode_select_caching(ten, &cur, true);
+            }
+        }
+    }
+
+    /// Whether this session switched the write cache off and it was still off
+    /// at the last durability point.
+    #[cfg(feature = "dangerous-write-support")]
+    pub fn write_cache_forced_off(&self) -> bool {
+        self.durability.load(std::sync::atomic::Ordering::Acquire) == DURABILITY_CACHE_OFF
+    }
+
+    /// How writes are being made durable: `"flush"`, `"write_through"`,
+    /// `"cache_off"` or `"unverified"`; `None` until decided.
+    #[cfg(feature = "dangerous-write-support")]
+    pub fn write_durability(&self) -> Option<&'static str> {
+        match self.durability.load(std::sync::atomic::Ordering::Acquire) {
+            DURABILITY_FLUSH => Some("flush"),
+            DURABILITY_WRITE_THROUGH => Some("write_through"),
+            DURABILITY_CACHE_OFF => Some("cache_off"),
+            DURABILITY_UNVERIFIED => Some("unverified"),
+            _ => None,
+        }
+    }
+
+    /// Durability point for a drive with no flush command whose cache we
+    /// switched off: it should still be off. If it is not (the drive reset),
+    /// the session continues exactly as it would on a drive that never had a
+    /// way to flush, but the mode drops to `unverified`, permanently, and the
+    /// event is logged. The commit is not aborted: Linux would carry on too.
+    #[cfg(feature = "dangerous-write-support")]
+    fn verify_cache_still_off(&self) {
+        use std::sync::atomic::Ordering as O;
+        if self.durability.load(O::Acquire) != DURABILITY_CACHE_OFF {
+            return;
+        }
+        // One retry: the first command after a drive reset fails with a UNIT
+        // ATTENTION that only reports the reset.
+        for _ in 0..2 {
+            if self.write_cache_state() == WriteCacheState::Disabled {
+                return;
+            }
+        }
+        self.durability.store(DURABILITY_UNVERIFIED, O::Release);
+        self.cache_forced_off.store(false, O::Release);
+        crate::forensic::record_usb(crate::forensic::UsbEvent::StateTransition {
+            from: "write_cache_off",
+            to: "write_unverified",
+        });
     }
 
     /// Ask the drive which write opcodes it will accept, **without writing
@@ -1124,6 +1408,11 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
     /// not paper over that. It records the fact instead: [`flush_is_a_no_op`]
     /// lets a caller find out which case it is in.
     ///
+    /// Before settling for that, `check_write_safety` tries to switch the
+    /// drive's write cache off with a non-persistent MODE SELECT; only if that
+    /// is impossible does the session run `unverified`, which is the kernel's
+    /// behaviour and is reported to the user as such.
+    ///
     /// Only an *invalid opcode* is treated this way. A flush that fails for
     /// any other reason is still an error: "this drive cannot flush" and "this
     /// flush did not work" are different facts.
@@ -1132,6 +1421,9 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
         use std::sync::atomic::Ordering as O;
 
         if self.no_flush_command.load(O::Acquire) {
+            // No flush exists. With the cache forced off, durability rests on
+            // it staying off, so re-check at every durability point.
+            self.verify_cache_still_off();
             return Ok(());
         }
 
@@ -1151,6 +1443,7 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
         match self.command(cdb, Direction::None, &mut []) {
             Ok(_) => {
                 self.flush_accepted.store(true, O::Release);
+                self.durability.store(DURABILITY_FLUSH, O::Release);
                 return Ok(());
             }
             Err(e) if !unsupported(&e) => return Err(e),
@@ -1162,6 +1455,7 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
         match self.command(cdb, Direction::None, &mut []) {
             Ok(_) => {
                 self.flush_accepted.store(true, O::Release);
+                self.durability.store(DURABILITY_FLUSH, O::Release);
                 return Ok(());
             }
             Err(e) if !unsupported(&e) => return Err(e),
@@ -1169,6 +1463,7 @@ impl<T: BulkTransport> ScsiBlockDevice<T> {
         }
 
         self.no_flush_command.store(true, O::Release);
+        self.verify_cache_still_off();
         Ok(())
     }
 
@@ -1329,22 +1624,109 @@ impl<T: BulkTransport> crate::device::WriteAt for ScsiBlockDevice<T> {
         ScsiBlockDevice::flush_support(self)
     }
 
-    /// Writes are allowed only if a flush command works, or the drive reports
-    /// a write-through cache (Caching page WCE clear). If the adapter rejects
-    /// SYNCHRONIZE CACHE and WCE is set or unreadable, the superblock could
-    /// reach the medium before the tree blocks it points at.
+    fn write_cache_forced_off(&self) -> bool {
+        ScsiBlockDevice::write_cache_forced_off(self)
+    }
+
+    fn write_durability(&self) -> Option<&'static str> {
+        ScsiBlockDevice::write_durability(self)
+    }
+
+    /// Decide how writes will be made durable, never to refuse them for that
+    /// reason. In order: a SYNCHRONIZE CACHE the drive accepts (`flush`); a
+    /// drive that already reports a write-through cache (`write_through`);
+    /// a non-persistent MODE SELECT that switches the cache off and reads back
+    /// off (`cache_off`); otherwise `unverified`, which proceeds exactly as
+    /// Linux does on an adapter that cannot flush (see `synchronize_cache`).
     ///
     /// The probe is a SYNCHRONIZE CACHE for the whole medium with nothing
     /// pending: a no-op for the drive, and the same command the kernel issues
-    /// at unmount.
+    /// at unmount. The MODE SELECT fallback writes no data block. Only a
+    /// transport failure is an error.
     fn check_write_safety(&self) -> Result<()> {
+        use std::sync::atomic::Ordering as O;
         self.synchronize_cache()?;
         if ScsiBlockDevice::flush_support(self) == Some(true) {
             return Ok(());
         }
-        if self.write_cache_state() == WriteCacheState::Disabled {
-            return Ok(());
-        }
-        Err(LuksError::UnsafeWriteCache)
+        let mode = if self.write_cache_state() == WriteCacheState::Disabled {
+            DURABILITY_WRITE_THROUGH
+        } else if self.force_write_cache_off()? {
+            DURABILITY_CACHE_OFF
+        } else {
+            DURABILITY_UNVERIFIED
+        };
+        self.durability.store(mode, O::Release);
+        Ok(())
+    }
+}
+
+/// Undo the session's cache change when the device goes away. Runs after the
+/// last volume on the device has closed (the volumes hold clones of the
+/// device and drop first), so the final commit has already been made.
+#[cfg(feature = "dangerous-write-support")]
+impl<T: BulkTransport> Drop for ScsiBlockDevice<T> {
+    fn drop(&mut self) {
+        self.restore_write_cache();
+    }
+}
+
+#[cfg(all(test, feature = "dangerous-write-support"))]
+mod mode_select_tests {
+    use super::*;
+
+    fn page(wce: bool, ps: bool) -> CachingPage {
+        let mut p = vec![0u8; 20];
+        p[0] = 0x08 | if ps { 0x80 } else { 0 };
+        p[1] = 18;
+        p[2] = if wce { 0x04 | 0x01 } else { 0x01 }; // RCD stays as read
+        p[12] = 0x14;
+        CachingPage { medium_type: 0, page: p }
+    }
+
+    #[test]
+    fn six_byte_cdb_is_pf_set_sp_clear() {
+        assert_eq!(mode_select_cdb(false, 24), vec![0x15, 0x10, 0, 0, 24, 0]);
+    }
+
+    #[test]
+    fn ten_byte_cdb_is_pf_set_sp_clear() {
+        assert_eq!(mode_select_cdb(true, 28), vec![0x55, 0x10, 0, 0, 0, 0, 0, 0, 28, 0]);
+    }
+
+    #[test]
+    fn six_byte_parameter_list_exact_bytes() {
+        let got = mode_select_params(false, &page(true, true), false);
+        let mut want = vec![0u8, 0, 0, 0]; // MDL, medium, device-specific, BDL
+        want.extend_from_slice(&[0x08, 18, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x14, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn ten_byte_parameter_list_exact_bytes() {
+        let mut cur = page(true, false);
+        cur.medium_type = 0x05;
+        let got = mode_select_params(true, &cur, false);
+        let mut want = vec![0u8, 0, 0x05, 0, 0, 0, 0, 0]; // MDL(2), medium, dev-spec, LONGLBA, rsvd, BDL(2)
+        want.extend_from_slice(&[0x08, 18, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x14, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn restore_sets_only_wce() {
+        let got = mode_select_params(false, &page(false, true), true);
+        assert_eq!(got[4], 0x08);
+        assert_eq!(got[6], 0x05);
+    }
+
+    #[test]
+    fn locating_skips_block_descriptors_and_refuses_truncated_pages() {
+        let mut d = vec![0u8; 4];
+        d[3] = 8;
+        d.extend_from_slice(&[0u8; 8]);
+        d.extend_from_slice(&page(true, true).page);
+        let p = locate_caching_page(false, &d).expect("found");
+        assert!(p.wce());
+        assert!(locate_caching_page(false, &d[..d.len() - 1]).is_none(), "partial page must not be echoed");
     }
 }

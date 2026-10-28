@@ -306,9 +306,12 @@ pub enum LuksError {
     #[error("cannot write to read-only plain volume")]
     ReadOnlyVolume,
 
-    /// The USB adapter rejected SYNCHRONIZE CACHE and does not report a
-    /// write-through cache, so there is no way to order tree blocks before the
-    /// superblock. Nothing has been written; reads keep working.
+    /// No longer produced by the USB path (an adapter that cannot flush now
+    /// runs in the `unverified` durability mode, as Linux does). Kept, with
+    /// its code 25, so numbering and the app's mapping stay stable.
+    ///
+    /// Was: the adapter rejected SYNCHRONIZE CACHE and does not report a
+    /// write-through cache. Nothing has been written; reads keep working.
     #[error("this USB adapter cannot guarantee writes reach the disk; writing is disabled to protect it")]
     UnsafeWriteCache,
 

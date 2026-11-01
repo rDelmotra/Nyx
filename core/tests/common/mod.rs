@@ -28,6 +28,82 @@ use luks_core::error::{LuksError, Result};
 use luks_core::usb::bot::{CBW_LEN, CBW_SIGNATURE, CSW_LEN, CSW_SIGNATURE};
 use luks_core::usb::BulkTransport;
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering::SeqCst};
+use std::sync::{Arc, Mutex};
+
+/// The Caching mode page a mock drive reports, minus WCE and PS: every other
+/// byte of a MODE SELECT'd page must come back unchanged.
+const CACHING_PAGE_TAIL: [u8; 17] = [
+    0x00, 0xFF, 0xFF, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x80, 0x14, 0, 0, 0, 0, 0, 0,
+];
+
+/// The mock's write-cache state, shared with the test through
+/// [`MockUsbDrive::cache_probe`] so it can be inspected after the drive has
+/// been moved into a `ScsiBlockDevice` and after that was dropped.
+pub struct CacheProbe {
+    /// Current WCE.
+    pub wce: AtomicBool,
+    /// Whether MODE SENSE(changeable) says WCE may be altered.
+    pub changeable: AtomicBool,
+    /// Accept a MODE SELECT but leave WCE as it was (a lying bridge).
+    pub lie: AtomicBool,
+    /// MODE SELECT commands received (CDB seen, accepted or not).
+    pub mode_selects: AtomicUsize,
+    /// MODE SELECTs that applied WCE=0 / WCE=1.
+    pub applied_off: AtomicUsize,
+    pub applied_on: AtomicUsize,
+    /// Anything wrong with a MODE SELECT: SP=1, PF=0, bad header, page changed
+    /// beyond WCE, PS set. A test must assert this is empty (`assert_clean`).
+    pub violations: Mutex<Vec<String>>,
+    /// Exact parameter lists received, in order.
+    pub select_params: Mutex<Vec<Vec<u8>>>,
+    /// Exact CDBs received, in order.
+    pub select_cdbs: Mutex<Vec<Vec<u8>>>,
+    /// Revert WCE to on after this many commands once it was switched off;
+    /// negative = never.
+    pub revert_after: AtomicI64,
+    since_off: AtomicUsize,
+}
+
+impl CacheProbe {
+    fn new() -> Self {
+        Self {
+            wce: AtomicBool::new(true),
+            changeable: AtomicBool::new(true),
+            lie: AtomicBool::new(false),
+            mode_selects: AtomicUsize::new(0),
+            applied_off: AtomicUsize::new(0),
+            applied_on: AtomicUsize::new(0),
+            violations: Mutex::new(Vec::new()),
+            select_params: Mutex::new(Vec::new()),
+            select_cdbs: Mutex::new(Vec::new()),
+            revert_after: AtomicI64::new(-1),
+            since_off: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn wce(&self) -> bool {
+        self.wce.load(SeqCst)
+    }
+
+    pub fn mode_selects(&self) -> usize {
+        self.mode_selects.load(SeqCst)
+    }
+
+    /// Simulate the drive resetting: volatile settings return to the default.
+    pub fn revert(&self) {
+        self.wce.store(true, SeqCst);
+    }
+
+    pub fn assert_clean(&self) {
+        let v = self.violations.lock().unwrap();
+        assert!(v.is_empty(), "MODE SELECT violations: {v:?}");
+    }
+
+    fn violation(&self, what: impl Into<String>) {
+        self.violations.lock().unwrap().push(what.into());
+    }
+}
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Stats {
@@ -60,6 +136,8 @@ enum Phase {
         blocks: u32,
     },
     Csw { pos: usize },
+    /// MODE SELECT parameter list still owed by the host.
+    SelectOut { want: usize, got: Vec<u8>, ten: bool },
 }
 
 pub struct MockUsbDrive {
@@ -94,6 +172,13 @@ pub struct MockUsbDrive {
     /// (the default) means the command is rejected like any other opcode this
     /// mock does not implement.
     pub write_cache_enabled: std::cell::Cell<Option<bool>>,
+    /// Write-cache state shared with the test; see [`CacheProbe`].
+    pub cache: Arc<CacheProbe>,
+    /// Reject MODE SENSE(6) / MODE SENSE(10) respectively.
+    pub no_sense6: std::cell::Cell<bool>,
+    pub no_sense10: std::cell::Cell<bool>,
+    /// Put an 8-byte block descriptor between the header and the page.
+    pub block_descriptor: std::cell::Cell<bool>,
 }
 
 impl MockUsbDrive {
@@ -114,13 +199,131 @@ impl MockUsbDrive {
             stall_transfers_larger_than: std::cell::Cell::new(None),
             stalled_endpoints: std::cell::Cell::new(false),
             write_cache_enabled: std::cell::Cell::new(None),
+            cache: Arc::new(CacheProbe::new()),
+            no_sense6: std::cell::Cell::new(false),
+            no_sense10: std::cell::Cell::new(false),
+            block_descriptor: std::cell::Cell::new(false),
         }
     }
 
     /// Answer MODE SENSE(6) for the Caching page with the given WCE bit.
     pub fn with_write_cache(self, wce: bool) -> Self {
         self.write_cache_enabled.set(Some(wce));
+        self.cache.wce.store(wce, SeqCst);
         self
+    }
+
+    /// The shared cache state; clone it before moving the drive.
+    pub fn cache_probe(&self) -> Arc<CacheProbe> {
+        self.cache.clone()
+    }
+
+    /// WCE is reported as not changeable.
+    pub fn with_wce_not_changeable(self) -> Self {
+        self.cache.changeable.store(false, SeqCst);
+        self
+    }
+
+    /// MODE SELECT is refused (sense: invalid opcode).
+    pub fn rejecting_mode_select(self) -> Self {
+        self.failing(0x15, [0x5, 0x20, 0x00]).failing(0x55, [0x5, 0x20, 0x00])
+    }
+
+    /// MODE SELECT is accepted but WCE stays on.
+    pub fn lying_about_mode_select(self) -> Self {
+        self.cache.lie.store(true, SeqCst);
+        self
+    }
+
+    /// WCE goes back on this many commands after it was switched off.
+    pub fn reverting_cache_after(self, commands: i64) -> Self {
+        self.cache.revert_after.store(commands, SeqCst);
+        self
+    }
+
+    /// Only the 10-byte MODE SENSE / MODE SELECT exist.
+    pub fn with_only_ten_byte_mode_commands(self) -> Self {
+        self.no_sense6.set(true);
+        self.failing(0x15, [0x5, 0x20, 0x00])
+    }
+
+    pub fn with_block_descriptor(self) -> Self {
+        self.block_descriptor.set(true);
+        self
+    }
+
+    /// MODE SENSE response for the Caching page. `pc` is 0 (current) or 1
+    /// (changeable).
+    fn caching_response(&self, ten: bool, pc: u8) -> Vec<u8> {
+        let mut page = vec![0u8; 20];
+        page[0] = 0x08 | if pc == 0 { 0x80 } else { 0 }; // PS reported on current values
+        page[1] = 18;
+        let wce = if pc == 1 { self.cache.changeable.load(SeqCst) } else { self.cache.wce() };
+        page[2] = if wce { 0x04 } else { 0x00 };
+        page[3..20].copy_from_slice(&CACHING_PAGE_TAIL);
+        if pc == 1 {
+            page[3..20].fill(0); // nothing else is changeable
+        }
+        let bd: &[u8] = if self.block_descriptor.get() { &[0, 0, 0, 0, 0, 0, 2, 0] } else { &[] };
+        let mut out = if ten { vec![0u8; 8] } else { vec![0u8; 4] };
+        if ten {
+            out[7] = bd.len() as u8;
+        } else {
+            out[3] = bd.len() as u8;
+        }
+        out.extend_from_slice(bd);
+        out.extend_from_slice(&page);
+        let mdl = out.len() - if ten { 2 } else { 1 };
+        if ten {
+            out[0..2].copy_from_slice(&(mdl as u16).to_be_bytes());
+        } else {
+            out[0] = mdl as u8;
+        }
+        out
+    }
+
+    /// Validate and apply a complete MODE SELECT parameter list.
+    fn apply_mode_select(&self, ten: bool, params: &[u8]) {
+        self.cache.select_params.lock().unwrap().push(params.to_vec());
+        let hl = if ten { 8 } else { 4 };
+        if params.len() != hl + 20 {
+            self.cache.violation(format!("parameter list length {}", params.len()));
+            return;
+        }
+        let (mdl, devspec, bdl) = if ten {
+            (u16::from_be_bytes([params[0], params[1]]) as usize, params[3], u16::from_be_bytes([params[6], params[7]]) as usize)
+        } else {
+            (params[0] as usize, params[2], params[3] as usize)
+        };
+        if mdl != 0 {
+            self.cache.violation("mode data length must be 0 on select");
+        }
+        if devspec != 0 {
+            self.cache.violation("device-specific parameter must be 0 on select");
+        }
+        if bdl != 0 {
+            self.cache.violation("block descriptor length must be 0");
+        }
+        let page = &params[hl..];
+        if page[0] & 0x80 != 0 {
+            self.cache.violation("PS bit set in MODE SELECT page");
+        }
+        if page[0] & 0x7F != 0x08 || page[1] != 18 {
+            self.cache.violation("not the caching page, or page length changed");
+        }
+        if page[2] & !0x04 != 0 || page[3..20] != CACHING_PAGE_TAIL {
+            self.cache.violation("page bytes other than WCE differ from what was read");
+        }
+        if self.cache.lie.load(SeqCst) {
+            return;
+        }
+        if page[2] & 0x04 == 0 {
+            self.cache.applied_off.fetch_add(1, SeqCst);
+            self.cache.wce.store(false, SeqCst);
+        } else {
+            self.cache.applied_on.fetch_add(1, SeqCst);
+            self.cache.wce.store(true, SeqCst);
+        }
     }
 
     /// Refuse `opcode` with CSW status 1, reporting `sense` when asked why.
@@ -184,6 +387,25 @@ impl MockUsbDrive {
     fn execute(&self, cdb: &[u8], tag: u32, expected_len: u32, flags: u8) -> Result<()> {
         self.stats.borrow_mut().commands += 1;
 
+        // Scripted revert: the drive resets some commands after WCE went off.
+        let after = self.cache.revert_after.load(SeqCst);
+        if after >= 0 && !self.cache.wce() {
+            if self.cache.since_off.fetch_add(1, SeqCst) as i64 >= after {
+                self.cache.wce.store(true, SeqCst);
+                self.cache.since_off.store(0, SeqCst);
+            }
+        }
+        if matches!(cdb[0], 0x15 | 0x55) {
+            self.cache.mode_selects.fetch_add(1, SeqCst);
+            self.cache.select_cdbs.lock().unwrap().push(cdb.to_vec());
+            if cdb[1] & 0x10 == 0 {
+                self.cache.violation("PF=0");
+            }
+            if cdb[1] & 0x01 != 0 {
+                self.cache.violation("SP=1: would permanently alter the drive");
+            }
+        }
+
         let host_expects_in = flags & 0x80 != 0;
         let phase_error = |why: &str| {
             let _ = why; // named for the reader; the CSW carries only a status
@@ -193,8 +415,8 @@ impl MockUsbDrive {
 
         // Direction check: every command with a data phase declares its
         // direction in the opcode; the CBW flag must agree.
-        let wants_in = matches!(cdb[0], 0x12 | 0x03 | 0x25 | 0x9E | 0x28 | 0x88);
-        let wants_out = matches!(cdb[0], 0x2A | 0x8A);
+        let wants_in = matches!(cdb[0], 0x12 | 0x03 | 0x25 | 0x9E | 0x28 | 0x88 | 0x1A | 0x5A);
+        let wants_out = matches!(cdb[0], 0x2A | 0x8A | 0x15 | 0x55);
         if expected_len > 0 && wants_in && !host_expects_in {
             phase_error("IN command sent with an OUT flag");
             return Ok(());
@@ -407,15 +629,34 @@ impl MockUsbDrive {
                 self.stats.borrow_mut().sync_commands += 1;
                 Vec::new()
             }
-            // MODE SENSE(6), only when the test configured a cache state.
-            0x1A if self.write_cache_enabled.get().is_some() => {
-                let wce = self.write_cache_enabled.get().unwrap();
-                let mut d = vec![0u8; 24];
-                d[0] = 23;
-                d[4] = 0x08; // Caching page
-                d[5] = 18;
-                d[6] = if wce { 0x04 } else { 0x00 };
-                d
+            // MODE SENSE(6)/(10), only when the test configured a cache state.
+            0x1A if self.write_cache_enabled.get().is_some() && !self.no_sense6.get() => {
+                self.caching_response(false, cdb[2] >> 6)
+            }
+            0x5A if self.write_cache_enabled.get().is_some() && !self.no_sense10.get() => {
+                self.caching_response(true, cdb[2] >> 6)
+            }
+            // MODE SELECT(6)/(10): the parameter list arrives in a data-out
+            // phase and is validated when complete.
+            0x15 | 0x55 if self.write_cache_enabled.get().is_some() => {
+                let ten = cdb[0] == 0x55;
+                let declared = if ten {
+                    u16::from_be_bytes([cdb[7], cdb[8]]) as usize
+                } else {
+                    cdb[4] as usize
+                };
+                if declared != expected_len as usize {
+                    phase_error("CBW length disagrees with the MODE SELECT CDB");
+                    return Ok(());
+                }
+                if declared == 0 {
+                    self.set_csw(tag, 0, 0);
+                    *self.phase.borrow_mut() = Phase::Csw { pos: 0 };
+                    return Ok(());
+                }
+                *self.phase.borrow_mut() = Phase::SelectOut { want: declared, got: Vec::new(), ten };
+                self.set_csw(tag, 0, 0);
+                return Ok(());
             }
             _ => {
                 self.set_csw(tag, expected_len, 1);
@@ -437,6 +678,21 @@ impl MockUsbDrive {
 
 impl BulkTransport for MockUsbDrive {
     fn write(&self, data: &[u8]) -> Result<usize> {
+        // MODE SELECT parameter list.
+        {
+            let mut phase = self.phase.borrow_mut();
+            if let Phase::SelectOut { want, got, ten } = &mut *phase {
+                let n = data.len().min(*want - got.len());
+                got.extend_from_slice(&data[..n]);
+                if got.len() == *want {
+                    let (got, ten) = (std::mem::take(got), *ten);
+                    *phase = Phase::Csw { pos: 0 };
+                    drop(phase);
+                    self.apply_mode_select(ten, &got);
+                }
+                return Ok(n);
+            }
+        }
         // Mid data-out phase: these bytes are payload, not a new command.
         {
             let mut phase = self.phase.borrow_mut();
@@ -505,7 +761,7 @@ impl BulkTransport for MockUsbDrive {
             // The host is reading while the drive is still waiting for the
             // data it promised to send. A real bridge stalls; returning zero
             // surfaces it as a hang in the test rather than as silent success.
-            Phase::DataOut { .. } => Ok(0),
+            Phase::DataOut { .. } | Phase::SelectOut { .. } => Ok(0),
             Phase::DataIn { data, pos } => {
                 if self.stalled_endpoints.get() {
                     return Err(LuksError::UsbErrno {

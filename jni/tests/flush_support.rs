@@ -15,6 +15,7 @@
 mod common;
 
 use common::{fixture, MockUsbDrive};
+use std::sync::atomic::Ordering::SeqCst;
 use luks_core::device::WriteAt;
 use luks_core::usb::ScsiBlockDevice;
 use luks_jni::bridge::{DeviceHandle, VolumeHandle};
@@ -160,19 +161,22 @@ fn info_json_does_not_block_behind_a_device_in_the_middle_of_a_flush() {
 }
 
 // ---------------------------------------------------------------------------
-// Write refusal when ordering cannot be guaranteed.
-//
-// Rule: writes are allowed only if SYNCHRONIZE CACHE works, or MODE SENSE
-// reports the write cache disabled (write-through). Rejected flush plus WCE
-// set or unknown -> refused before any byte is written; reads keep working.
+// Write durability modes. Writes are never refused for cache/flush reasons:
+//   flush          SYNCHRONIZE CACHE accepted
+//   write_through  no flush, drive already reports WCE clear (no MODE SELECT)
+//   cache_off      no flush, WCE on: we switch it off (MODE SELECT, SP=0)
+//                  and a MODE SENSE read-back confirms it
+//   unverified     none of the above worked: proceed like Linux's
+//                  sd_sync_cache(), and say so
 // These run on the shared device layer that both ext4 and btrfs sit on, over a
 // plain btrfs image (no LUKS fixture needed).
 // ---------------------------------------------------------------------------
 
+use common::states::{judge, Depth};
+use common::mem_device::MemoryDevice;
 use luks_core::device::ReadAt;
-use luks_core::error::LuksError;
 use luks_core::fs::btrfs::Btrfs;
-use luks_jni::bridge::{code, error_code, SharedDevice};
+use luks_jni::bridge::SharedDevice;
 
 fn shared_over(drive: MockUsbDrive) -> SharedDevice {
     SharedDevice::new(ScsiBlockDevice::open(drive).expect("open mock drive"))
@@ -186,78 +190,239 @@ fn no_flush(d: MockUsbDrive) -> MockUsbDrive {
     d.failing(0x35, NO_SUCH_OPCODE).failing(0x91, NO_SUCH_OPCODE)
 }
 
-/// First 1 MiB at the superblock region, to prove nothing was written.
-fn head(dev: &SharedDevice) -> Vec<u8> {
-    let mut b = vec![0u8; 1 << 20];
-    dev.read_at(0, &mut b).expect("read");
-    b
+fn durability(dev: &SharedDevice) -> Option<&'static str> {
+    WriteAt::write_durability(dev)
 }
 
-fn assert_refused_and_untouched(dev: &SharedDevice) {
-    let before = head(dev);
-    let err = dev.ensure_writes_safe().expect_err("writes must be refused");
-    assert!(matches!(err, LuksError::UnsafeWriteCache), "{err:?}");
-    assert_eq!(error_code(&err), code::WRITES_UNSAFE);
-    assert!(err.to_string().contains("cannot guarantee writes reach the disk"));
-    // The backstop in write_at refuses too, whatever path got there.
-    let w = dev.write_at(0x10000, &[0xAB; 4096]).expect_err("raw write refused");
-    assert!(matches!(w, LuksError::UnsafeWriteCache), "{w:?}");
-    assert_eq!(head(dev), before, "a refused write changed the device");
-    // Reads continue, filesystem included.
-    let fs = Btrfs::mount(dev.clone()).expect("reads still work");
-    fs.statfs().expect("statfs");
-}
-
-#[test]
-fn rejected_flush_with_unknown_cache_state_refuses_writes() {
-    // The mock does not implement MODE SENSE here: WCE is Unknown.
-    let dev = shared_over(no_flush(btrfs_drive()));
-    assert_refused_and_untouched(&dev);
-}
-
-#[test]
-fn rejected_flush_with_write_cache_enabled_refuses_writes() {
-    let dev = shared_over(no_flush(btrfs_drive().with_write_cache(true)));
-    assert_refused_and_untouched(&dev);
-}
-
-#[test]
-fn rejected_flush_refuses_a_btrfs_write_before_anything_is_written() {
-    let dev = shared_over(no_flush(btrfs_drive().with_write_cache(true)));
-    let before = head(&dev);
+/// Write one file through btrfs and read it back after a fresh mount.
+fn write_and_read_back(dev: &SharedDevice, name: &str, data: &[u8]) {
     let mut fs = Btrfs::mount(dev.clone()).expect("mount");
-    // No ensure_writes_safe call by the caller: the device itself refuses.
-    let err = fs.create_file_with_data("/", "x", b"data").expect_err("refused");
-    assert!(matches!(err, LuksError::UnsafeWriteCache), "{err:?}");
-    assert_eq!(head(&dev), before);
-}
-
-#[test]
-fn rejected_flush_with_write_cache_disabled_allows_writes() {
-    let dev = shared_over(no_flush(btrfs_drive().with_write_cache(false)));
-    dev.ensure_writes_safe().expect("write-through drive is safe without flush");
-    let mut fs = Btrfs::mount(dev.clone()).expect("mount");
-    fs.create_file_with_data("/", "wt.txt", b"write-through").expect("write allowed");
+    fs.create_file_with_data("/", name, data).expect("write must be allowed");
     let fs = Btrfs::mount(dev.clone()).expect("remount");
-    assert_eq!(fs.read_file("/wt.txt").expect("read back"), b"write-through");
+    assert_eq!(fs.read_file(&format!("/{name}")).expect("read back"), data);
+}
+
+/// The whole drive, graded by the same checkers the power-cut tests use.
+fn assert_consistent(dev: &SharedDevice, step: &str) {
+    let len = ReadAt::len(dev).expect("len") as usize;
+    let mut img = vec![0u8; len];
+    for (i, chunk) in img.chunks_mut(1 << 20).enumerate() {
+        dev.read_at((i << 20) as u64, chunk).expect("dump");
+    }
+    judge(&MemoryDevice::from_bytes(img), step, Depth::Ours);
 }
 
 #[test]
-fn a_working_flush_allows_writes_even_with_write_cache_enabled() {
-    let dev = shared_over(btrfs_drive().with_write_cache(true));
+fn a_working_flush_is_mode_flush_and_sends_no_mode_select() {
+    let drive = btrfs_drive().with_write_cache(true);
+    let probe = drive.cache_probe();
+    let dev = shared_over(drive);
     dev.ensure_writes_safe().expect("flush works");
-    let mut fs = Btrfs::mount(dev.clone()).expect("mount");
-    fs.create_file_with_data("/", "wb.txt", b"flushed").expect("write allowed");
-    let fs = Btrfs::mount(dev.clone()).expect("remount");
-    assert_eq!(fs.read_file("/wb.txt").expect("read back"), b"flushed");
+    assert_eq!(durability(&dev), Some("flush"));
+    write_and_read_back(&dev, "wb.txt", b"flushed");
+    drop(dev);
+    assert_eq!(probe.mode_selects(), 0, "f: no MODE SELECT when a flush works");
+    assert!(probe.wce(), "the cache was never touched");
+    probe.assert_clean();
 }
 
-/// The decision is made by the probe, before any commit could write: the
-/// device reports flush support without a single write having happened.
 #[test]
-fn the_probe_runs_before_the_first_write() {
-    let dev = shared_over(btrfs_drive());
-    assert_eq!(luks_core::device::WriteAt::flush_support(&dev), None);
-    dev.ensure_writes_safe().expect("safe");
-    assert_eq!(luks_core::device::WriteAt::flush_support(&dev), Some(true));
+fn flush_rejected_and_cache_already_off_is_write_through_with_no_mode_select() {
+    let drive = no_flush(btrfs_drive().with_write_cache(false));
+    let probe = drive.cache_probe();
+    let dev = shared_over(drive);
+    dev.ensure_writes_safe().expect("allowed");
+    assert_eq!(durability(&dev), Some("write_through"));
+    assert!(!WriteAt::write_cache_forced_off(&dev));
+    write_and_read_back(&dev, "wt.txt", b"write-through");
+    drop(dev);
+    assert_eq!(probe.mode_selects(), 0, "g: no MODE SELECT when WCE is already off");
+    assert!(!probe.wce());
+    probe.assert_clean();
+}
+
+/// (a) The case from the user's SSD adapter.
+#[test]
+fn flush_rejected_and_cache_on_switches_the_cache_off_and_restores_it_on_close() {
+    let drive = no_flush(btrfs_drive().with_write_cache(true));
+    let probe = drive.cache_probe();
+    let dev = shared_over(drive);
+    dev.ensure_writes_safe().expect("allowed");
+    assert_eq!(durability(&dev), Some("cache_off"));
+    assert!(WriteAt::write_cache_forced_off(&dev));
+    assert!(!probe.wce(), "the drive reports the cache off");
+    assert_eq!(probe.mode_selects(), 1);
+
+    write_and_read_back(&dev, "slow.txt", b"safe slow mode");
+    assert_consistent(&dev, "cache_off");
+    assert!(!probe.wce(), "still off during the session");
+    assert_eq!(probe.mode_selects(), 1, "no further MODE SELECT while connected");
+
+    drop(dev); // the last handle going away is the close point
+    assert!(probe.wce(), "restored on close");
+    assert_eq!(probe.mode_selects(), 2);
+    assert_eq!(probe.applied_off.load(SeqCst), 1);
+    assert_eq!(probe.applied_on.load(SeqCst), 1);
+    probe.assert_clean(); // never SP=1, always PF=1, BDL=0, PS clear
+}
+
+/// An MBR disk with one Linux partition holding the btrfs fixture, so a real
+/// `DeviceHandle` (and its info JSON) can sit on the mock without a LUKS fixture.
+fn mbr_disk_with_btrfs() -> Vec<u8> {
+    let fs = fixture("btrfs/states-4k.img");
+    let start_sectors = 2048u32;
+    let mut img = vec![0u8; start_sectors as usize * 512];
+    img[446 + 4] = 0x83;
+    img[446 + 8..446 + 12].copy_from_slice(&start_sectors.to_le_bytes());
+    img[446 + 12..446 + 16].copy_from_slice(&((fs.len() / 512) as u32).to_le_bytes());
+    img[510] = 0x55;
+    img[511] = 0xAA;
+    img.extend_from_slice(&fs);
+    img
+}
+
+#[test]
+fn the_device_info_json_reports_the_mode() {
+    let drive = no_flush(MockUsbDrive::new(mbr_disk_with_btrfs()).with_write_cache(true));
+    let probe = drive.cache_probe();
+    let dev = device_over(drive);
+    assert_eq!(json(dev.info_json()).get("writeDurability"), Some(&Value::Null), "unknown before the check");
+    dev.dev.ensure_writes_safe().expect("allowed");
+    let d = json(dev.info_json());
+    assert_eq!(d["writeDurability"], "cache_off", "{d}");
+    assert_eq!(d["writeCacheForcedOff"], Value::Bool(true), "{d}");
+    assert_eq!(d["flushSupported"], Value::Bool(false), "{d}");
+    drop(dev);
+    assert!(probe.wce());
+    probe.assert_clean();
+}
+
+#[test]
+fn the_ten_byte_mode_commands_work_end_to_end_with_a_block_descriptor() {
+    let drive = no_flush(btrfs_drive().with_write_cache(true).with_only_ten_byte_mode_commands().with_block_descriptor());
+    let probe = drive.cache_probe();
+    let dev = shared_over(drive);
+    dev.ensure_writes_safe().expect("allowed");
+    assert_eq!(durability(&dev), Some("cache_off"));
+    assert_eq!(probe.select_cdbs.lock().unwrap()[0][0], 0x55);
+    drop(dev);
+    assert!(probe.wce());
+    assert_eq!(probe.select_cdbs.lock().unwrap().last().unwrap()[0], 0x55);
+    probe.assert_clean();
+}
+
+/// (b) MODE SELECT rejected: allowed anyway, as Linux does.
+#[test]
+fn mode_select_rejected_runs_unverified_and_still_writes() {
+    let drive = no_flush(btrfs_drive().with_write_cache(true)).rejecting_mode_select();
+    let probe = drive.cache_probe();
+    let dev = shared_over(drive);
+    dev.ensure_writes_safe().expect("never refused for cache reasons");
+    assert_eq!(durability(&dev), Some("unverified"));
+    assert!(!WriteAt::write_cache_forced_off(&dev));
+    write_and_read_back(&dev, "u.txt", b"unverified");
+    assert_consistent(&dev, "unverified-rejected");
+    drop(dev);
+    assert!(probe.wce(), "never changed");
+    probe.assert_clean();
+}
+
+/// (c) A bridge that accepts MODE SELECT and keeps the cache on.
+#[test]
+fn a_lying_bridge_runs_unverified_and_still_writes() {
+    let drive = no_flush(btrfs_drive().with_write_cache(true)).lying_about_mode_select();
+    let probe = drive.cache_probe();
+    let dev = shared_over(drive);
+    dev.ensure_writes_safe().expect("allowed");
+    assert_eq!(durability(&dev), Some("unverified"));
+    write_and_read_back(&dev, "lie.txt", b"lie");
+    drop(dev);
+    assert!(probe.wce());
+    probe.assert_clean();
+}
+
+/// (d) WCE reported not changeable: no MODE SELECT is even attempted.
+#[test]
+fn wce_not_changeable_runs_unverified_without_sending_mode_select() {
+    let drive = no_flush(btrfs_drive().with_write_cache(true).with_wce_not_changeable());
+    let probe = drive.cache_probe();
+    let dev = shared_over(drive);
+    dev.ensure_writes_safe().expect("allowed");
+    assert_eq!(durability(&dev), Some("unverified"));
+    assert_eq!(probe.mode_selects(), 0);
+    write_and_read_back(&dev, "nc.txt", b"fixed");
+    drop(dev);
+    assert_eq!(probe.mode_selects(), 0);
+}
+
+/// MODE SENSE unusable: nothing to switch, nothing to confirm.
+#[test]
+fn unreadable_cache_state_runs_unverified_and_still_writes() {
+    let dev = shared_over(no_flush(btrfs_drive()));
+    dev.ensure_writes_safe().expect("allowed");
+    assert_eq!(durability(&dev), Some("unverified"));
+    write_and_read_back(&dev, "unk.txt", b"unknown");
+}
+
+/// (e) The drive resets mid-session and the cache comes back on.
+#[test]
+fn a_revert_mid_session_downgrades_to_unverified_and_the_commit_completes() {
+    let drive = no_flush(btrfs_drive().with_write_cache(true));
+    let probe = drive.cache_probe();
+    let dev = shared_over(drive);
+    dev.ensure_writes_safe().expect("allowed");
+    assert_eq!(durability(&dev), Some("cache_off"));
+    write_and_read_back(&dev, "before.txt", b"before the reset");
+
+    probe.revert(); // the drive reset: volatile settings are back to defaults
+    assert!(probe.wce());
+
+    // The commit's pre-superblock flush notices; the commit still completes.
+    write_and_read_back(&dev, "after.txt", b"after the reset");
+    assert_eq!(durability(&dev), Some("unverified"));
+    assert!(!WriteAt::write_cache_forced_off(&dev));
+
+    // Reads and the earlier file are intact, and the disk is consistent.
+    let fs = Btrfs::mount(dev.clone()).expect("mount");
+    assert_eq!(fs.read_file("/before.txt").unwrap(), b"before the reset");
+    assert_consistent(&dev, "after-revert");
+
+    // Later writes keep working in the downgraded mode.
+    write_and_read_back(&dev, "later.txt", b"later");
+    drop(dev);
+    assert_eq!(probe.applied_on.load(SeqCst), 0, "restore finds the cache already on and sends nothing");
+    probe.assert_clean();
+}
+
+#[test]
+fn the_revert_is_also_caught_by_a_scripted_reset() {
+    let drive = no_flush(btrfs_drive().with_write_cache(true)).reverting_cache_after(40);
+    let dev = shared_over(drive);
+    dev.ensure_writes_safe().expect("allowed");
+    for i in 0..6 {
+        write_and_read_back(&dev, &format!("f{i}.txt"), b"x");
+    }
+    assert_eq!(durability(&dev), Some("unverified"));
+    assert_consistent(&dev, "scripted-revert");
+}
+
+/// Ext4 sits on the same device layer: same modes, same restore, and ext4's
+/// own flushes (dirty bracket) go through the same re-check.
+#[test]
+fn ext4_gets_the_same_modes() {
+    let drive = no_flush(MockUsbDrive::new(fixture("ext4/small-1k.img")).with_write_cache(true));
+    let probe = drive.cache_probe();
+    let dev = shared_over(drive);
+    dev.ensure_writes_safe().expect("allowed");
+    assert_eq!(durability(&dev), Some("cache_off"));
+    let mut fs = luks_core::fs::ext4::Ext4::mount(dev.clone()).expect("mount ext4");
+    fs.create_file(2, "e.txt", b"ext4 safe slow", luks_core::fs::FileType::Regular).expect("write allowed");
+    let fs = luks_core::fs::ext4::Ext4::mount(dev.clone()).expect("remount");
+    assert_eq!(fs.read_file("/e.txt").unwrap(), b"ext4 safe slow");
+    probe.revert();
+    let mut fs = luks_core::fs::ext4::Ext4::mount(dev.clone()).expect("mount");
+    fs.create_file(2, "f.txt", b"after reset", luks_core::fs::FileType::Regular).expect("commit completes");
+    assert_eq!(durability(&dev), Some("unverified"));
+    drop((fs, dev));
+    probe.assert_clean();
 }

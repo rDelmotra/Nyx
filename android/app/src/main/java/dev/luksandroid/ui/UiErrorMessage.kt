@@ -50,7 +50,7 @@ object UiErrorMessage {
                 "Refresh the folder and try again."
         LuksException.HEALTH_READ_ONLY -> HEALTH_READ_ONLY_MESSAGE
         LuksException.WRITES_UNSAFE ->
-            "This USB adapter cannot guarantee writes reach the disk; writing is disabled to protect it. " +
+            "This USB adapter could neither flush its write cache nor switch it off, and the write was stopped. " +
                 "You can still read files."
         else -> "An unexpected error occurred (code $code)."
     }

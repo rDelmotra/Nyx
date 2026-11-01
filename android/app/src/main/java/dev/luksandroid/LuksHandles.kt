@@ -116,6 +116,13 @@ data class VolumeInfo(
      * first flush, in a build without the write path, or when the field is absent.
      */
     val flushSupported: Boolean? = null,
+    /**
+     * How writes are made durable: "flush", "write_through", "cache_off" (the adapter cannot flush, so
+     * its write cache was switched off while connected) or "unverified" (no flush and no way to confirm
+     * write-through; same as Linux). Null until the first write check. Can move to "unverified"
+     * mid-session.
+     */
+    val writeDurability: String? = null,
     /** LUKS cipher spec (e.g. `aes-xts-plain64`) and key size, when the native side reports them (F9 header). Never key material. */
     val cipher: String? = null,
     val keyBits: Int? = null,
@@ -331,7 +338,10 @@ open class LuksVolume internal constructor(private var handle: Long) : AutoClose
     private fun refreshInfo() {
         // Only the first flush answer is news; once it is known it never changes, so stop paying
         // a JNI call per commit.
-        if (handle == 0L || cachedInfo.flushSupported != null) return
+        // "cache_off" can still degrade to "unverified" (the drive resets), so keep reading it.
+        val d = cachedInfo.writeDurability
+        val settled = if (d == null) cachedInfo.flushSupported != null else d != "cache_off"
+        if (handle == 0L || settled) return
         try {
             cachedInfo = parseVolumeInfo(readInfoJson())
         } catch (t: Throwable) {
@@ -926,6 +936,7 @@ internal fun parseVolumeInfo(json: String): VolumeInfo {
         },
         encrypted = if (o.has("encrypted") && !o.isNull("encrypted")) o.optBoolean("encrypted", true) else true,
         flushSupported = if (o.has("flushSupported") && !o.isNull("flushSupported")) o.optBoolean("flushSupported") else null,
+        writeDurability = if (o.has("writeDurability") && !o.isNull("writeDurability")) o.optString("writeDurability") else null,
         cipher = if (o.has("cipher") && !o.isNull("cipher")) o.optString("cipher") else null,
         keyBits = if (o.has("keyBits") && !o.isNull("keyBits")) o.optInt("keyBits") else null,
     )

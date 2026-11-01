@@ -39,10 +39,25 @@ pub trait WriteAt: ReadAt {
         None
     }
 
+    /// Whether this device had no flush command and its volatile write cache
+    /// was switched off (for this power-on only) to make writes safe anyway.
+    fn write_cache_forced_off(&self) -> bool {
+        false
+    }
+
+    /// How writes are being made durable: `"flush"`, `"write_through"`,
+    /// `"cache_off"` or `"unverified"` (no flush, cache state not confirmed
+    /// off: what Linux does on such adapters). `None` until decided or when
+    /// the device cannot say. May change mid-session, towards `unverified`.
+    fn write_durability(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Decide, before the first write, whether this device can honour the
     /// write ordering a filesystem commit depends on (tree blocks durable
     /// before the superblock that points at them). Issues no write. A device
-    /// that cannot guarantee it returns [`LuksError::UnsafeWriteCache`].
+    /// that cannot guarantee it still returns `Ok`; it reports the mode through
+    /// [`write_durability`](Self::write_durability) instead of refusing.
     /// The default is `Ok`: files and in-memory images have no volatile cache
     /// this layer could learn about.
     fn check_write_safety(&self) -> Result<()> {
@@ -98,6 +113,14 @@ impl<D: WriteAt + ?Sized> WriteAt for &D {
 
     fn flush_support(&self) -> Option<bool> {
         (**self).flush_support()
+    }
+
+    fn write_cache_forced_off(&self) -> bool {
+        (**self).write_cache_forced_off()
+    }
+
+    fn write_durability(&self) -> Option<&'static str> {
+        (**self).write_durability()
     }
 
     fn check_write_safety(&self) -> Result<()> {

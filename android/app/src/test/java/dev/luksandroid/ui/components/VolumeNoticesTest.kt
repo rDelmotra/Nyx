@@ -50,3 +50,22 @@ class MergeFlushTest {
         assertNull(mergeFlushSupported(null, null))
     }
 }
+
+class WriteDurabilityNoticeTest {
+    @Test fun `orange dot only when unverified`() {
+        assertTrue(VolumeNotices.showUnverifiedDot("unverified"))
+        for (m in listOf("flush", "write_through", "cache_off", null)) assertFalse(VolumeNotices.showUnverifiedDot(m))
+    }
+
+    @Test fun `safe slow note only when the cache was switched off`() {
+        assertTrue(VolumeNotices.showSafeSlowNote("cache_off"))
+        for (m in listOf("flush", "write_through", "unverified", null)) assertFalse(VolumeNotices.showSafeSlowNote(m))
+    }
+
+    @Test fun `old no-flush banner only when the native layer reports no mode`() {
+        assertTrue(VolumeNotices.showNoFlush(false, null))
+        assertFalse(VolumeNotices.showNoFlush(false, "cache_off"))
+        assertFalse(VolumeNotices.showNoFlush(false, "unverified"))
+        assertFalse(VolumeNotices.showNoFlush(null, null))
+    }
+}

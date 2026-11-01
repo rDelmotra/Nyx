@@ -244,6 +244,14 @@ pub struct SharedDevice {
         allow(dead_code, reason = "only the write path flushes")
     )]
     flush_state: Arc<std::sync::atomic::AtomicU8>,
+    /// Mirror of `WriteAt::write_durability`, refreshed after the safety check
+    /// and every flush (a mid-session revert shows up here): 0 unknown,
+    /// 1 flush, 2 write_through, 3 cache_off, 4 unverified.
+    #[cfg_attr(
+        not(feature = "dangerous-write-support"),
+        allow(dead_code, reason = "only the write path decides durability")
+    )]
+    durability: Arc<std::sync::atomic::AtomicU8>,
     /// Write-safety verdict (`WriteAt::check_write_safety`): 0 not yet
     /// decided, 1 writes allowed, 2 refused. Shared by every clone.
     #[cfg(feature = "dangerous-write-support")]
@@ -268,14 +276,15 @@ impl SharedDevice {
             inner: Arc::new(Mutex::new(device)),
             writer: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             flush_state: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            durability: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             #[cfg(feature = "dangerous-write-support")]
             write_gate: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         }
     }
 
-    /// Decide once per device session whether writes may start, and refuse
-    /// with `UnsafeWriteCache` if the adapter cannot guarantee ordering.
-    /// Probes with a flush (no write) the first time. A transport error is
+    /// Decide once per device session how writes are made durable (flush,
+    /// write-through, cache switched off, or unverified); it never refuses
+    /// for that reason. Probes with a flush (no write) the first time. A transport error is
     /// returned without latching a verdict.
     #[cfg(feature = "dangerous-write-support")]
     pub fn ensure_writes_safe(&self) -> Result<()> {
@@ -293,12 +302,25 @@ impl SharedDevice {
             Some(false) => 2,
         };
         self.flush_state.store(state, Release);
+        self.mirror_durability(&*dev);
         match &verdict {
             Ok(()) => self.write_gate.store(1, Release),
             Err(LuksError::UnsafeWriteCache) => self.write_gate.store(2, Release),
             Err(_) => {}
         }
         verdict
+    }
+
+    #[cfg(feature = "dangerous-write-support")]
+    fn mirror_durability(&self, dev: &(dyn DeviceIo + Send + 'static)) {
+        let v = match dev.write_durability() {
+            None => 0,
+            Some("flush") => 1,
+            Some("write_through") => 2,
+            Some("cache_off") => 3,
+            Some(_) => 4,
+        };
+        self.durability.store(v, std::sync::atomic::Ordering::Release);
     }
 
     /// Whether a panic ever unwound through the device lock. Poison is never
@@ -358,6 +380,7 @@ impl luks_core::device::WriteAt for SharedDevice {
             Some(false) => 2,
         };
         self.flush_state.store(state, std::sync::atomic::Ordering::Release);
+        self.mirror_durability(&*dev);
         result
     }
 
@@ -366,6 +389,21 @@ impl luks_core::device::WriteAt for SharedDevice {
         match self.flush_state.load(std::sync::atomic::Ordering::Acquire) {
             1 => Some(true),
             2 => Some(false),
+            _ => None,
+        }
+    }
+
+    fn write_cache_forced_off(&self) -> bool {
+        self.durability.load(std::sync::atomic::Ordering::Acquire) == 3
+    }
+
+    /// Lock-free, like `flush_support`.
+    fn write_durability(&self) -> Option<&'static str> {
+        match self.durability.load(std::sync::atomic::Ordering::Acquire) {
+            1 => Some("flush"),
+            2 => Some("write_through"),
+            3 => Some("cache_off"),
+            4 => Some("unverified"),
             _ => None,
         }
     }
@@ -1077,6 +1115,8 @@ impl DeviceHandle {
         #[cfg(feature = "dangerous-write-support")]
         {
             info["flushSupported"] = json!(luks_core::device::WriteAt::flush_support(&self.dev));
+            info["writeDurability"] = json!(luks_core::device::WriteAt::write_durability(&self.dev));
+            info["writeCacheForcedOff"] = json!(luks_core::device::WriteAt::write_cache_forced_off(&self.dev));
         }
         info.to_string()
     }
@@ -1259,6 +1299,8 @@ impl VolumeHandle {
         #[cfg(feature = "dangerous-write-support")]
         {
             info["flushSupported"] = json!(luks_core::device::WriteAt::flush_support(&self.dev));
+            info["writeDurability"] = json!(luks_core::device::WriteAt::write_durability(&self.dev));
+            info["writeCacheForcedOff"] = json!(luks_core::device::WriteAt::write_cache_forced_off(&self.dev));
         }
         info.to_string()
     }

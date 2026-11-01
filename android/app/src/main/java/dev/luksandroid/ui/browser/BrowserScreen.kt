@@ -625,15 +625,18 @@ fun BrowserScreen(
     // unreadable-entry count). Null shows nothing; see VolumeNotices.
     var flushSupported by remember(volume) { mutableStateOf(volumeInfo.flushSupported) }
     // flushSupported is only known after the first flush, so re-read it after each commit/transfer.
+    var writeDurability by remember(volume) { mutableStateOf(volumeInfo.writeDurability) }
     suspend fun refreshFlushSupported() {
         val fresh = try {
-            withContext(Dispatchers.IO) { LuksSession.withLease { v -> v.info.flushSupported } }
+            withContext(Dispatchers.IO) { LuksSession.withLease { v -> v.info } }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             null
         }
-        flushSupported = mergeFlushSupported(flushSupported, fresh)
+        flushSupported = mergeFlushSupported(flushSupported, fresh?.flushSupported)
+        // A fresh reading always wins: "cache_off" can become "unverified" mid-session.
+        writeDurability = fresh?.writeDurability ?: writeDurability
     }
     var unreadableCount by remember { mutableStateOf<Int?>(null) }
     val transferTracker = remember { TransferTracker() }
@@ -1072,7 +1075,7 @@ fun BrowserScreen(
     Scaffold(
         modifier = modifier.fillMaxSize(),
         topBar = {
-            SessionStatusHeader()
+            SessionStatusHeader(writeDurability = writeDurability)
         },
         snackbarHost = { SnackbarHost(snackbarHostState) },
         floatingActionButton = {
@@ -1255,7 +1258,14 @@ fun BrowserScreen(
                         )
                     }
                 }
-                if (VolumeNotices.showNoFlush(flushSupported)) {
+                if (VolumeNotices.showSafeSlowNote(writeDurability)) {
+                    Text(
+                        text = VolumeNotices.SAFE_SLOW_NOTE,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                if (VolumeNotices.showNoFlush(flushSupported, writeDurability)) {
                     Surface(
                         color = MaterialTheme.colorScheme.tertiaryContainer,
                         shape = RoundedCornerShape(8.dp),

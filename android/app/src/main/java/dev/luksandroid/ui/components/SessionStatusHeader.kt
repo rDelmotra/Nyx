@@ -60,6 +60,9 @@ import dev.luksandroid.formatSize
 import dev.luksandroid.session.LuksSession
 import dev.luksandroid.session.SessionState
 import androidx.compose.foundation.border
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.TextButton
 import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.ui.platform.LocalContext
 import dev.luksandroid.ui.LuksHaptics
@@ -78,6 +81,7 @@ import androidx.compose.foundation.shape.CircleShape
 @Composable
 fun SessionStatusHeader(
     modifier: Modifier = Modifier,
+    writeDurability: String? = null,
 ) {
     val context = LocalContext.current
     val sessionState by LuksSession.state.collectAsState()
@@ -159,6 +163,9 @@ fun SessionStatusHeader(
                                     ),
                                     color = StateUnlocked,
                                 )
+                            }
+                            if (VolumeNotices.showUnverifiedDot(writeDurability)) {
+                                UnverifiedWritesDot()
                             }
                             Spacer(modifier = Modifier.width(8.dp))
                             // Calm Sync / Synced status chip (No anxious countdown clock)
@@ -405,5 +412,31 @@ private fun HealthSheetContent(health: Health, onDismiss: () -> Unit) {
             Text(sheet.action, style = MaterialTheme.typography.bodyMedium, color = TextMuted)
             Spacer(modifier = Modifier.height(24.dp))
         }
+    }
+}
+
+/** Small orange dot: this adapter's writes can't be confirmed. Tap for the explanation. */
+@Composable
+private fun UnverifiedWritesDot() {
+    var open by remember { mutableStateOf(false) }
+    Box(
+        modifier = Modifier
+            .clickable { open = true }
+            .padding(8.dp)
+            .semantics { contentDescription = VolumeNotices.UNVERIFIED_EXPLANATION },
+    ) {
+        Box(
+            modifier = Modifier
+                .size(8.dp)
+                .clip(CircleShape)
+                .background(Color(0xFFFF9800)),
+        )
+    }
+    if (open) {
+        AlertDialog(
+            onDismissRequest = { open = false },
+            confirmButton = { TextButton(onClick = { open = false }) { Text("OK") } },
+            text = { Text(VolumeNotices.UNVERIFIED_EXPLANATION) },
+        )
     }
 }

@@ -259,6 +259,12 @@ class SafDocumentOps(private val context: Context) : DocumentOps<Uri> {
     override fun displayName(doc: Uri): String? = column(doc, DocumentsContract.Document.COLUMN_DISPLAY_NAME).first
 
     override fun supportsRename(doc: Uri): Boolean {
+        // Standalone ACTION_CREATE_DOCUMENT URIs hold a single-document grant: renaming in
+        // ExternalStorageProvider triggers MediaStore revoke_uri_permission on the old path before
+        // DocumentsProvider copies modeFlags to the new URI, leaving the caller with zero access
+        // (and DownloadStorageProvider appends the MIME extension onto .luks-partial and throws).
+        // Tree-backed URIs carry a prefix grant on the tree and are unaffected.
+        if (!DocumentsContract.isTreeUri(doc)) return false
         val flags = column(doc, DocumentsContract.Document.COLUMN_FLAGS).second ?: return false
         return flags.toInt() and DocumentsContract.Document.FLAG_SUPPORTS_RENAME != 0
     }

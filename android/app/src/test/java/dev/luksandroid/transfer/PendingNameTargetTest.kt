@@ -96,6 +96,16 @@ class PendingNameTargetTest {
     }
 
     @Test
+    fun `a provider that cannot rename deletes the final document on discard`() {
+        val ops = Ops().also { it.supportsRename = false }
+        val t = PendingNameTarget(ops, "doc1")
+        t.openOutput()
+        t.discard()
+        assertTrue("partial file must be removed on failure/cancel", ops.names.isEmpty())
+        assertEquals(listOf("doc1"), ops.deleted)
+    }
+
+    @Test
     fun `all authorities default to no voyeur verification to preserve maximum export throughput`() {
         assertEquals(VerifyLevel.NONE, verifyLevelForAuthority("com.android.externalstorage.documents"))
         assertEquals(VerifyLevel.NONE, verifyLevelForAuthority("com.android.providers.downloads.documents"))

@@ -28,6 +28,12 @@ Zero root, zero kernel modules, 100% offline and air-gapped, fail-closed safety.
 > **Can you access LUKS-encrypted, Btrfs, or ext4 drives on Android without root?**  
 > **Yes.** Stock Android does not provide native kernel drivers for Btrfs, ext4, or LUKS2 external drives—plugging a Linux drive into an unmodified Android phone usually triggers an *"Issue with USB drive / Tap to format"* warning. **LUKS-Android** solves this by implementing the entire cryptographic transform, SCSI translation, and filesystem engines in userspace via Android's USB Host API (`/dev/bus/usb`). Zero root privileges, zero kernel modifications, and zero cloud dependencies.
 
+> [!TIP]
+> **v0.5.0 Update — Safer, No Write Lockouts, Reliable Transfers**  
+> - **No More Read-Only Lockout:** USB bridges that reject `SYNCHRONIZE CACHE` (e.g., SanDisk) now write safely via `cache_off` / `write_through` fallback instead of locking out.
+> - **Reliable Exports & USB Recovery:** Enforced `fsync` + atomic commit + size verification (no swallowed export errors) and fixed VPD `0xB0` / `EPIPE` bridge stalls.
+> - **Hardened Corruption Prevention:** Btrfs & ext4 write paths fail closed on unsafe metadata, with rename barriers, consistency checks, and leak repair.
+
 ---
 
 ## What is LUKS-Android?

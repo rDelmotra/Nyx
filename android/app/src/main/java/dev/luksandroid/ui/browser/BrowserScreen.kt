@@ -714,6 +714,7 @@ fun BrowserScreen(
                 currentPath = path
                 isSlackLimitReached = false
                 selectedPaths = emptySet()
+                refreshStatFs()
             } catch (e: CancellationException) {
                 throw e
             } catch (e: LuksException) {
